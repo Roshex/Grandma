@@ -66,15 +66,17 @@ def _worker_reconcile_single(
             
             for n in gt_nodes:
                 if n.is_leaf():
-                     # FIX: Ensure we split the GeneID from SpeciesID (1_a -> a)
-                     # clean_name handles '*' removal, split handles ID extraction
-                     raw_name = getattr(n, "clean_name", n.name)
-                     sp_name = raw_name.split("_")[-1]
-                     
-                     if sp_name in st_lookup:
-                         init_maps[n] = [st_lookup[sp_name]]
-                     else:
-                         raise ValueError(f"Gene Tree {g_num} tip '{n.name}' maps to species '{sp_name}', which is not in the Species Tree.")
+                    # FIX: Ensure we split the GeneID from SpeciesID (1_a -> a)
+                    # clean_name handles '*' removal, split handles ID extraction
+                    raw_name = getattr(n, "clean_name", n.name)
+                    sp_name = raw_name.split("_")[-1]
+                    
+                    if sp_name in st_lookup:
+                        init_maps[n] = [st_lookup[sp_name]]
+                    else:
+                        # PRINT TREE FOR DEBUGGING
+                        raise ValueError(f"Gene Tree {g_num} tip '{n.name}' maps to species '{sp_name}', which is not in the Species Tree:",
+                                         mul_data.mt.ete_tree.get_ascii(show_internal=True), f"Gene Tree:\n{gt_obj.ete_tree.get_ascii(show_internal=True)}")
                 else:
                     init_maps[n] = []
             

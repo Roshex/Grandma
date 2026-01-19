@@ -131,7 +131,7 @@ class MulTreeManager:
     def build(self) -> dict:
         mul_trees = {}
         
-        if self.cfg.lca_opt != "st-only":
+        if self.cfg.mode != "st-only":
             step = "Parsing hybrid clades"
             self.logger.report_step(step, "In progress...")
             h1_resolved = self._resolve_h_inputs(self.cfg.h1_nodes, "h1")
@@ -163,7 +163,7 @@ class MulTreeManager:
         # Index 0 is species tree itself regardless of mode
         mul_trees[0] = MulData(mt=self.st)
         
-        if self.cfg.lca_opt != "st-only":
+        if self.cfg.mode != "st-only":
             step = "Building MUL-trees"
             self.logger.report_step(step, "In progress...")
             
@@ -188,7 +188,7 @@ class GeneTreeManager:
         self.reconciler = reconciler
 
     def cull(self, mul_trees: Dict[int, MulData], gene_trees: Dict[int, GrandmaTree]):
-        if self.cfg.lca_opt != "st-only":
+        if self.cfg.mode != "st-only":
             self.collapse_groups(mul_trees, gene_trees)
         self.filter_and_check(mul_trees, gene_trees)
         self.write_filtered_trees(gene_trees)

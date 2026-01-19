@@ -16,24 +16,29 @@ except ImportError:
     HAS_PSUTIL = False
 
 class GrandmaLogger:
-    def __init__(self, log_path: Path, verbosity: int = 3):
+    def __init__(self, log_path: Path, verbosity: int = 3, parent_logger: 'GrandmaLogger' = None, clear_log: bool = True):
         self.log_path = log_path
         self.verbosity = verbosity
+        self.parent_logger = parent_logger  # The Engine Logger
         self.start_time = time.time()
         self.step_start_time = 0
         self.warnings = 0
         self.pids = [psutil.Process(os.getpid())] if HAS_PSUTIL else []
         
-        # Ensure dir exists
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        # Clear log file
-        with open(self.log_path, 'w') as f:
-            f.write("")
+        # Ensure dir exists & clear log file
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        if clear_log:
+            with open(self.log_path, 'w') as f:
+                f.write("")
 
     def write(self, message: str, level: int = 2, to_screen: bool = True):
         """Writes to log file and optionally to screen based on verbosity."""
         with open(self.log_path, "a") as f:
             f.write(message + "\n")
+        # Propagate to Engine Logger (Cumulative)
+        if self.parent_logger:
+            # Pass to_screen=False to avoid double-printing to terminal
+            self.parent_logger.write(message, level=level, to_screen=False)
         if to_screen and self.verbosity >= level:
             print(message)
 
@@ -130,42 +135,48 @@ class GrandmaLogger:
             with open(self.log_path, "a") as f:
                 f.write(file_line + "\n")
 
-    def print_start_banner(self, cfg, globs_dict):
-        """Replicates startProg from opt_parse.py"""
+    def log_software_banner(self, meta: 'GrandmaMetadata'):
+        """Prints the static software info (Authors, DOI, Version)."""
+        # This replaces the first half of the old print_start_banner
         start_v = 1 if self.verbosity == 0 else 3
         
-        self.write("# =========================================================================", level=start_v)
-        self.write("# Welcome to GRANDMA -- XXX .", level=start_v)
-        self.write(f"# Version {cfg.version} released on {cfg.release}", level=start_v)
-        self.write(f"# GRANDMA was developed by {cfg.authors}", level=start_v)
-        self.write(f"# \t\tbased on GRAMPA [Gene tree reconciliations with MUL-trees] by {cfg.source_authors}", level=start_v)
-        self.write(f"# Citation:      {cfg.doi}", level=start_v)
-        self.write(f"# Website:       {cfg.http}", level=start_v)
-        self.write(f"# Report issues: {cfg.github}", level=start_v)
+        self.write("# " + "=" * 73, level=start_v)
+        self.write(f"# Welcome to GRANDMA -- {meta.version} .", level=start_v)
+        self.write(f"# Version {meta.version} released on {meta.release}", level=start_v)
+        self.write(f"# GRANDMA was developed by {meta.authors}", level=start_v)
+        self.write(f"# \t\tbased on GRAMPA [Gene tree reconciliations with MUL-trees] by {meta.source_authors}", level=start_v)
+        self.write(f"# Citation:      {meta.doi}", level=start_v)
+        self.write(f"# Website:       {meta.http}", level=start_v)
+        self.write(f"# Report issues: {meta.github}", level=start_v)
         self.write("#", level=start_v)
         self.write(f"# The date and time at the start is:  {self.get_date_time()}", level=start_v)
         self.write(f"# Using Python executable located at: {sys.executable}", level=start_v)
         self.write(f"# Using Python version:               {'.'.join(map(str, sys.version_info[:3]))}", level=start_v)
         self.write(f"#\n# The program was called as:          {' '.join(sys.argv)}\n#", level=start_v)
 
+    def start_run(self, cfg, globs_dict):
+        """Replicates startProg from opt_parse.py"""
+        start_v = 1 if self.verbosity == 0 else 3
+
         if cfg.info_only: return
 
-        pad = 40
         self.write("# " + "-" * 125, level=start_v)
         self.write("# INPUT/OUTPUT INFO:", level=start_v)
+
+        pad = 40
         
         # Files
-        self.write(self.spaced("# Species tree file:", pad) + cfg.species_tree_path, level=start_v)
+        self.write(self.spaced("# Species tree file:", pad) + str(cfg.species_tree_path), level=start_v)
         if not cfg.is_mul_input:
-             self.write(self.spaced("# Gene tree file:", pad) + (cfg.gene_tree_path if cfg.gene_tree_path else ""), level=start_v)
+             self.write(self.spaced("# Gene tree file:", pad) + (str(cfg.gene_tree_path) if cfg.gene_tree_path else ""), level=start_v)
         
-        self.write(self.spaced("# Output directory:", pad) + cfg.output_dir, level=start_v)
+        self.write(self.spaced("# Output directory:", pad) + str(cfg.output_dir), level=start_v)
         
         if not cfg.is_mul_input:
             self.write(self.spaced("# Score file:", pad) + str(Path(cfg.output_dir) / f"{cfg.run_prefix}-scores.txt"), level=start_v)
             self.write(self.spaced("# Filtered gene trees:", pad) + str(Path(cfg.output_dir) / f"{cfg.run_prefix}-trees-filtered.txt"), level=start_v)
             self.write(self.spaced("# Check nums file:", pad) + str(Path(cfg.output_dir) / f"{cfg.run_prefix}-checknums.txt"), level=start_v)
-            if cfg.lca_opt != "check-nums":
+            if cfg.mode != "check-nums":
                 self.write(self.spaced("# Detailed mapping file:", pad) + str(Path(cfg.output_dir) / f"{cfg.run_prefix}-detailed.txt"), level=start_v)
                 self.write(self.spaced("# Duplication count file:", pad) + str(Path(cfg.output_dir) / f"{cfg.run_prefix}-dup-counts.txt"), level=start_v)
 
@@ -192,18 +203,18 @@ class GrandmaLogger:
         mul_str = "The tree input with -s will be read as a MUL-tree." if cfg.is_mul_input else "The tree input with -s will be read as singly-labeled tree."
         self.write(self.spaced("# --multree", pad) + self.spaced(str(cfg.is_mul_input), 30) + mul_str, level=start_v)
         # --checknums
-        cn_str = "GRAMPA will count groups to filter gene trees and exit." if cfg.lca_opt == "check-nums" else "GRAMPA will count groups to filter gene trees and then perform reconciliations."
-        self.write(self.spaced("# --checknums", pad) + self.spaced(str(cfg.lca_opt == "check-nums"), 30) + cn_str, level=start_v)
+        cn_str = "GRAMPA will count groups to filter gene trees and exit." if cfg.mode == "check-nums" else "GRAMPA will count groups to filter gene trees and then perform reconciliations."
+        self.write(self.spaced("# --checknums", pad) + self.spaced(str(cfg.mode == "check-nums"), 30) + cn_str, level=start_v)
         # --no-st, --st-only
         st_opt_str = "default"
-        if cfg.lca_opt == "no-st": st_opt_str = "no-st"
-        if cfg.lca_opt == "st-only": st_opt_str = "st-only"
+        if cfg.mode == "no-st": st_opt_str = "no-st"
+        if cfg.mode == "st-only": st_opt_str = "st-only"
         st_desc = "GRAMPA will perform reconciliations to all MUL-trees specified by -h1 and -h2 and the input species tree."
-        if cfg.lca_opt == "no-st": st_desc = "GRAMPA will perform reconciliations to only the MUL-trees specified by -h1 and -h2."
-        if cfg.lca_opt == "st-only": st_desc = "GRAMPA will perform reconciliations to only the input species tree."
+        if cfg.mode == "no-st": st_desc = "GRAMPA will perform reconciliations to only the MUL-trees specified by -h1 and -h2."
+        if cfg.mode == "st-only": st_desc = "GRAMPA will perform reconciliations to only the input species tree."
         self.write(self.spaced("# --no-st, --st-only", pad) + self.spaced(st_opt_str, 30) + st_desc, level=start_v)
         # --maps
-        if cfg.lca_opt != "check-nums":
+        if cfg.mode != "check-nums":
              map_desc = "GRAMPA will output node mappings for the lowest scoring tree in the detailed output file." if cfg.maps_opt else "GRAMPA will only output duplication and loss counts in the detailed output file."
              self.write(self.spaced("# --maps", pad) + self.spaced(str(cfg.maps_opt), 30) + map_desc, level=start_v)
         # --overwrite

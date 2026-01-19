@@ -34,6 +34,7 @@ class GrandmaTree:
         Assigns <x> labels to internal nodes if missing.
         Uses postorder to match legacy GRAMPA bottom-up labeling.
         """
+        self.node_map = {} # Reset
         i = 1
         for node in self.ete_tree.traverse("postorder"):
             if not node.is_leaf():
@@ -45,6 +46,14 @@ class GrandmaTree:
             
             self.node_map[node.name] = node
 
+    def refresh(self):
+        """
+        Rebuilds indices and caches. Call this after unpickling or structural changes.
+        """
+        self._index_nodes()
+        self._cache_depths()
+        self.build_lca_cache()
+        
     def _cache_depths(self):
         """
         Calculates node depth and attaches it DIRECTLY to the ete3 node object.
@@ -124,6 +133,7 @@ class GrandmaTree:
             leaf.name = f"{leaf.name}*"
             
         p_parent = p_node.up
+
         if p_parent is None:
             new_root = TreeNode()
             new_root.add_child(p_node)
@@ -139,6 +149,25 @@ class GrandmaTree:
         for n in new_tree_obj.traverse():
             if n.name.startswith("<") and n.name.endswith(">"):
                 n.name = None
+
+        # TBD: safer way to get constructor to re-index??
+        '''if p_parent is None:
+            # P is the root
+            new_root = TreeNode()
+            new_root.add_child(p_node.detach())
+            new_root.add_child(h_subtree_copy)
+            new_tree_obj = new_root
+        else:
+            new_internal = p_parent.add_child(TreeNode())
+            # Move original P and new H copy under new internal node
+            p_node.detach()
+            new_internal.add_child(p_node)
+            new_internal.add_child(h_subtree_copy)
+
+        # Clean up old internal labels before re-indexing
+        for n in new_tree_obj.traverse():
+            if n.name and n.name.startswith("<") and n.name.endswith(">"):
+                n.name = None'''
         
         # Constructor will call _cache_depths() and re-index
         return GrandmaTree(tree_obj=new_tree_obj)
