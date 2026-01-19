@@ -676,8 +676,8 @@ class FlowManager:
             next_tasks = self.extract_subproblems(res, meta['h1.node'], meta['h2.node'], depth, idx, sample=sample)
         except Exception as e:
             logger.write(f"Error extracting subproblems at Depth {depth}, Index {idx}: {e}", level=1)
-            logger.write(meta)
-            logger.write(res)
+            print(meta)
+            #print(res)
             return []
         
         # 4. Update History
