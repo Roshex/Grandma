@@ -24,7 +24,7 @@ class GrandmaEngine:
         self.mul_mgr = None
         self.gene_mgr = None
 
-    def run(self):
+    def run_iteration(self):
         # 0. Banner
         self.logger.print_start_banner(self.cfg, {})
         self.logger.report_step("", "", start=True)
@@ -99,6 +99,18 @@ class GrandmaEngine:
     def _end_prog(self, min_info=None):
         self.logger.print_end_prog(self.cfg, min_info)
         sys.exit(0)
+
+    def run(self):
+        # check mode and run accordingly
+        print(f"Running in mode: {self.cfg.mode}")
+        if self.cfg.mode == "single":
+            self.run_iteration()
+        else:
+            if self.cfg.mode == "full":
+                pass
+            # For other modes, implement as needed
+            self.logger.report_step("Mode not implemented", f"Mode {self.cfg.mode} is not yet implemented.", start=True)
+            self._end_prog()
 
 def main():
     config = parse_args()

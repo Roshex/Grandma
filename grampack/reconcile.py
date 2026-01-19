@@ -6,15 +6,12 @@ from functools import partial
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Any, Set, Optional, Union
+from ete3 import TreeNode
 from .tree_ops import GrandmaTree, MulData
 from .io import GrandmaConfig
 
 @dataclass(slots=True, frozen=True)
 class ReconResult:
-    """
-    Immutable container for reconciliation results.
-    Replaces the list: [score, n_dups, n_losses, maps, node_dups, node_losses]
-    """
     score: int
     n_dups: int
     n_losses: int
@@ -24,17 +21,12 @@ class ReconResult:
 
 @dataclass(slots=True, frozen=True)
 class GroupData:
-    """
-    Container for the groups of a specific Gene Tree <-> Mul Tree pair.
-    Mirrors the list [groups, fixed_groups] from original code.
-    """
     ambiguous_groups: List[List[str]]
     fixed_groups: List[Tuple[List[str], str]]
 
-# Type Alias for the content of the pickle file: { GeneID : GroupData }
 GroupsPickle = Dict[int, GroupData]
 
-# --- Worker Function (Must be top-level to be picklable) ---
+# --- Worker Function ---
 
 def _worker_reconcile_single(
     mul_item: Tuple[int, MulData], 
@@ -42,74 +34,60 @@ def _worker_reconcile_single(
     pickle_dir: str, 
     run_prefix: str
 ) -> Tuple[int, int]:
-    """
-    Worker function to reconcile one MUL-tree against all gene trees.
-    Executed in parallel processes.
-    """
+    
     mul_idx, mul_data = mul_item
     
-    # 1. Load Groups Pickle
-    # Note: We reconstruct the path string here to ensure pickle safety
+    # Initialize LCA cache
+    mul_data.mt.build_lca_cache()
+    
     p_path = Path(pickle_dir) / f"{run_prefix}_{mul_idx}_groups.pickle"
     
     cur_groups_dict: GroupsPickle = {}
     if mul_idx != 0:
         if not p_path.exists():
-            # In a worker, we might not want to print to stdout directly or access logger
-            return mul_idx, 9999999 # Return high score on error
-        
+            return mul_idx, 9999999
         try:
             with open(p_path, 'rb') as f:
                 cur_groups_dict = pickle.load(f)
         except Exception:
              return mul_idx, 9999999
 
-    # 2. Reconcile Gene Trees
     total_score = 0
     
-    # Instantiate a temporary Reconciler helper (stateless logic) 
-    # or access static methods if refactored. 
-    # For now, we reuse the logic via a helper class or method.
-    # To keep it simple, we use the Reconciler class methods which we made static-compatible below.
-
+    # --- 1. Species Tree Case (Standard LCA) ---
     if mul_idx == 0:
-        # Special case ST: Must iterate all gene trees
+        st_lookup = {n.name: n for n in mul_data.mt.ete_tree.traverse()}
+        
         for g_num, gt_obj in gene_trees.items():
             init_maps = {}
-            # OPTIMIZATION: Cache split names if possible, or do it here
-            for n in gt_obj.ete_tree.iter_leaves():
-                 init_maps[n.name] = [n.name.split("_")[-1]]
-            for n in gt_obj.ete_tree.traverse():
-                 if not n.is_leaf(): init_maps[n.name] = []
             
-            score = Reconciler.recon_lca_legacy_static(gt_obj, mul_data.mt, init_maps, False)
+            # Generate node list ONCE
+            gt_nodes = list(gt_obj.ete_tree.traverse("postorder"))
+            
+            for n in gt_nodes:
+                if n.is_leaf():
+                     # FIX: Ensure we split the GeneID from SpeciesID (1_a -> a)
+                     # clean_name handles '*' removal, split handles ID extraction
+                     raw_name = getattr(n, "clean_name", n.name)
+                     sp_name = raw_name.split("_")[-1]
+                     
+                     if sp_name in st_lookup:
+                         init_maps[n] = [st_lookup[sp_name]]
+                     else:
+                         raise ValueError(f"Gene Tree {g_num} tip '{n.name}' maps to species '{sp_name}', which is not in the Species Tree.")
+                else:
+                    init_maps[n] = []
+            
+            score = Reconciler.recon_lca_optimized(gt_obj, mul_data.mt, init_maps, False, precomputed_postorder=gt_nodes)
             total_score += score
+            
+    # --- 2. MUL-Tree Case (Permutation Reconciliation) ---
     else:
-        # Standard MUL-Recon: Iterate GROUPS, not trees (faster if filtering occurred)
         for g_num, groups in cur_groups_dict.items():
-            # Direct lookup is faster than iterating all and skipping
-            if g_num not in gene_trees:
-                continue 
+            if g_num not in gene_trees: continue 
             gt_obj = gene_trees[g_num]
-            
             score = Reconciler.reconcile_one_static(mul_data, gt_obj, groups, False)
             total_score += score
-
-    '''for g_num, gt_obj in gene_trees.items():
-        if mul_idx == 0:
-            # Special case ST
-            init_maps = {}
-            for n in gt_obj.ete_tree.iter_leaves():
-                 init_maps[n.name] = [n.name.split("_")[-1]]
-            for n in gt_obj.ete_tree.traverse():
-                 if not n.is_leaf(): init_maps[n.name] = []
-            score = Reconciler.recon_lca_legacy_static(gt_obj, mul_data.mt, init_maps, False)
-        else:
-            if g_num not in cur_groups_dict: continue
-            groups = cur_groups_dict[g_num]
-            score = Reconciler.reconcile_one_static(mul_data, gt_obj, groups, False)
-        
-        total_score += score'''
         
     return mul_idx, total_score
 
@@ -119,126 +97,146 @@ class Reconciler:
         self.cfg = config
 
     # --------------------------------------------------------------------------
-    # GROUP COLLAPSING LOGIC
+    # GROUP COLLAPSING LOGIC (Optimized)
     # --------------------------------------------------------------------------
 
     def _get_sister_clade_labels(self, node_obj) -> List[str]:
-        """Helper to get tip labels of the sister node from a Node Object."""
-        if not node_obj or not node_obj.up:
-            return []
-        
+        if not node_obj or not node_obj.up: return []
         sisters = [ch for ch in node_obj.up.children if ch != node_obj]
         labels = []
         for sis in sisters:
+            # Optimize: Avoid iter_leaves if cached, but for MT it's fast enough usually
             labels.extend([l.name.split("_")[-1] for l in sis.iter_leaves()])
         return labels
 
     def _find_node_by_clade(self, tree: GrandmaTree, target_leaves: Set[str]) -> Any:
-        """
-        Finds the node in 'tree' whose descendant leaves exactly match 'target_leaves'.
-        This avoids relying on node labels which change during MUL-tree construction.
-        """
-        # Find leaves matching names
+        # OPTIMIZATION: Use Dictionary Lookup O(1) instead of search_nodes O(N)
         leaf_nodes = []
         for t in target_leaves:
-            # Search for exact name match
-            matches = tree.ete_tree.search_nodes(name=t)
-            if matches:
-                leaf_nodes.extend(matches)
+            # Use get_node from GrandmaTree wrapper
+            node = tree.get_node(t)
+            if node:
+                leaf_nodes.append(node)
         
-        if not leaf_nodes:
-            return None
-            
-        # Get LCA of these leaves
+        if not leaf_nodes: return None
+        
+        # If the set matches exactly, the LCA is the node that covers them
+        # Note: In a MUL tree, getting LCA of all leaves in a clade returns the clade root
         lca = tree.ete_tree.get_common_ancestor(leaf_nodes)
-        
-        # Verify strict equality (Monophyly)
-        # If LCA has extra leaves not in target, it's not the exact clade node
         lca_leaves = {l.name for l in lca.iter_leaves()}
-        if lca_leaves == target_leaves:
-            return lca
+        if lca_leaves == target_leaves: return lca
         return None
 
-    # wrapper for multiprocessing compatibility
-    def compute_groups(self, gene_tree: GrandmaTree, mul_data: MulData) -> GroupData:
-        return self._compute_groups(gene_tree, mul_data)
-
-    def _compute_groups(self, gene_tree: GrandmaTree, mul_data: MulData) -> GroupData:
+    def get_sister_clades(self, mul_data: MulData) -> Tuple[Set[str], Set[str]]:
         """
-        Pure computation of groups for a single gene tree against a MUL-tree.
-        Returns GroupData object.
+        Calculates sister clades ONCE per MUL-tree.
         """
+        if mul_data.h1_node == "NA":
+            return set(), set()
+            
         h1_target = set(mul_data.h_clade)
-        groups: Dict[str, List[str]] = {}
-        singles: Dict[str, List[str]] = {}
+        h2_target = {f"{x}*" for x in mul_data.h_clade}
         
-        # Ensure postorder for bottom-up greedy grouping
+        n1_obj = self._find_node_by_clade(mul_data.mt, h1_target)
+        n2_obj = self._find_node_by_clade(mul_data.mt, h2_target)
+        
+        h1_sisters = self._get_sister_clade_labels(n1_obj) if n1_obj else []
+        h2_sisters = self._get_sister_clade_labels(n2_obj) if n2_obj else []
+
+        if n2_obj and not set(h1_sisters).isdisjoint({l.name for l in n2_obj.iter_leaves()}): h1_sisters = []
+        if n1_obj and not set(h2_sisters).isdisjoint({l.name for l in n1_obj.iter_leaves()}): h2_sisters = []
+
+        h1_clean = {x.replace("*", "") for x in h1_sisters}
+        h2_clean = {x.replace("*", "") for x in h2_sisters}
+        
+        return h1_clean, h2_clean
+
+    def compute_groups(self, gene_tree: GrandmaTree, mul_data: MulData, 
+                       h1_sisters: Set[str] = None, h2_sisters: Set[str] = None) -> GroupData:
+        return self._compute_groups(gene_tree, mul_data, h1_sisters, h2_sisters)
+
+    def _compute_groups(self, gene_tree: GrandmaTree, mul_data: MulData, 
+                        h1_sisters_clean: Set[str] = None, h2_sisters_clean: Set[str] = None) -> GroupData:
+        
+        # 1. Identify Candidate Groups (O(N) using DP)
+        h1_target = set(mul_data.h_clade)
+        groups = {}
+        singles = {}
         gt_nodes = list(gene_tree.ete_tree.traverse("postorder"))
 
-        # --- 1. Singles & Groups Identification ---
+        # OPTIMIZATION: Cache the species sets for every node to avoid re-traversing children
+        # Map: TreeNode -> Set[SpeciesName]
+        node_species_map: Dict[TreeNode, Set[str]] = {}
+        # Map: TreeNode -> List[LeafName] (for storing in 'groups'/'singles')
+        node_leaf_names: Dict[TreeNode, List[str]] = {}
+
         for node in gt_nodes:
             if node.is_leaf():
                 sp_name = node.name.split("_")[-1]
+                node_species_map[node] = {sp_name}
+                node_leaf_names[node] = [node.name]
+                
+                # Check for single match
                 if sp_name in h1_target:
                     parent = node.up
                     if parent:
+                        # We can't fully know parent's other children yet in postorder loop if we look 'up',
+                        # but singles logic relies on parent context.
+                        # Legacy logic: "anc_clade = [l.name for l in parent.iter_leaves() if l.name != node.name]"
+                        # This part is slightly expensive but only runs for target leaves.
+                        # We can optimize by waiting for parent processing, but for now let's leave this 
+                        # specific "single" check as-is or optimize slightly.
                         anc_clade = [l.name for l in parent.iter_leaves() if l.name != node.name]
                         singles[node.name] = anc_clade
-
-        for node in gt_nodes:
-            if not node.is_leaf():
+            else:
+                # Internal Node: Aggregate from children
                 children = node.children
-                if len(children) != 2: continue
-                d1, d2 = children[0], children[1]
-                d1_leaves = [l.name.split("_")[-1] for l in d1.iter_leaves()]
-                d2_leaves = [l.name.split("_")[-1] for l in d2.iter_leaves()]
+                current_specs = set()
+                current_leaf_names = []
                 
-                d1_is_hybrid = all(sp in h1_target for sp in d1_leaves)
-                d2_is_hybrid = all(sp in h1_target for sp in d2_leaves)
+                for ch in children:
+                    current_specs.update(node_species_map[ch])
+                    current_leaf_names.extend(node_leaf_names[ch])
                 
-                if d1_is_hybrid and d2_is_hybrid:
-                    # Disjoint check
-                    if not any(sp in d1_leaves for sp in d2_leaves):
-                        cur_clade = [l.name for l in node.iter_leaves()]
-                        # Greedy delete descendants
-                        for desc in node.iter_descendants():
-                            if desc.name in groups: del groups[desc.name]
-                        groups[node.name] = cur_clade 
-        
-        # Clean singles swallowed by groups
+                node_species_map[node] = current_specs
+                node_leaf_names[node] = current_leaf_names
+
+                if len(children) == 2:
+                    d1, d2 = children[0], children[1]
+                    d1_specs = node_species_map[d1]
+                    d2_specs = node_species_map[d2]
+                    
+                    # Logic: Both children must be PURELY hybrid
+                    # Python's set.issubset is optimized C
+                    d1_is_hybrid = d1_specs.issubset(h1_target)
+                    d2_is_hybrid = d2_specs.issubset(h1_target)
+                    
+                    if d1_is_hybrid and d2_is_hybrid:
+                        # Logic: Must be disjoint
+                        if d1_specs.isdisjoint(d2_specs):
+                            # Found a group!
+                            # Remove descendants from groups
+                            for desc in node.iter_descendants():
+                                if desc.name in groups: del groups[desc.name]
+                            
+                            groups[node.name] = current_leaf_names
+
+        # Cleanup singles
         for grp_node in groups:
             for leaf in groups[grp_node]:
                 if leaf in singles: del singles[leaf]
 
-        # --- 2. Fixing Logic ---
-        final_ambiguous: List[List[str]] = []
-        final_fixed: List[Tuple[List[str], str]] = []
+        final_ambiguous = []
+        final_fixed = []
 
+        # 2. Fix Groups using Sisters
         if mul_data.h1_node != "NA":
-            h2_target = {f"{x}*" for x in mul_data.h_clade}
-            n1_obj = self._find_node_by_clade(mul_data.mt, h1_target)
-            n2_obj = self._find_node_by_clade(mul_data.mt, h2_target)
-            
-            h1_sisters = self._get_sister_clade_labels(n1_obj) if n1_obj else []
-            h2_sisters = self._get_sister_clade_labels(n2_obj) if n2_obj else []
-
-            # Validity Check: Disjointness
-            if n2_obj:
-                h2_leaves_exact = {l.name for l in n2_obj.iter_leaves()}
-                if not set(h1_sisters).isdisjoint(h2_leaves_exact):
-                    h1_sisters = []
-            
-            if n1_obj:
-                h1_leaves_exact = {l.name for l in n1_obj.iter_leaves()}
-                if not set(h2_sisters).isdisjoint(h1_leaves_exact):
-                    h2_sisters = []
-
-            # Clean sisters (remove *)
-            h1_sisters_clean = {x.replace("*", "") for x in h1_sisters}
-            h2_sisters_clean = {x.replace("*", "") for x in h2_sisters}
+            if h1_sisters_clean is None or h2_sisters_clean is None:
+                h1_sisters_clean, h2_sisters_clean = self.get_sister_clades(mul_data)
 
             def process_unit(unit_nodes: List[str]):
-                if len(unit_nodes) == 1:
+                # Re-fetching nodes is fast with node_map in GrandmaTree
+                if len(unit_nodes) == 1: 
                     g_node = gene_tree.get_node(unit_nodes[0])
                 else:
                     n_objs = [gene_tree.get_node(x) for x in unit_nodes]
@@ -247,12 +245,15 @@ class Reconciler:
                 if not g_node or not g_node.up:
                     final_ambiguous.append(unit_nodes)
                     return
-
+                
+                # Get sisters of the gene node
+                # Note: We can optimize this too, but it's only for the formed groups (few)
                 gt_sisters = self._get_sister_clade_labels(g_node)
                 if not gt_sisters:
                     final_ambiguous.append(unit_nodes)
                     return
-                    
+
+                # Check intersection
                 if h1_sisters_clean and all(s in h1_sisters_clean for s in gt_sisters):
                     final_fixed.append((unit_nodes, '')) 
                 elif h2_sisters_clean and all(s in h2_sisters_clean for s in gt_sisters):
@@ -269,179 +270,189 @@ class Reconciler:
         return GroupData(final_ambiguous, final_fixed)
 
     # --------------------------------------------------------------------------
-    # RECONCILIATION LOGIC
+    # RECONCILIATION LOGIC (OPTIMIZED)
     # --------------------------------------------------------------------------
 
     @staticmethod
-    def recon_lca_legacy_static(gene_tree: GrandmaTree, map_target_tree: GrandmaTree, 
-                         initial_maps: Dict[str, List[str]], retmap=False) -> Union[int, ReconResult]:
-        
+    def recon_lca_optimized(gene_tree: GrandmaTree, map_target_tree: GrandmaTree, 
+                         initial_maps: Dict[TreeNode, List[TreeNode]], retmap=False, 
+                         precomputed_postorder: List[TreeNode] = None) -> Union[int, ReconResult]:
+        """
+        Highly optimized LCA reconciliation.
+        """
         score = 0
-        dups = {n.name: 0 for n in gene_tree.ete_tree.traverse()}
-        losses = {n.name: 0 for n in gene_tree.ete_tree.traverse()}
-        nodes = list(gene_tree.ete_tree.traverse("postorder"))
         lca_maps = initial_maps.copy()
+        
+        node_dups_obj = {}
+        node_losses_obj = {}
+        if retmap:
+            for n in gene_tree.ete_tree.traverse():
+                node_dups_obj[n] = 0
+                node_losses_obj[n] = 0
+        
+        nodes = precomputed_postorder if precomputed_postorder else gene_tree.ete_tree.traverse("postorder")
         
         for node in nodes:
             if node.is_leaf(): continue
+            
             children = node.children
-            # Fix polytomy handling
             if len(children) < 2: continue
             
-            # LCA of all children maps
-            child_maps = [lca_maps[child.name][0] for child in children]
-            map_node = map_target_tree.get_lca(child_maps)
-            lca_maps[node.name] = [map_node.name]
+            # Retrieve maps (guaranteed to exist due to identity checks upstream)
+            c1_map = lca_maps[children[0]][0]
+            c2_map = lca_maps[children[1]][0]
+            
+            # Cached LCA lookup
+            map_node = map_target_tree.get_lca_obj([c1_map, c2_map])
+            lca_maps[node] = [map_node]
             
             is_dup = 0
-            # If map matches any child map
-            if any(map_node.name == cm for cm in child_maps):
+            if map_node is c1_map or map_node is c2_map:
                 is_dup = 1
-                dups[node.name] += 1
                 score += 1
+                if retmap: node_dups_obj[node] += 1
                 
-            cur_depth = map_target_tree.get_node_depth(map_node.name)
+            cur_depth = getattr(map_node, "fast_depth", 0)
             
             if node.is_root():
-                 losses[node.name] += cur_depth
-                 score += cur_depth
+                score += cur_depth
+                if retmap: node_losses_obj[node] += cur_depth
             
-            for i, child in enumerate(children):
-                child_map = child_maps[i]
-                child_depth = map_target_tree.get_node_depth(child_map)
-                c_loss = (child_depth - cur_depth - 1) + is_dup
-                if c_loss > 0:
-                    score += c_loss
-                    losses[child.name] += c_loss
-                
-        if retmap: 
-            return ReconResult(score, sum(dups.values()), sum(losses.values()), lca_maps, dups, losses)
+            c1_depth = getattr(c1_map, "fast_depth", 0)
+            c1_loss = (c1_depth - cur_depth - 1) + is_dup
+            if c1_loss > 0:
+                score += c1_loss
+                if retmap: node_losses_obj[children[0]] += c1_loss
+            
+            c2_depth = getattr(c2_map, "fast_depth", 0)
+            c2_loss = (c2_depth - cur_depth - 1) + is_dup
+            if c2_loss > 0:
+                score += c2_loss
+                if retmap: node_losses_obj[children[1]] += c2_loss
+
+        if retmap:
+            final_maps_str = {k.name: [v[0].name] for k, v in lca_maps.items()}
+            final_dups_str = {k.name: v for k, v in node_dups_obj.items()}
+            final_losses_str = {k.name: v for k, v in node_losses_obj.items()}
+            return ReconResult(score, sum(final_dups_str.values()), sum(final_losses_str.values()), final_maps_str, final_dups_str, final_losses_str)
+            
         return score
 
     @staticmethod
     def reconcile_one_static(mul_data: MulData, gene_tree: GrandmaTree, 
-                      groups: GroupData, retmap=False) -> Union[int, ReconResult]:
-        """
-        Reconciles one gene tree to one MUL-tree using pre-computed groups.
-        """
-        best_score = 999999
-        best_res = None
-
+                    groups: GroupData, retmap=False) -> Union[int, ReconResult]:
+        
         perm_groups = groups.ambiguous_groups
         fixed_groups = groups.fixed_groups
 
-        # OPTIMIZATION: Pre-calculate leaf species names once
-        leaf_names = {n.name: n.name.split("_")[-1] for n in gene_tree.ete_tree.iter_leaves()}
+        # 1. Target Cache
+        mul_node_lookup = {n.name: n for n in mul_data.mt.ete_tree.traverse()}
         
-        # OPTIMIZATION: Map Leaf -> Group Index/Suffix ONCE
-        # This avoids iterating the groups list 2^N * Leaves times.
-        leaf_to_perm_idx = {}
-        for idx, grp in enumerate(perm_groups):
-            for node in grp:
-                leaf_to_perm_idx[node] = idx
+        # 2. Pre-calculate Target Options
+        leaf_targets = {}
+        leaf_nodes = list(gene_tree.ete_tree.iter_leaves())
         
-        leaf_to_fixed_suffix = {}
-        for grp, suffix in fixed_groups:
-            for node in grp:
-                leaf_to_fixed_suffix[node] = suffix
-        
-        # 3. Permutation Loop (2^N)
-        for combo in itertools.product(['', '*'], repeat=len(perm_groups)):
-            current_mapping = {}
-
-            # Fast Map Construction (O(Leaves) instead of O(Leaves * Groups)) & using pre-calculated strings
-            for n_name, sp_name in leaf_names.items():
-                suffix = ""
-                
-                # O(1) Lookup
-                # Check ambiguous
-                if n_name in leaf_to_perm_idx:
-                    suffix = combo[leaf_to_perm_idx[n_name]]
-                # Check fixed
-                elif n_name in leaf_to_fixed_suffix:
-                    suffix = leaf_to_fixed_suffix[n_name]
-                            
-                current_mapping[n_name] = [sp_name + suffix]
-
-            '''def get_map_suffix(n_name):
-                # Check ambiguous groups
-                for i, grp in enumerate(perm_groups):
-                    if n_name in grp: return combo[i]
-                # Check fixed groups
-                for grp, fix_map in fixed_groups:
-                    if n_name in grp: return fix_map
-                return "" '''
-
-            # Initialize Maps
-            '''for node in gene_tree.ete_tree.iter_leaves():
-                sp_name = node.name.split("_")[-1]
-                suffix = get_map_suffix(node.name)
-                current_mapping[node.name] = [sp_name + suffix]'''
-
-            '''for node_name, sp_name in leaf_species.items():
-                suffix = get_map_suffix(node_name)
-                current_mapping[node_name] = [sp_name + suffix]'''
+        for n in leaf_nodes:
+            # FIX: Ensure 1_a -> a
+            raw_name = getattr(n, "clean_name", n.name)
+            sp_name = raw_name.split("_")[-1]
             
-            # Internal nodes init
-            for node in gene_tree.ete_tree.traverse():
-                if not node.is_leaf(): current_mapping[node.name] = []
-                    
-            # Run LCA
+            normal_target = mul_node_lookup.get(sp_name)
+            star_target = mul_node_lookup.get(sp_name + "*")
+            
+            if not normal_target:
+                raise ValueError(f"Leaf '{n.name}' maps to species '{sp_name}', but '{sp_name}' is not in the MUL-tree.")
+                
+            if not star_target: star_target = normal_target
+            leaf_targets[n] = (normal_target, star_target)
+
+        # 3. Map Leaf -> Group Index
+        leaf_instructions = {}
+        for idx, grp in enumerate(perm_groups):
+            for n_name in grp:
+                node = gene_tree.get_node(n_name)
+                if node: leaf_instructions[node] = (0, idx)
+                
+        for grp, suffix in fixed_groups:
+            target_idx = 1 if suffix == "*" else 0
+            for n_name in grp:
+                node = gene_tree.get_node(n_name)
+                if node: leaf_instructions[node] = (1, target_idx)
+
+        # 4. Hoist Traversal
+        gt_postorder = list(gene_tree.ete_tree.traverse("postorder"))
+
+        best_score = 999999
+        best_res = None
+        
+        # 5. Permutation Loop
+        for combo in itertools.product([0, 1], repeat=len(perm_groups)):
+            current_mapping = {}
+            
+            for node in leaf_nodes:
+                targets = leaf_targets[node] 
+                target_idx = 0 
+                
+                if node in leaf_instructions:
+                    type_code, val = leaf_instructions[node]
+                    target_idx = combo[val] if type_code == 0 else val
+                
+                current_mapping[node] = [targets[target_idx]]
+
+            for node in gt_postorder:
+                if not node.is_leaf(): current_mapping[node] = []
+            
             if retmap:
-                res = Reconciler.recon_lca_legacy_static(gene_tree, mul_data.mt, current_mapping, True)
+                res = Reconciler.recon_lca_optimized(gene_tree, mul_data.mt, current_mapping, True, gt_postorder)
                 if res.score < best_score:
                     best_score = res.score
-                    best_res = res # Store the object
-                # If equal, we might want to store multiple, but keeping simple for now
+                    best_res = res
             else:
-                score = Reconciler.recon_lca_legacy_static(gene_tree, mul_data.mt, current_mapping, False)
+                score = Reconciler.recon_lca_optimized(gene_tree, mul_data.mt, current_mapping, False, gt_postorder)
                 if score < best_score:
                     best_score = score
         
         return best_res if retmap else best_score
 
-    # --------------------------------------------------------------------------
-    # DRIVERS WITH PICKLING
-    # --------------------------------------------------------------------------
-
+    @staticmethod
+    def recon_lca_legacy_static(gene_tree: GrandmaTree, map_target_tree: GrandmaTree, 
+                         initial_maps: Dict[str, List[str]], retmap=False) -> Union[int, ReconResult]:
+        obj_maps = {}
+        for n in gene_tree.ete_tree.traverse():
+             val_list = initial_maps.get(n.name, []) 
+             if not val_list and n in initial_maps: val_list = initial_maps[n] 
+             
+             if val_list:
+                 if isinstance(val_list[0], str):
+                      obj_maps[n] = [map_target_tree.get_node(val_list[0])]
+                 else:
+                      obj_maps[n] = val_list
+             else:
+                 obj_maps[n] = []
+                 
+        return Reconciler.recon_lca_optimized(gene_tree, map_target_tree, obj_maps, retmap)
+        
     def recon_all(self, mul_trees: Dict[int, MulData], gene_trees: Dict[int, GrandmaTree], 
                   pickle_dir: str, run_prefix: str, n_proc: int, logger: Any) -> List[Tuple[int, int]]:
-        """
-        Main driver. Iterates MUL-trees, loads their group pickles, reconciles all gene trees.
-        Uses multiprocessing for parallel execution.
-        """
         step = "Reconciliation"
         logger.report_step(step, "In progress...")
-        
         all_scores = {}
-        
-        # Prepare arguments for the worker
-        # gene_trees object is passed to all workers. 
-        # Since it is read-only, multiprocessing should handle it efficiently on Linux (fork).
-        # On Windows, it will be pickled, so ensure GrandmaTree is picklable.
-        
         tasks = mul_trees.items()
-        
         worker_func = partial(_worker_reconcile_single, 
                               gene_trees=gene_trees, 
                               pickle_dir=str(pickle_dir), 
                               run_prefix=run_prefix)
-        
         if n_proc > 1:
             with mp.Pool(processes=n_proc) as pool:
-                # imap_unordered lets us track progress if needed, but we just want results
                 for idx, score in pool.imap_unordered(worker_func, tasks):
                     all_scores[idx] = score
         else:
-            # Serial Fallback
             for item in tasks:
                 idx, score = worker_func(item)
                 all_scores[idx] = score
-
         logger.report_step(step, "Success")
         return sorted(all_scores.items(), key=lambda x: x[1])
 
-    # Method to keep class compatibility with existing code calling instance methods
     def recon_lca_legacy(self, *args, **kwargs):
         return Reconciler.recon_lca_legacy_static(*args, **kwargs)
         
@@ -451,42 +462,40 @@ class Reconciler:
     def get_lowest_maps(self, sorted_scores: List[Tuple[int, int]], n_lowest: int, 
                         mul_trees: Dict[int, MulData], gene_trees: Dict[int, GrandmaTree], 
                         pickle_dir: str, run_prefix: str, logger: Any) -> List[Tuple[int, Dict[int, ReconResult]]]:
-        
         step = "Getting maps for lowest scoring MTs"
         logger.report_step(step, "In progress...")
-        
         detailed_res = []
         limit = min(len(sorted_scores), n_lowest)
-        
         for idx, total in sorted_scores[:limit]:
             mul_data = mul_trees[idx]
-            
-            # Load Pickle
+            mul_data.mt.build_lca_cache() 
             pickle_path = Path(pickle_dir) / f"{run_prefix}_{idx}_groups.pickle"
             cur_groups_dict = {}
             if idx != 0 and pickle_path.exists():
                 with open(pickle_path, 'rb') as f:
                     cur_groups_dict = pickle.load(f)
-            
-            # Reconcile All Gene Trees with Maps
             gt_results = {}
+            st_lookup = {n.name: n for n in mul_data.mt.ete_tree.traverse()} if idx == 0 else {}
+            
             for g_num, gt_obj in gene_trees.items():
                 if idx == 0:
                     init_maps = {}
-                    for n in gt_obj.ete_tree.iter_leaves():
-                         init_maps[n.name] = [n.name.split("_")[-1]]
-                    for n in gt_obj.ete_tree.traverse():
-                         if not n.is_leaf(): init_maps[n.name] = []
-                    res = self.recon_lca_legacy(gt_obj, mul_data.mt, init_maps, True)
+                    gt_nodes = list(gt_obj.ete_tree.traverse("postorder"))
+                    for n in gt_nodes:
+                        if n.is_leaf():
+                             # FIX: Ensure 1_a -> a here too for consistency
+                             raw_name = getattr(n, "clean_name", n.name)
+                             sp_name = raw_name.split("_")[-1]
+                             if sp_name in st_lookup: init_maps[n] = [st_lookup[sp_name]]
+                        else:
+                             init_maps[n] = []
+                    res = Reconciler.recon_lca_optimized(gt_obj, mul_data.mt, init_maps, True, gt_nodes)
                 else:
                     groups = cur_groups_dict[g_num]
                     res = self.reconcile_one(mul_data, gt_obj, groups, True)
-                
                 gt_results[g_num] = res
-            
             detailed_res.append((idx, gt_results))
             del cur_groups_dict
-            
         logger.report_step(step, "Success")
         return detailed_res
         

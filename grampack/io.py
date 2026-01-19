@@ -17,6 +17,10 @@ class GrandmaConfig:
     species_tree_path: str = ""
     gene_tree_path: str = ""
     output_dir: str = ""
+
+    # Execution Mode
+    mode: str = "single"  # options: single, split, full, parallel
+
     run_prefix: str = "grandma"
     overwrite: bool = False
 
@@ -62,7 +66,7 @@ def parse_args() -> GrandmaConfig:
     parser.add_argument("-s", dest="spec_tree", required=True, help="Species tree file")
     parser.add_argument("-g", dest="gene_tree", help="Gene tree file (required unless --buildmultrees)")
     
-    # Options
+    # Base Options
     parser.add_argument("-h1", dest="h1", help="Hybrid clade 1 (space separated nodes/tips)")
     parser.add_argument("-h2", dest="h2", help="Hybrid clade 2 (space separated nodes/tips)")
     parser.add_argument("-c", dest="cap", type=int, default=8, help="Max groups (cap)")
@@ -70,6 +74,18 @@ def parse_args() -> GrandmaConfig:
     parser.add_argument("-p", dest="procs", type=int, default=1, help="Number of processes")
     parser.add_argument("-f", dest="prefix", default="grandma", help="Output file prefix")
     parser.add_argument("-v", dest="verbosity", type=int, default=3, help="Verbosity (0-3)")
+
+    # Mode Options
+    parser.add_argument("-m", dest="mode", choices=["single", "split", "full", "parallel"], default="single",
+                        help="Execution mode (single, split, full, parallel)")
+    parser.add_argument('-i', '--iter', type=int, default=0, help='Number of iterations; <int>, non-positive for infinite mode')
+    parser.add_argument('--prep', type=str, help='Preprocess input files; "0/D/default" for default settings, or <path> for a config json')
+    parser.add_argument('--start', type=str, default='auto', help='Start point when finishing a previous execution; positive <int>, or "auto" for auto-detection')
+    parser.add_argument('--cutoff', type=str, default='auto', help='Stopping condition mode; "auto" for abs:0+lookback, "rel:<float>" for relative, or "abs:<int>" for absolute')
+    parser.add_argument('--ignore-nesting', action='store_true', help='Do not automatically fix nested hybridization events; let GRAMPA iterate normally')
+
+    parser.add_argument('--plot', action='store_true', help='Plot taxon count, MP score, and normalized score over iterations')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode for additional output')
 
     # Flags
     parser.add_argument("--buildmultrees", action="store_true", help="Only build MUL-trees and exit")
@@ -100,6 +116,9 @@ def parse_args() -> GrandmaConfig:
         species_tree_path = args.spec_tree,
         gene_tree_path    = args.gene_tree if args.gene_tree else "",
         output_dir        = out_dir,
+
+        mode              = args.mode,
+
         run_prefix        = args.prefix,
         overwrite         = args.overwrite,
         h1_nodes          = args.h1,

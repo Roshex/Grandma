@@ -186,14 +186,6 @@ class GeneTreeManager:
         self.cfg = config
         self.logger = logger
         self.reconciler = reconciler
-        self.precomputed_groups = {}
-
-class GeneTreeManager:
-    def __init__(self, config: GrandmaConfig, logger: GrandmaLogger, reconciler: Reconciler):
-        self.cfg = config
-        self.logger = logger
-        self.reconciler = reconciler
-        # Note: self.precomputed_groups is REMOVED to enforce memory saving
 
     def cull(self, mul_trees: Dict[int, MulData], gene_trees: Dict[int, GrandmaTree]):
         if self.cfg.lca_opt != "st-only":
@@ -221,11 +213,14 @@ class GeneTreeManager:
             if pickle_path.exists() and not self.cfg.overwrite:
                 continue
                 
+            # OPTIMIZATION: Get sisters once for this MUL-tree
+            h1_sis, h2_sis = self.reconciler.get_sister_clades(m_data)
+
             # Compute groups for ALL gene trees for THIS mul-tree
             current_mt_groups: Dict[int, GroupData] = {}
             
             for g_idx, gt_obj in gene_trees.items():
-                group_data = self.reconciler.compute_groups(gt_obj, m_data)
+                group_data = self.reconciler.compute_groups(gt_obj, m_data, h1_sis, h2_sis)
                 current_mt_groups[g_idx] = group_data
             
             # Dump to disk

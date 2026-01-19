@@ -4,7 +4,7 @@ It uses ETE3 but adds methods to make the tree look and behave like the old dict
 '''
 
 from ete3 import Tree, TreeNode
-from typing import List, Set, Dict, Optional
+from typing import List, Set, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 
 class GrandmaTree:
@@ -18,96 +18,111 @@ class GrandmaTree:
             # add ; if missing
             if newick and not newick.strip().endswith(";"):
                 newick += ";"
-            #print('starting to load tree:', newick)
             # Format 1 allows internal node names
-            self.ete_tree = Tree(newick, format=0) # ETE format 0: standard newick: flexible names and blengths + support values
-            #print(self.ete_tree)
+            self.ete_tree = Tree(newick, format=0) 
             
         self.node_map = {} # Map name -> TreeNode
+        
+        # OPTIMIZATION: Cache for LCA lookups to avoid tree traversal overhead
+        self.lca_cache: Dict[Tuple[int, ...], TreeNode] = {}
+        
         self._index_nodes()
-        self._cache_depths()
+        self._cache_depths() # FIXED: This must be enabled!
 
     def _index_nodes(self):
         """
         Assigns <x> labels to internal nodes if missing.
-        CHANGED: Uses postorder to match legacy GRAMPA bottom-up labeling (Root = High ID).
+        Uses postorder to match legacy GRAMPA bottom-up labeling.
         """
         i = 1
-        # Change "levelorder" to "postorder"
         for node in self.ete_tree.traverse("postorder"):
             if not node.is_leaf():
                 if not node.name:
                     node.name = f"<{i}>"
                     i += 1
-                elif not node.name.startswith("<"):
-                    # Preserve existing names if they aren't auto-generated IDs
-                    pass
             else:
-                # Clean leaf names
                 node.name = str(node.name).strip()
             
             self.node_map[node.name] = node
 
     def _cache_depths(self):
         """
-        Calculates node depth (distance to root in number of nodes).
-        Legacy GRAMPA defines root depth as 0.
+        Calculates node depth and attaches it DIRECTLY to the ete3 node object.
+        Allows O(1) attribute access (node.fast_depth).
         """
-        self.depths = {}
+        # Traverse preorder: parent is always processed before child
         for node in self.ete_tree.traverse("preorder"):
-            depth = 0
-            curr = node
-            while curr.up:
-                depth += 1
-                curr = curr.up
-            self.depths[node.name] = depth
+            if node.is_root():
+                node.add_feature("fast_depth", 0)
+            else:
+                node.add_feature("fast_depth", node.up.fast_depth + 1)
+            
+            # Optimization for MUL-trees: Cache the "clean" name to avoid .split()/.replace() later
+            clean = node.name.replace("*", "") if node.is_leaf() else ""
+            node.add_feature("clean_name", clean)
 
-    def get_node_depth(self, node_name: str) -> int:
-        return self.depths.get(node_name, 0)
+    def build_lca_cache(self):
+        """
+        Pre-computes or prepares the tree for heavy LCA queries.
+        This is called before the heavy permutation loops.
+        """
+        self.lca_cache = {}
+        # We could pre-fill, but lazy caching in get_lca is usually better 
+        # to avoid storing N^2 pairs if not all are needed.
+        pass
 
     def get_node(self, name: str) -> TreeNode:
         return self.node_map.get(name)
 
     def get_lca(self, species_list: List[str]) -> TreeNode:
-        """Returns the LCA node object for a list of species names."""
+        """String-based LCA lookup (Legacy support)"""
         nodes = [self.node_map[name] for name in species_list]
         if not nodes: return None
         if len(nodes) == 1: return nodes[0]
         return self.ete_tree.get_common_ancestor(nodes)
 
+    def get_lca_obj(self, nodes: List[TreeNode]) -> TreeNode:
+        """
+        OPTIMIZATION: Object-based LCA lookup.
+        Uses caching to avoid tree traversal.
+        """
+        if not nodes: return None
+        if len(nodes) == 1: return nodes[0]
+        
+        # Sort by memory address (id) to create a consistent key for the pair/set
+        # Tuple creation is very fast in Python
+        key = tuple(sorted(id(n) for n in nodes))
+        
+        if key in self.lca_cache:
+            return self.lca_cache[key]
+        
+        lca = self.ete_tree.get_common_ancestor(nodes)
+        self.lca_cache[key] = lca
+        return lca
+
     def get_clade_leaves(self, node_name: str) -> Set[str]:
         node = self.get_node(node_name)
-        if not node:
-            return set()
+        if not node: return set()
         return {leaf.name for leaf in node.iter_leaves()}
 
     def to_mul_tree(self, h_node_label: str, p_node_label: str) -> 'GrandmaTree':
         """Generates a MUL-tree by copying h_node subtree to p_node location."""
         new_tree_obj = self.ete_tree.copy()
         
-        # 1. Search nodes
         h_matches = new_tree_obj.search_nodes(name=h_node_label)
         p_matches = new_tree_obj.search_nodes(name=p_node_label)
         
-        if not h_matches or not p_matches:
-            return None
-            
+        if not h_matches or not p_matches: return None
         h_node = h_matches[0]
         p_node = p_matches[0]
 
-        # 2. Validity Check
-        # No need to check p_node == h_node: otherwise we block autopolyploidy
-        if p_node in h_node.iter_descendants():
-            return None
+        if p_node in h_node.iter_descendants(): return None
 
-        # 3. Copy subtree
         h_subtree_copy = h_node.copy()
         
-        # 4. Relabel tips in copy
         for leaf in h_subtree_copy.iter_leaves():
             leaf.name = f"{leaf.name}*"
             
-        # 5. Attach
         p_parent = p_node.up
         if p_parent is None:
             new_root = TreeNode()
@@ -121,18 +136,14 @@ class GrandmaTree:
             new_internal.add_child(p_node)
             new_internal.add_child(h_subtree_copy)
 
-        # 6. Remove the <x> labels in the new tree to re-index later (when calling constructor)
         for n in new_tree_obj.traverse():
             if n.name.startswith("<") and n.name.endswith(">"):
                 n.name = None
         
+        # Constructor will call _cache_depths() and re-index
         return GrandmaTree(tree_obj=new_tree_obj)
 
     def to_string(self, internal_labels=True) -> str:
-        # Format 8 includes all names, 1 includes internal
-        fmt = 1 if internal_labels else 5 # 5 is internal only? ETE formats are tricky.
-        # Format 8: all names, no branch lengths (closest to what we need)
-        # However, legacy code output standard newick.
         root_name = str(self.ete_tree.name) if internal_labels else ""
         return self.ete_tree.write(format=8 if internal_labels else 9)[:-1]+root_name+";"
 
@@ -142,4 +153,4 @@ class MulData:
     h_clade: list = field(default_factory=list)
     h1_node: str = "NA"
     h2_node: str = "NA"
-
+    
