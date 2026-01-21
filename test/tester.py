@@ -40,7 +40,7 @@ if __name__ == "__main__":
     time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}/ {other_args}", "new") # --debug --plot
     #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug --plot", "new")
     #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_deep/ {other_args} -m full", "new")
-    
-    time_tool(f"python {old_tool} -g {g} -s {s} -o {o_old} --overwrite {other_args} --maps", "old")
+
+    #time_tool(f"python {old_tool} -g {g} -s {s} -o {o_old} --overwrite {other_args} --maps", "old")
 
     time_tool(f"python {Path(__file__).parent / 'exe_compare.py'} -log {path_manual / 'compare_log.txt'} -old {o_old} -new {o_new}", "compare")
