@@ -9,7 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from .models import Tree, TreeNode, SmrtTree, StepResult
-from .gene_ops import TreeLoader
+from .ops import TreeLoader
 
 class HCounterState:
     """Tracks hybridization events to detect nested patterns."""

@@ -10,7 +10,7 @@ from dataclasses import replace
 from .config import parse_args, GrandmaConfig, GrandmaWriter, GrandmaMetadata
 from .logger import GrandmaLogger
 from .models import SmrtTree
-from .gene_ops import TreeLoader, GeneTreeManager, MulTreeManager
+from .ops import TreeLoader, GeneTreeManager, MulTreeManager
 from .flow import FlowManager
 from .reconcile import Reconciler
 from .orthology import OrthologyLabeler
