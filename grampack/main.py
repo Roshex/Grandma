@@ -9,7 +9,7 @@ from dataclasses import replace
 
 from .config import parse_args, GrandmaConfig, GrandmaWriter, GrandmaMetadata
 from .logger import GrandmaLogger
-from .models import SmrtTree
+from .models import SmrtTree, NameRegistry
 from .ops import TreeLoader, GeneTreeManager, MulTreeManager
 from .flow import FlowManager
 from .reconcile import Reconciler
@@ -90,6 +90,7 @@ class Run:
         self.spec_tree = spec_tree
         self.gene_trees = gene_trees if gene_trees is not None else {}
         self.mul_trees = {}
+        self.registry = NameRegistry()
         
         # 3. Components (Lazy init)
         self.reconciler = None
@@ -151,7 +152,7 @@ class Run:
         '''
 
         # 5. Reconciliation and MUL-tree Selection
-        step_result = self.reconciler.run(self.mul_trees, self.gene_trees,
+        step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry,
                                                           self.cfg, self.logger, self.writer)
 
         '''if not step_result.sorted_scores:

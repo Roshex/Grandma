@@ -3,7 +3,7 @@ import pickle
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict, Set, Any
 
-from .models import SmrtTree, MulTree, GroupData
+from .models import SmrtTree, MulTree, GroupData, NameRegistry
 from .config import GrandmaConfig
 from .logger import GrandmaLogger
 from .reconcile import Reconciler
@@ -51,7 +51,7 @@ class GeneTreeProcessor:
 
 class TreeLoader:
     @staticmethod
-    def gene_trees(path: str, logger: GrandmaLogger) -> dict[int, SmrtTree]:
+    def gene_trees(path: str, logger: GrandmaLogger, registry: NameRegistry = None) -> dict[int, SmrtTree]:
         step = "Reading gene trees"
         logger.report_step(step, "In progress...")
 
@@ -124,7 +124,16 @@ class MulTreeManager:
                 if node_name not in h_nodes:
                     h_nodes.append(node_name)
             else:
-                lca_node = self.st.get_lca(clade)
+                # --- FIX: Use ete3 directly since get_lca was removed from SmrtTree ---
+                nodes_obj = []
+                for name in clade:
+                    node_obj = self.st.get_node(name)
+                    if not node_obj:
+                        self.logger.write(f"Error: Node {name} not found in tree during LCA resolution.")
+                        sys.exit(1)
+                    nodes_obj.append(node_obj)
+                
+                lca_node = self.st.ete_tree.get_common_ancestor(nodes_obj)
                 if lca_node.name not in h_nodes:
                     h_nodes.append(lca_node.name)
         return h_nodes
@@ -178,9 +187,6 @@ class MulTreeManager:
                     if mt_wrapper:
                         mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, h2_obj)
                         mul_num += 1
-                    '''mt = self.st.to_mul_tree(h1, h2)
-                    if mt:
-                        mul_trees[mul_num] = MulTree(mt, h_clade, h1, h2)'''
             
             self.logger.report_step(step, f"Success: {mul_num-1} MUL-trees built")
             
