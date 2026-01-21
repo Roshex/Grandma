@@ -143,7 +143,7 @@ class Run:
         # Note: In iterative modes, we are filtering the *memory* gene trees, 
         # which effectively filters them for subsequent iterations too.
         # TBD !!!
-        self.gene_mgr.cull(self.mul_trees, self.gene_trees)
+        self.gene_mgr.cull(self.mul_trees, self.gene_trees, self.registry)
         if self.cfg.mode == "check-nums": return None
 
         # DEBUG

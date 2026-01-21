@@ -1,3 +1,4 @@
+import re
 import sys
 import pickle
 from pathlib import Path
@@ -103,9 +104,16 @@ class MulTreeManager:
         self.logger = logger
 
     def _resolve_h_inputs(self, raw_input: str, h_type: str) -> list:
-        # Default: All nodes
+        """
+        Resolves h1/h2 inputs into a list of node names.
+        Optimized to use get_leaf_names() for faster set operations.
+        """
         if not raw_input:
-            return [n.name for n in self.st.ete_tree.traverse()]
+            # Return Tips first (get_leaves), then Internal nodes (Post-order)
+            # This matches the legacy GRAMPA behavior where `nodes` dict was built tips-first.
+            tips = [n.name for n in self.st.ete_tree.get_leaves()]
+            internal = [n.name for n in self.st.ete_tree.traverse("postorder") if not n.is_leaf()]
+            return tips + internal
 
         if " " in raw_input:
             groups = raw_input.split(" ")
@@ -115,27 +123,34 @@ class MulTreeManager:
 
         h_nodes = []
         for clade in clade_lists:
-            if len(clade) == 1:
-                val = clade[0]
-                node_name = f"<{val}>" if val.isdigit() else val
-                if not self.st.get_node(node_name):
-                     self.logger.write(f"Error: Node {node_name} not found in tree.")
-                     sys.exit(1)
-                if node_name not in h_nodes:
-                    h_nodes.append(node_name)
+            cleaned_clade = []
+            for item in clade:
+                name_to_check = f"<{item}>" if item.isdigit() else item
+                if not self.st.get_node(name_to_check):
+                    self.logger.write(f"Error: Node {name_to_check} not found in tree (specified in -{h_type}).")
+                    sys.exit(1)
+                cleaned_clade.append(name_to_check)
+
+            if len(cleaned_clade) == 1:
+                val = cleaned_clade[0]
+                if val not in h_nodes:
+                    h_nodes.append(val)
             else:
-                # --- FIX: Use ete3 directly since get_lca was removed from SmrtTree ---
-                nodes_obj = []
-                for name in clade:
-                    node_obj = self.st.get_node(name)
-                    if not node_obj:
-                        self.logger.write(f"Error: Node {name} not found in tree during LCA resolution.")
-                        sys.exit(1)
-                    nodes_obj.append(node_obj)
-                
+                nodes_obj = [self.st.get_node(name) for name in cleaned_clade]
                 lca_node = self.st.ete_tree.get_common_ancestor(nodes_obj)
+                
+                # OPTIMIZATION: Use get_leaf_names() instead of iter_leaves()
+                # ETE3 get_leaf_names is significantly faster as it avoids creating Node objects
+                lca_leaves = set(lca_node.get_leaf_names())
+                input_set = set(cleaned_clade)
+                
+                # Check subset relationship
+                if len(lca_leaves) != len(input_set) and not input_set.issubset(lca_leaves):
+                     pass
+
                 if lca_node.name not in h_nodes:
                     h_nodes.append(lca_node.name)
+                    
         return h_nodes
 
     def build(self) -> dict:
@@ -198,15 +213,15 @@ class GeneTreeManager:
         self.logger = logger
         self.reconciler = reconciler
 
-    def cull(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]):
+    def cull(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry):
         if self.cfg.mode != "st-only":
-            self.collapse_groups(mul_trees, gene_trees)
+            self.collapse_groups(mul_trees, gene_trees, registry)
         self.filter_and_check(mul_trees, gene_trees)
         self.write_filtered_trees(gene_trees)
 
-    def collapse_groups(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]):
+    def collapse_groups(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry):
         """
-        Computes groups for all MUL-trees and DUMPS to pickle immediately.
+        Computes groups for all MUL-trees using registry-optimized logic and DUMPS to pickle immediately.
         Does NOT retain data in memory.
         """
         step = "Collapsing gene tree groupings"
@@ -219,93 +234,135 @@ class GeneTreeManager:
             if m_idx == 0: continue
             
             pickle_path = pickle_dir / f"{self.cfg.run_prefix}_{m_idx}_groups.pickle"
-            
-            # Skip if exists and not overwrite
             if pickle_path.exists() and not self.cfg.overwrite:
                 continue
                 
-            # OPTIMIZATION: Get sisters once for this MUL-tree
-            h1_sis, h2_sis = self.reconciler.get_sister_clades(m_data)
-
-            # Compute groups for ALL gene trees for THIS mul-tree
+            # Compute groups using the registry for speed
             current_mt_groups: Dict[int, GroupData] = {}
             
+            # Pre-calculate sister clades (returned as Sets of Strings)
+            h1_sis, h2_sis = self.reconciler.get_sister_clades(m_data)
+
             for g_idx, gt_obj in gene_trees.items():
-                group_data = self.reconciler.compute_groups(gt_obj, m_data, h1_sis, h2_sis)
+                group_data = self.reconciler.compute_groups(gt_obj, m_data, registry, h1_sis, h2_sis)
                 current_mt_groups[g_idx] = group_data
             
-            # Dump to disk
             try:
                 with open(pickle_path, 'wb') as f:
                     pickle.dump(current_mt_groups, f)
             except Exception as e:
                 self.logger.write(f"Error saving pickle {pickle_path}: {e}")
             
-            # CLEAR MEMORY
             del current_mt_groups
             
         self.logger.report_step(step, "Success")
 
     def filter_and_check(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]):
+        """
+        Writes checknums file and filters trees exceeding group cap.
+        Optimized regex formatting and pre-sorted iteration.
+        """
         step = "Filtering gene trees over group cap"
         self.logger.report_step(step, "In progress...")
         
         check_path = Path(self.cfg.output_dir) / f"{self.cfg.run_prefix}-checknums.txt"
-        trees_to_remove: Set[int] = set()
         
+        gt_failures = {} 
+        sorted_mul_ids = sorted(mul_trees.keys())
+        sorted_gene_ids = sorted(gene_trees.keys())
+
+        # OPTIMIZATION: Memoize regex patterns for formatting
+        # Since h_clade is constant for a given MUL-tree, we compile the regex once per MT.
+        mt_regex_cache = {}
+
+        def format_mt_optimized(mt, h_clade, m_idx):
+            s = mt.to_string(internal_labels=True)
+            if s.endswith(';'): s = s[:-1]
+            
+            # Use cached compiled regex for this MUL-tree
+            if m_idx not in mt_regex_cache:
+                # Matches any species in h_clade that is NOT followed by a *
+                # Pattern: \b(SpecA|SpecB|SpecC)(?!\*)
+                pattern_str = r'\b(' + '|'.join(map(re.escape, h_clade)) + r')(?!\*)'
+                mt_regex_cache[m_idx] = re.compile(pattern_str)
+            
+            # Single pass replacement using regex engine
+            s = mt_regex_cache[m_idx].sub(r'\1+', s)
+            s = s.replace("+*", "*")
+            return s
+
         with open(check_path, 'w') as f:
             f.write("mul.tree\tgene.tree\tgroups\tfixed\tcombinations\tover.cap.filtered\n")
             
-            for m_idx, m_data in mul_trees.items():
+            for m_idx in sorted_mul_ids:
                 if m_idx == 0: continue
+                m_data = mul_trees[m_idx]
                 
-                # Load Pickle to check counts
-                pickle_path = Path(self.cfg.output_dir) / f"{self.cfg.run_prefix}_{m_idx}_groups.pickle"
+                # Use optimized formatter
+                mt_str = format_mt_optimized(m_data.mt, m_data.h_clade, m_idx)
+                
+                h_info = ""
+                if not self.cfg.is_mul_input:
+                     h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
+                     h2_name = m_data.h2_node.name if m_data.h2_node else "NA"
+                     h_info = f"\tH1 Node:{h1_name}\tH2 Node:{h2_name}"
+                
+                f.write(f"# MT-{m_idx}:{mt_str}{h_info}\n")
+
+                pickle_path = self.cfg.pickle_dir / f"{self.cfg.run_prefix}_{m_idx}_groups.pickle"
                 if not pickle_path.exists(): continue
                 
-                current_mt_groups: Dict[int, GroupData] = {}
-                with open(pickle_path, 'rb') as pf:
-                    current_mt_groups = pickle.load(pf)
+                current_mt_groups = {}
+                try:
+                    with open(pickle_path, 'rb') as pf:
+                        current_mt_groups = pickle.load(pf)
+                except Exception:
+                    continue
                 
-                mt_str = m_data.mt.to_string(internal_labels=True)[:-1] 
-                f.write(f"# MT-{m_idx}: {mt_str} | H1: {m_data.h1_node}, H2: {m_data.h2_node}\n")
-                                
-                for g_idx in gene_trees:
+                buffer = []
+                
+                for g_idx in sorted_gene_ids:
                     if g_idx not in current_mt_groups: continue
                     
                     groups = current_mt_groups[g_idx]
-                    num_groups = len(groups.ambiguous_groups)
+                    num_ambig = len(groups.ambiguous_groups)
                     num_fixed = len(groups.fixed_groups)
-                    combos = 2**num_groups
+                    total_groups = num_ambig + num_fixed
                     
                     over_cap = "N"
-                    if num_groups > self.cfg.group_cap:
+                    if num_ambig > self.cfg.group_cap:
                         over_cap = "Y"
-                        trees_to_remove.add(g_idx)
-                        
-                    f.write(f"{m_idx}\t{g_idx}\t{num_groups}\t{num_fixed}\t{combos}\t{over_cap}\n")
+                        if g_idx not in gt_failures: gt_failures[g_idx] = []
+                        gt_failures[g_idx].append(m_idx)
+
+                    combos = 1 << num_ambig 
+                    buffer.append(f"{m_idx}\t{g_idx}\t{total_groups}\t{num_fixed}\t{combos}\t{over_cap}\n")
                 
-                f.write("# ----------------------------------\n")
+                if buffer:
+                    f.write("".join(buffer))
                 
-                # CLEAR MEMORY
                 del current_mt_groups
 
-        self.logger.report_step(step, f"Success: {len(trees_to_remove)} gts over cap")
+        self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap")
         
-        for idx in trees_to_remove:
-            if idx in gene_trees:
-                del gene_trees[idx]
+        for g_idx in sorted(gt_failures.keys()):
+            if g_idx in gene_trees:
+                fail_count = len(gt_failures[g_idx])
+                self.logger.write(f"# WARNING: Gene tree on line {g_idx} is over the group cap in {fail_count} MTs and will be filtered.")
                 self.logger.warnings += 1
+                del gene_trees[g_idx]
 
     def write_filtered_trees(self, gene_trees: Dict[int, SmrtTree]):
+        """Matches GRAMPA's filterOut logic."""
         step = "Writing filtered gene trees to file"
         self.logger.report_step(step, "In progress...")
         
         p = Path(self.cfg.output_dir) / f"{self.cfg.run_prefix}-trees-filtered.txt"
         count = 0
         with open(p, 'w') as f:
-            for idx, gt_obj in gene_trees.items():
-                f.write(gt_obj.to_string(internal_labels=False) + "\n")
+            for idx in sorted(gene_trees.keys()):
+                # GRAMPA writes the original newick string
+                f.write(gene_trees[idx].to_string(internal_labels=False) + "\n")
                 count += 1
                 
         self.logger.report_step(step, f"Success: {count} gene trees written")

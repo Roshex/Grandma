@@ -110,99 +110,135 @@ class Reconciler:
         
         return h1_clean, h2_clean
 
-    def compute_groups(self, gene_tree: SmrtTree, mul_data: MulTree, 
+    def compute_groups(self, gene_tree: SmrtTree, mul_data: MulTree, registry: NameRegistry,
                        h1_sisters: Set[str] = None, h2_sisters: Set[str] = None) -> GroupData:
-        h1_target = set(mul_data.h_clade)
-        groups = {}
-        singles = {}
-        gt_nodes = list(gene_tree.ete_tree.traverse("postorder"))
+        """
+        Registry-Optimized O(N) implementation.
+        Uses integer IDs for Set operations (Union/IsSubset) to achieve significant speedup.
+        """
+        # 1. Pre-computation: Convert targets to Integer IDs
+        # This allows O(1) lookups and fast set operations
+        h1_target_ids = set()
+        for name in mul_data.h_clade:
+            h1_target_ids.add(registry.get_id(name))
+            
+        groups = {} 
+        singles = {} 
+        
+        # Cache: node -> (species_id_set, leaf_names_list, active_roots)
+        # species_id_set: Set[int] - much faster than Set[str]
+        node_info = {}
 
-        # OPTIMIZATION: Cache the species sets for every node to avoid re-traversing children
-        # Map: TreeNode -> Set[SpeciesName]
-        node_species_map: Dict[TreeNode, Set[str]] = {}
-        # Map: TreeNode -> List[LeafName] (for storing in 'groups'/'singles')
-        node_leaf_names: Dict[TreeNode, List[str]] = {}
+        ginfo = gene_tree.ete_tree
 
-        for node in gt_nodes:
+        for node in ginfo.traverse("postorder"):
             if node.is_leaf():
+                # Extract name and convert to ID
                 sp_name = node.name.split("_")[-1]
-                node_species_map[node] = {sp_name}
-                node_leaf_names[node] = [node.name]
+                sp_id = registry.get_id(sp_name)
                 
-                # Check for single match
-                if sp_name in h1_target:
-                    parent = node.up
-                    if parent:
-                        anc_clade = [l.name for l in parent.iter_leaves() if l.name != node.name]
-                        singles[node.name] = anc_clade
-            else:
-                # Internal Node: Aggregate from children
-                children = node.children
-                current_specs = set()
-                current_leaf_names = []
-                for ch in children:
-                    current_specs.update(node_species_map[ch])
-                    current_leaf_names.extend(node_leaf_names[ch])
-                node_species_map[node] = current_specs
-                node_leaf_names[node] = current_leaf_names
-
-                if len(children) == 2:
-                    d1, d2 = children[0], children[1]
-                    d1_specs = node_species_map[d1]
-                    d2_specs = node_species_map[d2]
-                    
-                    # Logic: Both children must be PURELY hybrid and be disjoint
-                    # Python's set.issubset is optimized C
-                    d1_is_hybrid = d1_specs.issubset(h1_target)
-                    d2_is_hybrid = d2_specs.issubset(h1_target)
-                    
-                    if d1_is_hybrid and d2_is_hybrid and d1_specs.isdisjoint(d2_specs):
-                        # Found a group -> remove descendants from groups
-                        for desc in node.iter_descendants():
-                            if desc.name in groups: del groups[desc.name]
-                        
-                        groups[node.name] = current_leaf_names
-
-        # Cleanup singles
-        for grp_node in groups:
-            for leaf in groups[grp_node]:
-                if leaf in singles: del singles[leaf]
-
-        final_ambiguous = []
-        final_fixed = []
-
-        # 2. Fix Groups using Sisters
-        if mul_data.h1_node is not None:
-            if h1_sisters is None or h2_sisters is None:
-                h1_sisters, h2_sisters = self.get_sister_clades(mul_data)
-            def process_unit(unit_nodes: List[str]):
-                if len(unit_nodes) == 1: g_node = gene_tree.get_node(unit_nodes[0])
+                is_h1 = sp_id in h1_target_ids
+                
+                s_set = {sp_id}
+                l_list = [node.name]
+                
+                if is_h1:
+                    singles[node.name] = [] 
+                    a_roots = [node.name]
                 else:
-                    n_objs = [gene_tree.get_node(x) for x in unit_nodes]
-                    g_node = gene_tree.ete_tree.get_common_ancestor(n_objs)
+                    a_roots = []
                 
-                if not g_node or not g_node.up:
-                    final_ambiguous.append(unit_nodes)
-                    return
+                node_info[node] = (s_set, l_list, a_roots)
                 
-                # Get sisters of the gene node
-                # Note: We can optimize this too, but it's only for the formed groups (few)
-                gt_sisters = self._get_sister_clade_labels(g_node)
-                if not gt_sisters:
-                    final_ambiguous.append(unit_nodes)
-                    return
-                if h1_sisters and all(s in h1_sisters for s in gt_sisters): final_fixed.append((unit_nodes, '')) 
-                elif h2_sisters and all(s in h2_sisters for s in gt_sisters): final_fixed.append((unit_nodes, '*'))
-                else: final_ambiguous.append(unit_nodes)
+            else:
+                children = node.children
+                
+                u_s_set = set()
+                u_l_list = []
+                u_a_roots = []
+                
+                all_h1_descendants = True
+                total_species_count = 0
+                
+                for child in children:
+                    c_s_set, c_l_list, c_a_roots = node_info[child]
+                    
+                    u_s_set.update(c_s_set)
+                    u_l_list.extend(c_l_list)
+                    u_a_roots.extend(c_a_roots)
+                    total_species_count += len(c_s_set)
+                    
+                    # Integer set subset check is highly optimized
+                    if not c_s_set.issubset(h1_target_ids):
+                        all_h1_descendants = False
+                
+                children_disjoint = (len(u_s_set) == total_species_count)
 
-            for g_list in groups.values(): process_unit(g_list)
-            for s_node in singles: process_unit([s_node])
-        else:
-            final_ambiguous.extend(groups.values())
-            for s_node in singles: final_ambiguous.append([s_node])
+                if all_h1_descendants and children_disjoint and len(children) > 1:
+                    # Valid Group
+                    for r in u_a_roots:
+                        if r in groups: del groups[r]
+                        if r in singles: del singles[r]
+                    
+                    groups[node.name] = [u_l_list, []]
+                    u_a_roots = [node.name]
+                
+                node_info[node] = (u_s_set, u_l_list, u_a_roots)
+
+        # --- Post-Processing ---
+        
+        def fill_anc_leaves(n_name, is_group):
+            n_obj = gene_tree.get_node(n_name)
+            if not n_obj or not n_obj.up: return
+            
+            p_obj = n_obj.up
+            if p_obj in node_info and n_obj in node_info:
+                p_leaves = node_info[p_obj][1]
+                n_leaves_set = set(node_info[n_obj][1])
+                anc_list = [l for l in p_leaves if l not in n_leaves_set]
+                
+                if is_group:
+                    groups[n_name][1] = anc_list
+                else:
+                    singles[n_name] = anc_list
+
+        for g_name in groups: fill_anc_leaves(g_name, True)
+        for s_name in singles: fill_anc_leaves(s_name, False)
+
+        # --- Fixes Logic ---
+        final_ambiguous = [] # List of List[int]
+        final_fixed = []     # List of (List[int], str)
+
+        # Sister checking (Logic using string sets for safety/easier debugging)
+        if mul_data.h1_node and (h1_sisters is None):
+            h1_sisters, h2_sisters = self.get_sister_clades(mul_data)
+
+        def to_ids(names):
+            return [registry.get_id(n) for n in names]
+
+        def check_fix(unit_nodes, anc_leaves):
+            # unit_nodes is list of strings
+            
+            group_sis_specs = [n.split("_")[-1] for n in anc_leaves]
+            
+            if group_sis_specs:
+                if h1_sisters and all(s in h1_sisters for s in group_sis_specs):
+                    final_fixed.append((to_ids(unit_nodes), ''))
+                    return
+                elif h2_sisters and all(s in h2_sisters for s in group_sis_specs):
+                    final_fixed.append((to_ids(unit_nodes), '*'))
+                    return
+            
+            final_ambiguous.append(to_ids(unit_nodes))
+
+        for g_leaves, anc_leaves in groups.values():
+            check_fix(g_leaves, anc_leaves)
+            
+        for s_name, anc_leaves in singles.items():
+            check_fix([s_name], anc_leaves)
 
         return GroupData(final_ambiguous, final_fixed)
-
+    
     # --------------------------------------------------------------------------
     # RECONCILIATION LOGIC (Unified Flat)
     # --------------------------------------------------------------------------
@@ -213,24 +249,26 @@ class Reconciler:
         gt_flat: FlatTree, 
         registry: NameRegistry
     ) -> Tuple[List[List[int]], List[Tuple[List[int], str]]]:
-        
+        """
+        Modified to accept GroupData that already contains IDs.
+        Filters for nodes present in the flattened tree.
+        """
         ambig_groups_ids = []
-        for grp in group_data.ambiguous_groups:
-            ids = []
-            for name in grp:
-                nid = registry.get_id(name) 
+        for grp_ids in group_data.ambiguous_groups:
+            # grp_ids is List[int]
+            valid_ids = []
+            for nid in grp_ids:
                 if nid in gt_flat.name_id_to_node_id:
-                    ids.append(gt_flat.name_id_to_node_id[nid])
-            if ids: ambig_groups_ids.append(ids)
+                    valid_ids.append(gt_flat.name_id_to_node_id[nid])
+            if valid_ids: ambig_groups_ids.append(valid_ids)
 
         fixed_groups_ids = []
-        for grp, suffix in group_data.fixed_groups:
-            ids = []
-            for name in grp:
-                nid = registry.get_id(name)
+        for grp_ids, suffix in group_data.fixed_groups:
+            valid_ids = []
+            for nid in grp_ids:
                 if nid in gt_flat.name_id_to_node_id:
-                    ids.append(gt_flat.name_id_to_node_id[nid])
-            if ids: fixed_groups_ids.append((ids, suffix))
+                    valid_ids.append(gt_flat.name_id_to_node_id[nid])
+            if valid_ids: fixed_groups_ids.append((valid_ids, suffix))
         
         return ambig_groups_ids, fixed_groups_ids
 

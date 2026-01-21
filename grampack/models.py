@@ -530,8 +530,9 @@ class ReconResult:
 
 @dataclass(slots=True, frozen=True)
 class GroupData:
-    ambiguous_groups: List[List[str]]
-    fixed_groups: List[Tuple[List[str], str]]
+    # Changed from List[str] to List[int] (IDs from NameRegistry)
+    ambiguous_groups: List[List[int]]
+    fixed_groups: List[Tuple[List[int], str]]
 
 @dataclass(slots=True, frozen=True)
 class MulTree:
