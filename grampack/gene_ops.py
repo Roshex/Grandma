@@ -2,14 +2,15 @@ import sys
 import pickle
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict, Set, Any
-from .tree_ops import GrandmaTree, MulData
-from .io import GrandmaConfig
+
+from .models import SmrtTree, MulTree, GroupData
+from .config import GrandmaConfig
 from .logger import GrandmaLogger
-from .reconcile import Reconciler, GroupData
+from .reconcile import Reconciler
 
 class GeneTreeProcessor:
     @staticmethod
-    def read_gene_tree(line: str, index: int) -> Tuple[int, Optional[GrandmaTree], str]:
+    def read_gene_tree(line: str, index: int) -> Tuple[int, Optional[SmrtTree], str]:
         """
         Parses a gene tree line.
         Returns: (index, TreeObject, FilterMessage)
@@ -21,7 +22,7 @@ class GeneTreeProcessor:
         try:
             # Use GrandmaTree wrapper which uses ETE3
             # ETE3 format 1 loads internal names if present
-            gt = GrandmaTree(newick=clean_line)
+            gt = SmrtTree(newick=clean_line)
         except Exception:
             return index, None, "# Error parsing newick"
 
@@ -50,7 +51,7 @@ class GeneTreeProcessor:
 
 class TreeLoader:
     @staticmethod
-    def gene_trees(path: str, logger: GrandmaLogger) -> dict[int, GrandmaTree]:
+    def gene_trees(path: str, logger: GrandmaLogger) -> dict[int, SmrtTree]:
         step = "Reading gene trees"
         logger.report_step(step, "In progress...")
 
@@ -81,7 +82,7 @@ class TreeLoader:
         return gene_trees
     
     @staticmethod
-    def spec_tree(path: str, logger: GrandmaLogger) -> GrandmaTree:
+    def spec_tree(path: str, logger: GrandmaLogger) -> SmrtTree:
         step = "Reading species tree"
         logger.report_step(step, "In progress...")
 
@@ -93,10 +94,10 @@ class TreeLoader:
             raise e
         
         logger.report_step(step, "Success: species tree read")
-        return GrandmaTree(newick=content)
+        return SmrtTree(newick=content)
 
 class MulTreeManager:
-    def __init__(self, species_tree: GrandmaTree, config: GrandmaConfig, logger: GrandmaLogger):
+    def __init__(self, species_tree: SmrtTree, config: GrandmaConfig, logger: GrandmaLogger):
         self.st = species_tree
         self.cfg = config
         self.logger = logger
@@ -161,7 +162,7 @@ class MulTreeManager:
             h2_resolved = []
 
         # Index 0 is species tree itself regardless of mode
-        mul_trees[0] = MulData(mt=self.st)
+        mul_trees[0] = MulTree(mt=self.st)
         
         if self.cfg.mode != "st-only":
             step = "Building MUL-trees"
@@ -172,10 +173,14 @@ class MulTreeManager:
                 h1_st_node = self.st.get_node(h1)
                 h_clade = [l.name for l in h1_st_node.iter_leaves()]
                 for h2 in h2_resolved:
-                    mt = self.st.to_mul_tree(h1, h2)
-                    if mt:
-                        mul_trees[mul_num] = MulData(mt, h_clade, h1, h2)
+
+                    mt_wrapper, h1_obj, h2_obj = self.st.to_mul_tree(h1, h2)
+                    if mt_wrapper:
+                        mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, h2_obj)
                         mul_num += 1
+                    '''mt = self.st.to_mul_tree(h1, h2)
+                    if mt:
+                        mul_trees[mul_num] = MulTree(mt, h_clade, h1, h2)'''
             
             self.logger.report_step(step, f"Success: {mul_num-1} MUL-trees built")
             
@@ -187,13 +192,13 @@ class GeneTreeManager:
         self.logger = logger
         self.reconciler = reconciler
 
-    def cull(self, mul_trees: Dict[int, MulData], gene_trees: Dict[int, GrandmaTree]):
+    def cull(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]):
         if self.cfg.mode != "st-only":
             self.collapse_groups(mul_trees, gene_trees)
         self.filter_and_check(mul_trees, gene_trees)
         self.write_filtered_trees(gene_trees)
 
-    def collapse_groups(self, mul_trees: Dict[int, MulData], gene_trees: Dict[int, GrandmaTree]):
+    def collapse_groups(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]):
         """
         Computes groups for all MUL-trees and DUMPS to pickle immediately.
         Does NOT retain data in memory.
@@ -235,7 +240,7 @@ class GeneTreeManager:
             
         self.logger.report_step(step, "Success")
 
-    def filter_and_check(self, mul_trees: Dict[int, MulData], gene_trees: Dict[int, GrandmaTree]):
+    def filter_and_check(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]):
         step = "Filtering gene trees over group cap"
         self.logger.report_step(step, "In progress...")
         
@@ -286,7 +291,7 @@ class GeneTreeManager:
                 del gene_trees[idx]
                 self.logger.warnings += 1
 
-    def write_filtered_trees(self, gene_trees: Dict[int, GrandmaTree]):
+    def write_filtered_trees(self, gene_trees: Dict[int, SmrtTree]):
         step = "Writing filtered gene trees to file"
         self.logger.report_step(step, "In progress...")
         

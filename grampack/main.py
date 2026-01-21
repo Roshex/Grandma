@@ -1,12 +1,15 @@
 import os
 import re
 import sys
+import random
+import multiprocessing as mp
+from functools import partial
 from pathlib import Path
 from dataclasses import replace
 
-from .io import parse_args, GrandmaConfig, GrandmaWriter, GrandmaMetadata
+from .config import parse_args, GrandmaConfig, GrandmaWriter, GrandmaMetadata
 from .logger import GrandmaLogger
-from .tree_ops import GrandmaTree
+from .models import SmrtTree
 from .gene_ops import TreeLoader, GeneTreeManager, MulTreeManager
 from .flow import FlowManager
 from .reconcile import Reconciler
@@ -15,14 +18,13 @@ from .orthology import OrthologyLabeler
 import psutil
 HAS_PSUTIL = psutil is not None
 
-# --- Top-level Helper Functions for Pickling ---
+# --- Top-level Helper Functions ---
 
 def _is_memory_st(st):
-    """Replacement for lambda: Check if st is a memory object rather than a path."""
+    """Check if st is a GrandmaTree object (Memory) or Path/str (Disk)."""
     return not isinstance(st, (str, Path))
 
 def _is_not_none(obj):
-    """Replacement for lambda: Check if object is initialized."""
     return obj is not None
 
 # --- Standalone workers function supporting parallel processing --- #
@@ -38,16 +40,19 @@ def run_worker(task_data, config, test_func, verbosity=0, logger=None):
     if hasattr(st, 'refresh'):
         st.refresh()
 
-    # Ensure ID-specific sub-directory
+    # Ensure ID-specific output and pickle sub-directories
     out = config.output_dir / id / "output"
     out.mkdir(parents=True, exist_ok=True)
-    
-    # Update pickle dir to be sub-directory specific
-    pkl_dir = config.pickle_dir
-    pkl_dir = pkl_dir.parent / id / 'output' / pkl_dir.name
+    pkl_dir = config.pickle_dir.parent / id / 'output' / config.pickle_dir.name
 
-    # Localized configuration
+    # Handle Gene Tree Input Type (Disk path vs Memory Dict)
+    # If gts is a path/string, we must update the config so Run() loads it, 
+    # and pass None to Run() so it doesn't think we gave it an empty dict.
     iter_cfg = replace(config, output_dir=out, pickle_dir=pkl_dir, verbosity=verbosity)
+    # To be checked again!
+    '''if isinstance(gts, (str, Path)):
+        iter_cfg = replace(iter_cfg, gene_tree_path=Path(gts))
+        gts = None  # Signal to Run class to use the loader'''
 
     # If no logger provided (preferred in multiprocessing), create local one
     if not logger:
@@ -57,7 +62,6 @@ def run_worker(task_data, config, test_func, verbosity=0, logger=None):
     run_inst = Run(iter_cfg, spec_tree=st, gene_trees=gts, logger=logger)
     res = run_inst.execute(from_memory=test_func(st))
 
-    # Return ID and out path for history/glueing
     return id, out, res
 
 # --- Core Classes --- #
@@ -69,7 +73,7 @@ class Run:
     It does not know about iteration history or other runs.
     """
     def __init__(self, config: GrandmaConfig, logger: GrandmaLogger = None, 
-                 spec_tree: GrandmaTree = None, gene_trees: dict = None):
+                 spec_tree: SmrtTree = None, gene_trees: dict = None):
         self.cfg = config
         
         # 1. Setup Logging/Writing for this specific run
@@ -147,38 +151,42 @@ class Run:
         '''
 
         # 5. Reconciliation and MUL-tree Selection
-        sorted_scores, detailed_res = self.reconciler.run(self.mul_trees, self.gene_trees,
+        step_result = self.reconciler.run(self.mul_trees, self.gene_trees,
                                                           self.cfg, self.logger, self.writer)
 
-        # 6. Extract Best Result
-        min_idx = sorted_scores[0][0]
-        min_data = self.mul_trees[min_idx]
-        min_maps = detailed_res[0][1] if detailed_res else {}
+        '''if not step_result.sorted_scores:
+            self.logger.write("No valid MUL-trees scored.", level=1)
+            return None'''
+
+        # 6. Extract Best Result (using StepResult properties)
+        min_idx = step_result.mt_idx()
+        min_data = step_result.mul_trees[min_idx]
+        
+        # kept_mul_results is Dict[mul_idx, Dict[g_idx, Maps]]
+        min_maps = step_result.kept_mul_maps[min_idx]
         
         # 7. Orthology (Optional)
-        if self.cfg.orth_opt and detailed_res:
-             OrthologyLabeler.run(self.gene_trees, min_maps, min_data[0], 
-                                min_data[2], self.cfg.output_dir, self.cfg.run_prefix)
+        if self.cfg.orth_opt and min_maps:
+             # OrthologyLabeler expects dict of results. We pass min_maps directly.
+             # NOTE: OrthologyLabeler might need adjustment if it expects a list vs dict, 
+             # but standard dict iteration works for both.
+             # We pass keys as gene_num, values as ReconResult
+             # OrthologyLabeler.run signature: gene_trees, min_maps_dict
+             # But ReconResult wraps maps. Orthology.py uses res[3] (maps) and res[4] (dups)
+             # or attributes if updated. Assuming strict compat, we pass the wrapper.
+             OrthologyLabeler.run(self.gene_trees, min_maps, min_data.mt, 
+                                min_data.h_clade, self.cfg.output_dir, self.cfg.run_prefix)
 
         # 8. Final Report
-        min_score = sorted_scores[0][1]
         min_tree_str = min_data.mt.to_string(internal_labels=True)
         h_clade = min_data.h_clade
         for spec in h_clade:
             min_tree_str = re.sub(f"{spec}(?!\*)", f"{spec}+", min_tree_str)
             min_tree_str = min_tree_str.replace("+*", "*")
             
-        self.logger.print_end_prog(self.cfg, (min_idx, min_score, min_tree_str))
+        self.logger.print_end_prog(self.cfg, (min_idx, step_result.mt_score(), min_tree_str))
 
-        # Return structured result
-        return {
-            "min_idx": min_idx,
-            "min_score": min_score,
-            "mul_data": min_data,
-            "min_maps": min_maps,
-            "sorted_scores_dict": {k:v for k,v in sorted_scores},
-            "gene_trees": self.gene_trees 
-        }
+        return step_result
         
 class Engine:
     """
@@ -197,15 +205,21 @@ class Engine:
         Path(self.cfg.output_dir).mkdir(parents=True, exist_ok=True)
         log_path = Path(self.cfg.output_dir) / f"{self.cfg.run_prefix}.log"
         self.flow_logger = GrandmaLogger(log_path, self.cfg.verbosity, clear_log=False)
+        '''# In resume, append to log, don't clear
+        is_resume = (self.cfg.history is not None and len(self.cfg.history) > 0)
+        self.flow_logger = GrandmaLogger(log_path, self.cfg.verbosity, clear_log=not is_resume)'''
 
     def run(self):
+        # 1. Seed Initialization
+        if self.cfg.seed is not None:
+            random.seed(self.cfg.seed)
+            # if 'numpy' in sys.modules: import numpy; numpy.random.seed(self.cfg.seed)
 
-        meta = GrandmaMetadata()
         self._init_flow_logger()
+        meta = GrandmaMetadata()
         # Print software info once for the whole session
         self.flow_logger.log_software_banner(meta)
-
-        self.flow_logger.write(f"# Running in mode: {self.cfg.mode}", level=1)
+        self.flow_logger.write(f"# Running in Mode: {self.cfg.mode} | Seed: {self.cfg.seed}", level=1)
         self.flow_logger.write("# " + "=" * 73, level=1)
         if self.cfg.mode in ["no-st", "st-only", "build-mts", "check-nums", "single"]:
             self.run_single()
@@ -214,8 +228,7 @@ class Engine:
         elif self.cfg.mode == "split":
             self.run_split()
         else:
-            self.flow_logger.write(f"# Error: Unknown mode {self.cfg.mode}", level=1)
-            sys.exit(1)
+            sys.exit(f"Unknown mode {self.cfg.mode}")
 
     def run_single(self):
         """
@@ -246,15 +259,20 @@ class Engine:
             ignore_nesting=self.cfg.ignore_nesting,
             history=self.cfg.history,
             history_file=self.cfg.history_file,
-            output_dir=base_output_dir
+            output_dir=base_output_dir,
+            seed = self.cfg.seed
         )
 
-        current_st = None # Holds GrandmaTree
-        current_gts = None # Holds Dict[int, GrandmaTree]
+        current_st = None
+        current_gts = None
+
+        # If resuming, we rely on Run() loading from files via cfg paths in the first iteration loop,
+        # OR we load them here. Actually, io.py sets cfg.species_tree_path to the previous output 
+        # if i > 0. So current_st can remain None for the first loop.
        
         # Iteration Loop
         try:
-            while i < self.cfg.max_iter:
+            while i < max_iter:
                 i += 1
                 self.flow_logger.write(
                     f'#\n##### Iteration {i}' + (' (inf mode) #####\n#' if max_iter == float('inf') else f' of {int(max_iter)} #####\n#'))#∞
@@ -270,6 +288,19 @@ class Engine:
                     logger = iter_logger
                 )
 
+                '''# Prepare Task
+                # If current_st is None (first loop or resume), we pass Paths from cfg.
+                # If current_st is Obj (subsequent loops), we pass Objs.
+                task_st = current_st if current_st else self.cfg.species_tree_path
+                task_gts = current_gts if current_gts else self.cfg.gene_tree_path
+                
+                # Setup output folder for this iteration
+                task_id = str(i-1)
+                iter_out = self.cfg.output_dir / task_id / "output"
+                iter_logger = GrandmaLogger(iter_out / f"{self.cfg.run_prefix}.log", 
+                                            self.cfg.verbosity, parent_logger=self.flow_logger)
+                '''
+
                 if not res:
                     self.flow_logger.write("# No results generated in iteration.")
                     break
@@ -284,11 +315,8 @@ class Engine:
                 )
                 
                 if not next_trees: break
-                
                 current_st, current_gts = next_trees
-                # Clean up memory/PIDs
-                self.flow_logger.pids = [psutil.Process(os.getpid())] if HAS_PSUTIL else []
-
+                
         except KeyboardInterrupt:
             self.flow_logger.write("# Interrupted by user.", level=1)
 
@@ -308,8 +336,8 @@ class Engine:
                             mode="no-st",
                             verbosity=0)
 
-            mem_st = GrandmaTree(tree_obj=st_obj)
-            mem_gts = {k: GrandmaTree(tree_obj=v) for k, v in enumerate(gt_objs)}
+            mem_st = SmrtTree(tree_obj=st_obj)
+            mem_gts = {k: SmrtTree(tree_obj=v) for k, v in enumerate(gt_objs)}
             
             run_inst = Run(fix_cfg, spec_tree=mem_st, gene_trees=mem_gts)
             return run_inst.execute(from_memory=True)    
@@ -321,9 +349,6 @@ class Engine:
         Tracking should be Process-Safe and Unified.
         Matches the recursive sub-problem architecture: folder 'Depth.Index' (as tracked in 'history').
         """
-        import multiprocessing as mp
-        from functools import partial
-
         self.flow_logger.write("# Starting Parallelized Split Mode (Binary Recursive Search)", level=1)
         
         # Initialize Unified FlowManager (Main Process Only)
@@ -333,19 +358,31 @@ class Engine:
             ignore_nesting=self.cfg.ignore_nesting, 
             history=self.cfg.history, 
             history_file=self.cfg.history_file, 
-            output_dir=self.cfg.output_dir
+            output_dir=self.cfg.output_dir,
+            seed = self.cfg.seed
         )
 
-        # Initial task: (SpeciesTreePath/Obj, GeneTreesPath/Dict, BinaryID)
-        current_tasks = [(self.cfg.species_tree_path, self.cfg.gene_tree_path, "0")]
+        # 1. Initialize Task Queue
+        # Start with the root problem
+        root_task = (self.cfg.species_tree_path, self.cfg.gene_tree_path, "0")
+        current_tasks = [root_task]
+        
+        # 2. Fast-Forward (Resume) Logic
+        # If we have history, we might have completed the root or others.
+        # We need to reconstruct the frontier.
+        if self.cfg.history:
+            self.flow_logger.write(f"# History found ({len(self.cfg.history)} entries). Checking for resume...", level=1)
+            current_tasks = flow_mgr.fast_forward_split(current_tasks, self.flow_logger)
 
-        # Initialize the Pool
         pool = mp.Pool(processes=self.cfg.num_processes)
-
         depth = 0
+        
+        # Adjust depth display if resuming deep
+        if current_tasks and "." in str(current_tasks[0][2]):
+             depth = int(str(current_tasks[0][2]).split('.')[0])
+
         while current_tasks:
             self.flow_logger.write(f"# Dispatching {len(current_tasks)} sub-problems at Depth {depth}...", level=1)
-            
             step = f"Processing Depth {depth}"
             self.flow_logger.report_step(step, "", start=True)
 
@@ -357,6 +394,7 @@ class Engine:
             # Process results sequentially in the main process (safe access to flow_mgr)
             next_tasks = []
             for bin_id, iter_out, res in batch_results:
+                if not res: continue
                 # Logic to determine branching vs termination moved to flow_mgr
                 next_tasks.extend(
                     flow_mgr.handle_split_result(bin_id, res, iter_out, logger=self.flow_logger, debug=self.cfg.debug)

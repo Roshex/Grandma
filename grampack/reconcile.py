@@ -6,31 +6,17 @@ from functools import partial
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Any, Set, Optional, Union
-from ete3 import TreeNode
-from .tree_ops import GrandmaTree, MulData
-from .io import GrandmaConfig
 
-@dataclass(slots=True, frozen=True)
-class ReconResult:
-    score: int
-    n_dups: int
-    n_losses: int
-    maps: Dict[str, List[str]] = field(default_factory=dict)
-    node_dups: Dict[str, int] = field(default_factory=dict)
-    node_losses: Dict[str, int] = field(default_factory=dict)
-
-@dataclass(slots=True, frozen=True)
-class GroupData:
-    ambiguous_groups: List[List[str]]
-    fixed_groups: List[Tuple[List[str], str]]
+from .config import GrandmaConfig
+from .models import TreeNode, SmrtTree, MulTree, GroupData, Map, ReconResult, StepResult
 
 GroupsPickle = Dict[int, GroupData]
 
 # --- Worker Function ---
 
 def _worker_reconcile_single(
-    mul_item: Tuple[int, MulData], 
-    gene_trees: Dict[int, GrandmaTree], 
+    mul_item: Tuple[int, MulTree], 
+    gene_trees: Dict[int, SmrtTree], 
     pickle_dir: str, 
     run_prefix: str
 ) -> Tuple[int, int]:
@@ -94,7 +80,7 @@ def _worker_reconcile_single(
     return mul_idx, total_score
 
 class Reconciler:
-    def __init__(self, species_tree: GrandmaTree, config: Any):
+    def __init__(self, species_tree: SmrtTree, config: Any):
         self.st = species_tree
         self.cfg = config
 
@@ -111,7 +97,7 @@ class Reconciler:
             labels.extend([l.name.split("_")[-1] for l in sis.iter_leaves()])
         return labels
 
-    def _find_node_by_clade(self, tree: GrandmaTree, target_leaves: Set[str]) -> Any:
+    def _find_node_by_clade(self, tree: SmrtTree, target_leaves: Set[str]) -> Any:
         # OPTIMIZATION: Use Dictionary Lookup O(1) instead of search_nodes O(N)
         leaf_nodes = []
         for t in target_leaves:
@@ -129,11 +115,11 @@ class Reconciler:
         if lca_leaves == target_leaves: return lca
         return None
 
-    def get_sister_clades(self, mul_data: MulData) -> Tuple[Set[str], Set[str]]:
+    def get_sister_clades(self, mul_data: MulTree) -> Tuple[Set[str], Set[str]]:
         """
         Calculates sister clades ONCE per MUL-tree.
         """
-        if mul_data.h1_node == "NA":
+        if mul_data.h1_node is None:
             return set(), set()
             
         h1_target = set(mul_data.h_clade)
@@ -153,11 +139,11 @@ class Reconciler:
         
         return h1_clean, h2_clean
 
-    def compute_groups(self, gene_tree: GrandmaTree, mul_data: MulData, 
+    def compute_groups(self, gene_tree: SmrtTree, mul_data: MulTree, 
                        h1_sisters: Set[str] = None, h2_sisters: Set[str] = None) -> GroupData:
         return self._compute_groups(gene_tree, mul_data, h1_sisters, h2_sisters)
 
-    def _compute_groups(self, gene_tree: GrandmaTree, mul_data: MulData, 
+    def _compute_groups(self, gene_tree: SmrtTree, mul_data: MulTree, 
                         h1_sisters_clean: Set[str] = None, h2_sisters_clean: Set[str] = None) -> GroupData:
         
         # 1. Identify Candidate Groups (O(N) using DP)
@@ -232,7 +218,7 @@ class Reconciler:
         final_fixed = []
 
         # 2. Fix Groups using Sisters
-        if mul_data.h1_node != "NA":
+        if mul_data.h1_node is not None:
             if h1_sisters_clean is None or h2_sisters_clean is None:
                 h1_sisters_clean, h2_sisters_clean = self.get_sister_clades(mul_data)
 
@@ -276,7 +262,7 @@ class Reconciler:
     # --------------------------------------------------------------------------
 
     @staticmethod
-    def recon_lca_optimized(gene_tree: GrandmaTree, map_target_tree: GrandmaTree, 
+    def recon_lca_optimized(gene_tree: SmrtTree, map_target_tree: SmrtTree, 
                          initial_maps: Dict[TreeNode, List[TreeNode]], retmap=False, 
                          precomputed_postorder: List[TreeNode] = None) -> Union[int, ReconResult]:
         """
@@ -320,28 +306,26 @@ class Reconciler:
                 score += cur_depth
                 if retmap: node_losses_obj[node] += cur_depth
             
-            c1_depth = getattr(c1_map, "fast_depth", 0)
-            c1_loss = (c1_depth - cur_depth - 1) + is_dup
-            if c1_loss > 0:
-                score += c1_loss
-                if retmap: node_losses_obj[children[0]] += c1_loss
-            
-            c2_depth = getattr(c2_map, "fast_depth", 0)
-            c2_loss = (c2_depth - cur_depth - 1) + is_dup
-            if c2_loss > 0:
-                score += c2_loss
-                if retmap: node_losses_obj[children[1]] += c2_loss
+            for child in [children[0], children[1]]:
+                child_map = lca_maps[child][0]
+                child_depth = getattr(child_map, "fast_depth", 0)
+                loss = (child_depth - cur_depth - 1) + is_dup
+                if loss > 0:
+                    score += loss
+                    if retmap: node_losses_obj[child] += loss
 
         if retmap:
             final_maps_str = {k.name: [v[0].name] for k, v in lca_maps.items()}
             final_dups_str = {k.name: v for k, v in node_dups_obj.items()}
             final_losses_str = {k.name: v for k, v in node_losses_obj.items()}
-            return ReconResult(score, sum(final_dups_str.values()), sum(final_losses_str.values()), final_maps_str, final_dups_str, final_losses_str)
             
+            final_maps_obj = Map(sum(final_dups_str.values()), sum(final_losses_str.values()), cor=final_maps_str, dups=final_dups_str, losses=final_losses_str)
+            return ReconResult(score, [final_maps_obj])
+    
         return score
 
     @staticmethod
-    def reconcile_one_static(mul_data: MulData, gene_tree: GrandmaTree, 
+    def reconcile_one_static(mul_data: MulTree, gene_tree: SmrtTree, 
                     groups: GroupData, retmap=False) -> Union[int, ReconResult]:
         
         perm_groups = groups.ambiguous_groups
@@ -385,7 +369,7 @@ class Reconciler:
         gt_postorder = list(gene_tree.ete_tree.traverse("postorder"))
 
         best_score = 999999
-        best_res = None
+        all_maps = []
         
         # 5. Permutation Loop
         for combo in itertools.product([0, 1], repeat=len(perm_groups)):
@@ -408,16 +392,21 @@ class Reconciler:
                 res = Reconciler.recon_lca_optimized(gene_tree, mul_data.mt, current_mapping, True, gt_postorder)
                 if res.score < best_score:
                     best_score = res.score
-                    best_res = res
+                    all_maps = res.maps
+                elif res.score == best_score:
+                    all_maps.extend(res.maps)
             else:
                 score = Reconciler.recon_lca_optimized(gene_tree, mul_data.mt, current_mapping, False, gt_postorder)
                 if score < best_score:
                     best_score = score
         
-        return best_res if retmap else best_score
+        if retmap:
+            return ReconResult(best_score, all_maps)
+        
+        return best_score
 
     @staticmethod
-    def recon_lca_legacy_static(gene_tree: GrandmaTree, map_target_tree: GrandmaTree, 
+    def recon_lca_legacy_static(gene_tree: SmrtTree, map_target_tree: SmrtTree, 
                          initial_maps: Dict[str, List[str]], retmap=False) -> Union[int, ReconResult]:
         obj_maps = {}
         for n in gene_tree.ete_tree.traverse():
@@ -434,7 +423,7 @@ class Reconciler:
                  
         return Reconciler.recon_lca_optimized(gene_tree, map_target_tree, obj_maps, retmap)
         
-    def recon_all(self, mul_trees: Dict[int, MulData], gene_trees: Dict[int, GrandmaTree], 
+    def recon_all(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], 
                   pickle_dir: str, run_prefix: str, n_proc: int, logger: Any) -> List[Tuple[int, int]]:
         step = "Reconciliation"
         logger.report_step(step, "In progress...")
@@ -462,20 +451,26 @@ class Reconciler:
         return Reconciler.reconcile_one_static(*args, **kwargs)
     
     def get_lowest_maps(self, sorted_scores: List[Tuple[int, int]], n_lowest: int, 
-                        mul_trees: Dict[int, MulData], gene_trees: Dict[int, GrandmaTree], 
-                        pickle_dir: str, run_prefix: str, logger: Any) -> List[Tuple[int, Dict[int, ReconResult]]]:
+                        mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], 
+                        pickle_dir: str, run_prefix: str, logger: Any) -> Dict[int, Dict[int, ReconResult]]:
+        
         step = "Getting maps for lowest scoring MTs"
         logger.report_step(step, "In progress...")
-        detailed_res = []
+        
+        # Change: Store in Dict instead of List of Tuples
+        detailed_res = {} 
         limit = min(len(sorted_scores), n_lowest)
+        
         for idx, total in sorted_scores[:limit]:
             mul_data = mul_trees[idx]
             mul_data.mt.build_lca_cache() 
+            
             pickle_path = Path(pickle_dir) / f"{run_prefix}_{idx}_groups.pickle"
             cur_groups_dict = {}
             if idx != 0 and pickle_path.exists():
                 with open(pickle_path, 'rb') as f:
                     cur_groups_dict = pickle.load(f)
+            
             gt_results = {}
             st_lookup = {n.name: n for n in mul_data.mt.ete_tree.traverse()} if idx == 0 else {}
             
@@ -485,25 +480,42 @@ class Reconciler:
                     gt_nodes = list(gt_obj.ete_tree.traverse("postorder"))
                     for n in gt_nodes:
                         if n.is_leaf():
-                             # FIX: Ensure 1_a -> a here too for consistency
-                             raw_name = getattr(n, "clean_name", n.name)
-                             sp_name = raw_name.split("_")[-1]
-                             if sp_name in st_lookup: init_maps[n] = [st_lookup[sp_name]]
+                            # FIX: Ensure 1_a -> a here too for consistency
+                            raw_name = getattr(n, "clean_name", n.name)
+                            sp_name = raw_name.split("_")[-1]
+                            if sp_name in st_lookup: init_maps[n] = [st_lookup[sp_name]]
                         else:
-                             init_maps[n] = []
+                            init_maps[n] = []
                     res = Reconciler.recon_lca_optimized(gt_obj, mul_data.mt, init_maps, True, gt_nodes)
                 else:
                     groups = cur_groups_dict[g_num]
                     res = self.reconcile_one(mul_data, gt_obj, groups, True)
                 gt_results[g_num] = res
-            detailed_res.append((idx, gt_results))
+            
+            detailed_res[idx] = gt_results
             del cur_groups_dict
+            
         logger.report_step(step, "Success")
         return detailed_res
         
-    def run(self, mul_trees: dict, gene_trees: dict, cfg: GrandmaConfig, logger: Any, writer: Any) -> Tuple[list, list]:
+    def run(self, mul_trees: dict, gene_trees: dict, cfg: GrandmaConfig, logger: Any, writer: Any) -> StepResult:
         n_lowest, pickle_dir, run_prefix, n_proc = cfg.n_lowest, cfg.pickle_dir, cfg.run_prefix, cfg.num_processes
         sorted_scores = self.recon_all(mul_trees, gene_trees, pickle_dir, run_prefix, n_proc, logger)
         detailed_res = self.get_lowest_maps(sorted_scores, n_lowest, mul_trees, gene_trees, pickle_dir, run_prefix, logger)
         writer.write_results(sorted_scores, detailed_res, mul_trees, gene_trees)
-        return sorted_scores, detailed_res
+
+        # Get the first k,v pair from detailed_res
+        detailed_res_limited = {}
+        for mul_idx in detailed_res:
+            # Instead of keeping ReconResult, keep Maps[0] (Dict[int, Dict[int, Map]] vs Dict[int, Dict[int, ReconResult]] in StepResult)
+            maps_dict = {g_idx: res.maps[0] for g_idx, res in detailed_res[mul_idx].items()}
+            detailed_res_limited[mul_idx] = maps_dict
+            if len(detailed_res_limited) >= 1:
+                break
+
+        return StepResult(
+            sorted_scores=sorted_scores,
+            mul_trees=mul_trees,
+            kept_mul_maps=detailed_res_limited, # this dict is sorted
+            gene_trees=gene_trees
+        )

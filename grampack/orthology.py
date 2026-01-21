@@ -1,9 +1,10 @@
-from .tree_ops import GrandmaTree
 from pathlib import Path
+
+from .models import SmrtTree
 
 class OrthologyLabeler:
     @staticmethod
-    def run(gene_trees: dict, min_maps: dict, min_tree: GrandmaTree, 
+    def run(gene_trees: dict, min_maps: dict, min_tree: SmrtTree, 
             hybrid_clade: list, out_dir: str, prefix: str):
             
         orth_file_path = Path(out_dir) / f"{prefix}_orthologies.txt"

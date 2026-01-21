@@ -1,16 +1,15 @@
-from doctest import debug
 import os
 import re
 import json
 import random
 import pandas as pd
-from typing import Tuple, List, Optional, Dict
+from typing import Tuple, List, Optional, Dict, Any
 from dataclasses import dataclass, field
 from collections import defaultdict
 from pathlib import Path
-from ete3 import Tree, TreeNode
-# Import necessary components from other modules for type hinting if needed
-from .tree_ops import GrandmaTree
+
+from .models import Tree, TreeNode, SmrtTree, StepResult
+from .gene_ops import TreeLoader
 
 class HCounterState:
     """Tracks hybridization events to detect nested patterns."""
@@ -18,7 +17,6 @@ class HCounterState:
         self.base_to_full = defaultdict(set)
         self.sets_by_key = []
         self.h_counter = {}
-
         if history:
             self._integrate_history(history)
             self._rebuild_h_counter()
@@ -106,24 +104,15 @@ class HCounterState:
             groups[suffix].append(name)
         return list(groups.values())
 
-
-@dataclass(frozen=True, slots=True)
-class FlowEvent:
-    """Immutable record of a hybridization event."""
-    tree: Tree
-    h1_node: TreeNode
-    h2_node: TreeNode
-    score: float
-    score_tuple: Tuple[float, float]
-
 class FlowManager:
-    def __init__(self, iter_num, cutoff_cfg, ignore_nesting, history, history_file, output_dir):
+    def __init__(self, iter_num, cutoff_cfg, ignore_nesting, history, history_file, output_dir, seed=42):
         self.curr_i = iter_num
         self.cutoff_cfg = cutoff_cfg
         self.ignore_nesting = ignore_nesting
         self.history = history
         self.history_file = history_file
         self.output_dir = output_dir
+        self.seed = seed
         self.h_counter = HCounterState() if ignore_nesting or iter_num == 0 else HCounterState(history)
 
     ### New from-objs parsing ###
@@ -150,6 +139,26 @@ class FlowManager:
             return ((self_score - best_score) / self_score) > cutoff_val
         return True
 
+    def _to_proceed(self, res: StepResult, i_str: str, logger, debug) -> bool:
+        """
+        Unified logic to validate scores, apply cutoffs, and rename trees.
+        """
+        min_idx = res.mt_idx()
+        if min_idx == 0:
+            logger.write(f"# Cutoff reached: no events found at {i_str}.", level=1)
+            return False
+
+        self_score = res.self_score
+        best_score = res.mt_score()
+        
+        if debug: print(f"[DEBUG] Self-mapping score: {self_score}, Best non-self score: {best_score}")
+        
+        if not self.check_cutoff(self_score, best_score): 
+            logger.write(f"# Cutoff reached: no events found at {i_str}.", level=1)
+            return False
+
+        return True
+
     ### Output methods ###
 
     def _fix_semicolon(self, tree_str: str) -> str:
@@ -158,15 +167,20 @@ class FlowManager:
 
     def update_history(self, i, new_events):
         for j, v in new_events.items():
-            mt, gts = v
+            # v is StepResult
+            gts = v.gene_trees
+            mt = v.mul_trees[v.mt_idx()]
+            score = v.mt_score()
+            score_tuple = (v.self_score, score)
+            other_tree = ''
             self.history[(i, j)] = {
-                'multree': mt['tree'].write(format=8),
+                'multree': mt.mt.ete_tree.write(format=8),
                 'gt_file': len(gts) if gts is not None else 'NA',
-                'score': mt['score'],
-                'h1.node': mt['h1.node'].get_leaf_names() if isinstance(mt['h1.node'], Tree) else mt['h1.node'],
-                'h2.node': mt['h2.node'].get_leaf_names() if isinstance(mt['h2.node'], Tree) else mt['h2.node'],
-                'score_tuple': mt['score_tuple'],
-                'other_tree': mt['other_tree'] # already a string
+                'score': score,
+                'h1.node': mt.h1_node.get_leaf_names() if isinstance(mt.h1_node, Tree) else mt.h1_node,
+                'h2.node': mt.h2_node.get_leaf_names() if isinstance(mt.h2_node, Tree) else mt.h2_node,
+                'score_tuple': score_tuple,
+                'other_tree': other_tree # already a string
             }
         with open(self.history_file, 'w') as f:
             json.dump({str(k): v for k, v in self.history.items()}, f, indent=4)
@@ -385,7 +399,7 @@ class FlowManager:
     # --- Overlapping logic for Full and Split modes ---
 
     @staticmethod
-    def get_actual_h2(mt_wrapper: GrandmaTree, h2_sister_name: str, h_clade: list) -> TreeNode:
+    def __get_actual_h2(mt_wrapper: SmrtTree, h2_sister_name: str, h_clade: list) -> TreeNode:
         """
         Consistently identifies the H2 insertion node.
         It is the node that is a child of the backbone but contains the H* clade.
@@ -415,7 +429,7 @@ class FlowManager:
         print(f"\n[DEBUG] {title}")
         print(ete_tree.get_ascii(show_internal=True, attributes=['name']))
 
-    def _prepare_handled_data(self, res, logger, debug) -> Tuple[Optional[dict], Optional[pd.Series]]:
+    def __prepare_handled_data(self, res, logger, debug) -> Tuple[Optional[dict], Optional[pd.Series]]:
         """
         Unified logic to validate scores, apply cutoffs, and rename trees.
         Refactored from process_prev_iter.
@@ -435,7 +449,9 @@ class FlowManager:
         # Resolve H nodes
         mul_data = res['mul_data']
         # Direct O(1) dictionary lookup in GrandmaTree instead of O(N) search_nodes of ete3
-        h1_node = mul_data.mt.get_node(mul_data.h1_node)
+        #h1_node = mul_data.mt.get_node(mul_data.h1_node)
+        h1_node = mul_data.h1_node
+
         # Correctly identify H2 node (sister of the sister provided in results): TBC!!!
         #h2_sister = engine_res['mul_data'].mt.get_node(engine_res['mul_data'].h2_node)
         #h2_node = [c for c in h2_sister.up.get_children() if c != h2_sister][0]
@@ -455,20 +471,27 @@ class FlowManager:
 
     # --- Handlers for the Full mode ---
 
-    def rename_trees_for_next_iter(self, res: dict, h1_node: TreeNode, h2_node: TreeNode, sample: List[int] = None) -> pd.Series:
+    def rename_trees_for_next_iter(self, res: StepResult, sample: List[int] = None) -> pd.Series:
+
+        best_mt_idx = res.mt_idx()
+        best_mt = res.mul_trees[best_mt_idx]
+
+        h1_node = best_mt.h1_node
+        h2_node = best_mt.h2_node
         h1_leaves = h1_node.get_leaves()
         h2_leaves = h2_node.get_leaves()
         disallowed_lvs = [l.name for l in h1_leaves]
         
         distance_map = {}
-        for n in res['mul_data'].mt.ete_tree:
+        for n in best_mt.mt.ete_tree.traverse():
             d1 = n.get_distance(h1_node, topology_only=True)
             d2 = n.get_distance(h2_node, topology_only=True)
             distance_map[n.name] = ".1" if d1 < d2 else ".2"
 
         mapped_gts_list = []
-        gts = res['gene_trees']
-        for g_idx, recon_res in res['min_maps'].items():
+        gts = res.gene_trees
+        min_maps = res.kept_mul_maps[best_mt_idx]
+        for g_idx, recon_res in min_maps.items():
             gt_ete = gts[g_idx].ete_tree.copy() # Operations on copies
 
             if sample is not None and g_idx in sample:
@@ -489,30 +512,28 @@ class FlowManager:
         for l in h2_leaves: l.name = l.name.replace("*", "") + ".2"
 
         if sample is not None:
-            self._debug_tree("Renamed MT for next iteration:", res['mul_data'].mt.ete_tree)
+            self._debug_tree("Renamed MT for next iteration:", best_mt.mt.ete_tree)
         
-        return res['mul_data'].mt, mapped_gts_list
+        return best_mt.mt, mapped_gts_list
 
-    def handle_iteration_result(self, i: int, res: dict, iter_out: Path, engine_callback, logger, debug: bool) -> Optional[Tuple[GrandmaTree, Dict[int, GrandmaTree]]]:
+    def handle_iteration_result(self, i: int, res: StepResult, iter_out: Path, engine_callback, logger, debug: bool) -> Optional[Tuple[SmrtTree, Dict[int, SmrtTree]]]:
         """
         Handles the end of a 'Full' mode iteration.
         Returns: (next_st, next_gts) or None if stopping.
         """
         # 1. Validation & Cutoff
-        meta = self._prepare_handled_data(res, logger, debug)
-        if not meta:
-            logger.write(f"# Cutoff reached: no events found at iteration {i}.", level=1)
+        if not self._to_proceed(res, f'Iteration {i}', logger, debug):
             return None
         sample = [10, 13] if debug else None
-        
+
         # 2. Rename Trees for Next Iteration
-        next_mt, next_gts = self.rename_trees_for_next_iter(res, meta['h1.node'], meta['h2.node'], sample=sample)
-        meta['tree'] = next_mt.ete_tree  # Update tree object in meta
+        next_mt, next_gts = self.rename_trees_for_next_iter(res, sample=sample)
+        res.mul_data.mt.ete_tree = next_mt.ete_tree  # Update tree object
 
         # 3. Check for Nested Hybridization
         # This encapsulates the while-loop for recursive sub-fixes
         new_events = self.check_and_fix_nested(
-            mt_dict=meta,
+            mt_dict=res,
             genetrees=next_gts,
             engine_callback=lambda st, gts, h1, h2, out: engine_callback(st, gts, h1, h2, out),
             curr_i=i,
@@ -530,8 +551,8 @@ class FlowManager:
         final_mt, final_gts_list = new_events[last_idx]
         
         # Convert list back to Dict for GrandmaTree consumption
-        next_st = GrandmaTree(tree_obj=final_mt['tree'])
-        next_gts = {idx: GrandmaTree(tree_obj=gt) for idx, gt in enumerate(final_gts_list)}
+        next_st = SmrtTree(tree_obj=final_mt['tree'])
+        next_gts = {idx: SmrtTree(tree_obj=gt) for idx, gt in enumerate(final_gts_list)}
         
         # Write handoff files for resume support
         self.write_handoff_files(final_mt['tree'], final_gts_list, iter_out.parent)
@@ -540,16 +561,22 @@ class FlowManager:
 
     # --- Handlers for the Split mode ---
     
-    def extract_subproblems(self, res, h1_node, h2_node, depth: int, idx: int, min_gt_leaves: int = 2, min_st_leaves: int = 1,
+    def extract_subproblems(self, res: StepResult, depth: int, idx: int, min_gt_leaves: int = 2, min_st_leaves: int = 1,
                             sample: List[int] = None) -> None:
         """
         Refined binary recursion split using ETE3-safe surgery and O(N) GT extraction.
         1. Inner: Extracts independent 'pure' subtrees for each hybrid lineage.
         2. Outer: Backbone with H1 clade collapsed to a placeholder leaf.
         """
-        mt_wrapper = res['mul_data'].mt
-        min_maps = res['min_maps']
-        gts = res['gene_trees']
+        best_mt_idx = res.mt_idx()
+        best_mt = res.mul_trees[best_mt_idx]
+
+        h1_node = best_mt.h1_node
+        h2_node = best_mt.h2_node
+        mt_wrapper = best_mt.mt
+        min_maps = res.kept_mul_maps[best_mt_idx]
+        gts = res.gene_trees
+
         try:
             h_clade_names = [l.name for l in h1_node.get_leaves()]
         except Exception as e:
@@ -562,8 +589,8 @@ class FlowManager:
         inner_gts = {}
         new_gt_counter = 0
         for g_idx, gt_wrapper in gts.items():
-            recon = min_maps.get(g_idx)
-            if not recon: continue
+            maps = min_maps.get(g_idx)
+            if not maps: continue
 
             if sample is not None and g_idx in sample:
                 self._debug_tree(f"Inner GT {g_idx} (Pre-split):", gt_wrapper.ete_tree)
@@ -576,7 +603,7 @@ class FlowManager:
             for node in gt_ete.traverse("postorder"):
                 if node.is_leaf():
                     # Check if the single leaf maps to the hybrid clade
-                    mapped_sp = recon.maps[node.name][0].replace("*", "")
+                    mapped_sp = maps[node.name][0].replace("*", "")
                     node_is_pure[node] = mapped_sp in h_clade_names
                 else:
                     # Internal node is pure only if ALL its children are pure
@@ -599,7 +626,7 @@ class FlowManager:
 
             for ph_node in final_pure_lineages:
                 extracted_gt = ph_node.copy()
-                inner_gts[new_gt_counter] = GrandmaTree(tree_obj=extracted_gt)
+                inner_gts[new_gt_counter] = SmrtTree(tree_obj=extracted_gt)
                 
                 if sample is not None and g_idx in sample:
                     self._debug_tree(f"Extracted Inner as Lineage {new_gt_counter}:", extracted_gt)
@@ -622,8 +649,8 @@ class FlowManager:
 
         outer_gts = {}
         for g_idx, gt_wrapper in gts.items():
-            recon = min_maps.get(g_idx)
-            if not recon: continue
+            maps = min_maps.get(g_idx)
+            if not maps: continue
 
             if sample is not None and g_idx in sample:
                 self._debug_tree(f"Outer GT {g_idx} (Pre-prune):", gt_wrapper.ete_tree)
@@ -631,11 +658,11 @@ class FlowManager:
             gt_ete = gt_wrapper.ete_tree.copy()
             # Keep leaves that did NOT map to the hybrid clade
             to_keep = [l for l in gt_ete.iter_leaves() 
-                       if recon.maps[l.name][0].replace("*", "") not in h_clade_names]
+                       if maps[l.name][0].replace("*", "") not in h_clade_names]
             
             if len(to_keep) >= min_gt_leaves:
                 gt_ete.prune(to_keep, preserve_branch_length=True)
-                outer_gts[g_idx] = GrandmaTree(tree_obj=gt_ete)
+                outer_gts[g_idx] = SmrtTree(tree_obj=gt_ete)
 
                 if sample is not None and g_idx in sample:
                     self._debug_tree(f"Pruned Outer GT {g_idx}:", gt_ete)
@@ -649,12 +676,12 @@ class FlowManager:
         # Only queue tasks if species tree has enough leaves to be valid
         next_tasks = []
         if len(inner_st_obj.get_leaves()) >= min_st_leaves and len(inner_gts) > 0:
-            next_tasks.append((GrandmaTree(tree_obj=inner_st_obj), inner_gts, f"{depth + 1}.{idx * 2}"))
+            next_tasks.append((SmrtTree(tree_obj=inner_st_obj), inner_gts, f"{depth + 1}.{idx * 2}"))
         if len(outer_st_obj.get_leaves()) >= min_st_leaves and len(outer_gts) > 0:
-            next_tasks.append((GrandmaTree(tree_obj=outer_st_obj), outer_gts, f"{depth + 1}.{idx * 2 + 1}"))
+            next_tasks.append((SmrtTree(tree_obj=outer_st_obj), outer_gts, f"{depth + 1}.{idx * 2 + 1}"))
         return next_tasks
 
-    def handle_split_result(self, bin_id, res, iter_out, logger, debug):
+    def handle_split_result(self, bin_id, res: StepResult, iter_out, logger, debug):
         """
         Processes a split worker result.
         Returns: List of new sub-tasks or empty list.
@@ -663,25 +690,22 @@ class FlowManager:
         depth, idx = (int(x) for x in bin_id.split('.')) if '.' in bin_id else (0, 0)
 
         # 2. Validation & Cutoff
-        meta = self._prepare_handled_data(res, logger, debug)
-        if not meta:
-            logger.write(f"# Cutoff reached: no events found at Depth {depth}, Index {idx}.", level=1)
+        if not self._to_proceed(res, f"Depth {depth}, Index {idx}", logger, debug):
             return []
-        meta['tree'] = res['mul_data'].mt.ete_tree  # Update tree object in meta
-        logger.write(f"# Reticulation found at Depth {depth}, Index {idx} with score {res['min_score']}.", level=1)
+
+        logger.write(f"# Reticulation found at Depth {depth}, Index {idx} with score {res.mt_score()}.", level=1)
         sample = [10, 13] if debug else None
         
         # 3. Extract Subproblems
         try:
-            next_tasks = self.extract_subproblems(res, meta['h1.node'], meta['h2.node'], depth, idx, sample=sample)
+            next_tasks = self.extract_subproblems(res, depth, idx, sample=sample)
         except Exception as e:
             logger.write(f"Error extracting subproblems at Depth {depth}, Index {idx}: {e}", level=1)
-            print(meta)
             #print(res)
             return []
         
         # 4. Update History
-        self.update_history(depth, {idx: [meta, res.get('gene_trees')]})
+        self.update_history(depth, {idx: res})
             
         return next_tasks
 
@@ -706,7 +730,7 @@ class FlowManager:
                 st_text = f.read().strip()
                 if not st_text.endswith(';'): st_text += ';'
                 # Use GrandmaTree wrapper for robust newick parsing
-                base_st = GrandmaTree(newick=st_text)
+                base_st = SmrtTree(newick=st_text)
         except Exception as e:
             logger.write(f"Error loading original ST for gluing: {e}", level=1)
             return
