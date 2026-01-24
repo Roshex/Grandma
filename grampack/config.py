@@ -84,6 +84,25 @@ class GlobalContext:
     def history_file(self) -> Path:
         """Dynamic property derived from the root output dir."""
         return self.root_dir / 'history.json'
+    
+    def update(self, **changes) -> 'GlobalContext':
+        """
+        Returns a new GlobalContext with specific fields updated.
+        Validates that keys exist to prevent silent errors.
+        """
+        # Certain fields should not be allowed to be changed
+        forbidden_keys = {"seed", "plot", "norun", "nolog", "orth_opt", "max_iter",
+        "min_gt_lvs", "min_st_lvs", "root_dir", "log_file", "history", "start_pt"}
+        # Safety check to ensure we aren't inventing new fields
+        valid_fields = {f.name for f in fields(self)}
+        for key in changes:
+            if key not in valid_fields:
+                raise TypeError(f"GlobalContext got an unexpected keyword argument '{key}'")
+            if key in forbidden_keys:
+                raise ValueError(f"GlobalContext field '{key}' is not allowed to be changed")
+
+        return replace(self, **changes)
+
 
 # --- Unit of Reconciliation (Dynamic) ---
 @dataclass(frozen=True, slots=True)

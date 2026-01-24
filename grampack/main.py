@@ -5,7 +5,6 @@ import random
 import multiprocessing as mp
 from functools import partial
 from pathlib import Path
-from dataclasses import replace
 from typing import Optional, Tuple, Dict, Any, List, Union
 
 from .config import InitParser, GlobalContext, TaskConfig, GrandmaWriter
@@ -48,7 +47,7 @@ def task_worker(payload: Tuple[Any, Any, str], context: GlobalContext, config: T
     )
 
     # Create local GlobalContext (e.g., to override verbosity for workers)
-    iter_ctx = replace(context, verbosity=verbosity)
+    iter_ctx = context.update(verbosity=verbosity)
 
     # If no parent logger provided (preferred in multiprocessing)
     # create logger without forwarding to parent
@@ -296,7 +295,7 @@ class Engine:
         mem_st = SmrtTree(tree_obj=st_obj)
         mem_gts = {k: SmrtTree(tree_obj=v) for k, v in enumerate(gt_objs)}
         
-        fix_tcf = replace(self.tcf,
+        fix_tcf = self.tcf.update(
                         st = mem_st,
                         gts = mem_gts,
                         output_dir=fix_dir,
@@ -305,7 +304,7 @@ class Engine:
                         mode="no-st")
         
         # Create a quiet context
-        fix_ctx = replace(self.ctx, verbosity=0)
+        fix_ctx = self.ctx.update(verbosity=0)
         
         return Task(fix_ctx, logger=None).execute(fix_tcf)
     
