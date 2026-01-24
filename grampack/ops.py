@@ -1,78 +1,106 @@
+import os
 import re
 import sys
+import json
 import pickle
+from glob import glob
 from pathlib import Path
-from typing import Tuple, List, Optional, Dict, Set, Any
+from typing import Tuple, List, Optional, Dict, Set, Any, Union
 
-from .models import SmrtTree, MulTree, GroupData, NameRegistry
-from .config import GrandmaConfig
-from .logger import GrandmaLogger
+from .models import Tree, SmrtTree, MulTree, GroupData, NameRegistry
+from .config import TaskConfig
+from .logger import GrandmaLogger, is_fatal
 from .reconcile import Reconciler
 
-class GeneTreeProcessor:
+class CommonUtils:
     @staticmethod
-    def read_gene_tree(line: str, index: int) -> Tuple[int, Optional[SmrtTree], str]:
-        """
-        Parses a gene tree line.
-        Returns: (index, TreeObject, FilterMessage)
-        """
-        clean_line = line.strip()
-        if not clean_line:
-            return index, None, "# Empty line"
+    def _fix_semicolon(tree_str: str) -> str:
+        """Ensures tree strings end with a semicolon."""
+        tree_str = tree_str.strip()
+        return tree_str if tree_str.endswith(';') else tree_str + ';'
 
-        try:
-            # Use GrandmaTree wrapper which uses ETE3
-            # ETE3 format 1 loads internal names if present
-            gt = SmrtTree(newick=clean_line)
-        except Exception:
-            return index, None, "# Error parsing newick"
+    @staticmethod
+    def write_handoff_files(dir: Path, st: Tree=None, gts: Optional[List[Tree]]=None):
+        """Writes the trees to disk to allow inspection/resume, matching iter_mode.py."""
+        if st:
+            st_path = dir / 'multree.tre'
+            with open(st_path, 'w') as f: f.write(st.write(format=0))
+        if gts:
+            gt_path = dir / 'genetrees.txt'
+            with open(gt_path, 'w') as f:
+                for gt in gts: f.write(gt.write(format=0) + '\n')
 
-        # Filters from gene_tree.py
-        # 1. Check for Polytomies (non-bifurcating)
-        # In ETE3, check if any node has > 2 children
-        for node in gt.ete_tree.traverse():
-            if len(node.children) > 2:
-                # Check if root trifurcation (allowed in unrooted, but GRAMPA usually wants rooted)
-                if node.is_root():
-                     return index, None, "Tree contains non-bifurcating nodes (root)"
-                return index, None, "Tree contains non-bifurcating nodes"
+    @staticmethod
+    def _identify_path(p: Union[str, Path]) -> Tuple[str, List[Path]]:
 
-        # 2. Check Rooting (Num Internal = Num Tips - 1)
-        # Note: ETE3 handles rooting differently, but strict bifurcating tree property holds:
-        # Leaves = N, Internal = N-1.
-        leaves = len(gt.ete_tree.get_leaves())
-        internal = len([n for n in gt.ete_tree.traverse() if not n.is_leaf()])
+        if not isinstance(p, (Path, str)):
+            return "invalid", []
         
-        if internal != (leaves - 1):
-             # This usually happens if the root has only 2 children? 
-             # Actually for rooted bifurcating: N leaves -> N-1 internal (including root).
-             pass 
+        if isinstance(p, str) and not os.path.exists(p):
+            return "raw", []
 
-        return index, gt, ""
+        p = Path(p)
 
-class TreeLoader:
+        if p.exists():
+            return ("file" if p.is_file() else "directory"), [p]
+
+        parent = p.parent if p.parent != Path('.') else Path.cwd()
+        matches = list(parent.glob(p.name))
+
+        if matches:
+            return "pattern", matches
+
+        return "nonexistent", []
+    
     @staticmethod
-    def gene_trees(path: str, logger: GrandmaLogger, registry: NameRegistry = None) -> dict[int, SmrtTree]:
-        step = "Reading gene trees"
-        logger.report_step(step, "In progress...")
+    def _load_single_content(input: Union[Path, str], desc: str, logger: GrandmaLogger, key: str="Error") -> str:
+        """Loads a single tree string from Path or String."""
+        kind, paths = CommonUtils._identify_path(input)
+        if kind == "raw":
+            return input
+        elif kind == "file":
+            try:
+                return paths[0].read_text()
+            except Exception as e:
+                logger.write(f"{key} reading {desc} file '{paths[0]}': {e}")
+        elif kind == "nonexistent":
+            logger.write(f"{key}: {desc} file '{input}' not found.")
+        else:
+            logger.write(f"{key}: Invalid input type for {desc}.")
 
-        try:
-            with open(path, 'r') as f:
-                lines = f.readlines()
-        except Exception as e:
-            logger.write(f"Error reading gene tree file: {e}")
-            raise e
-            
-        gene_trees = {}
-        valid_count = 0
-        warnings = []
+    @staticmethod
+    def _load_multi_content(input: Union[Path, str], desc: str, logger: GrandmaLogger, key: str="Error") -> Tuple[List[str], Optional[List[str]]]:
+        """
+        Handles File, Raw String, or Folder input.
+        Returns List of (content, source_name).
+        """
+        kind, paths = CommonUtils._identify_path(input)
+        if kind == "raw":
+            return input, None
+        elif kind == "file":
+            try:
+                return paths[0].read_text().splitlines(), None
+            except Exception as e:
+                logger.write(f"{key} reading {desc} file '{paths[0]}': {e}")
+        elif kind == "directory" or kind == "pattern":
+            if kind == "directory":
+                paths = list(paths[0].glob('*'))
+            content = []
+            for p in paths:
+                try:
+                    txt = p.read_text().strip()
+                    if txt:
+                        content.append(txt)
+                except Exception as e:
+                    logger.write(f"{key}: Could not read {p}: {e}")
+            return content, [p.name for p in paths]
+        elif kind == "nonexistent":
+            logger.write(f"{key}: {desc} file '{input}' not found.")
+        else:
+            logger.write(f"{key}: Invalid input type for {desc}.")
 
-        for i, line in enumerate(lines):
-            idx, gt, msg = GeneTreeProcessor.read_gene_tree(line, i+1)
-            if gt:
-                gene_trees[idx] = gt
-                valid_count += 1
-            if msg:
+
+    """
                 if not gt:
                     warnings.append(f"# WARNING: Gene tree on line {i+1}: {msg} -- Filtering.")
                     logger.warnings += 1
@@ -80,30 +108,369 @@ class TreeLoader:
         logger.report_step(step, f"Success: {valid_count} gene trees read")
         for w in warnings: logger.write(w)
 
-        return gene_trees
-    
+        return gene_trees"""
+
+
+class TreeLoader:
+    """
+    Handles loading, verification, and optional repais of Species and Gene trees.
+    """
     @staticmethod
-    def spec_tree(path: str, logger: GrandmaLogger) -> SmrtTree:
+    def spec_tree(tcf: TaskConfig, logger: GrandmaLogger) -> SmrtTree:
+
+        if isinstance(tcf.st, SmrtTree):
+            # Do nothing, already loaded
+            step = "Loading species tree from memory"
+            logger.report_step(step, "In progress...")
+            logger.report_step(step, "Success: Species tree loaded from memory")
+            return tcf.st
+
         step = "Reading species tree"
         logger.report_step(step, "In progress...")
 
+        # Input Validation
+        if not tcf.st:
+            logger.write("Error: Species tree not found. Please check the input.")
+
+        # Load Raw Content
+        line = CommonUtils._load_single_content(tcf.st, "species tree", logger)
+        
+        # Basic Formatting
+        line = TreeLoader._sanitize_line(line)
+        line = CommonUtils._fix_semicolon(line)
+
+        # Parse
         try:
-            with open(path, 'r') as f:
-                content = f.read().strip()
+            # Format 1 allows internal node names, which we might need
+            t = Tree(line, format=0)
         except Exception as e:
             logger.write(f"Error reading species tree file: {e}")
-            raise e
+
+        # Topology Fixes & Checks (Polytomies, Rooting)
+        # We error on ST issues unless repair is requested, as ST must be robust.
+        is_valid, msg = TreeLoader._fix_and_validate_topology(t, tcf.repair)
+        if not is_valid:
+            logger.write(f"Error: Species tree invalid: {msg}")
+
+        # MUL-Tree Validation
+        TreeLoader._validate_mul_status(t, tcf.is_mul_input, logger)
+
+        if tcf.repair:
+            CommonUtils._write_handoff_files(tcf.output_dir, st=t)
+
+        logger.report_step(step, "Success: Species tree read")
+        return SmrtTree(tree_obj=t)
+
+    @staticmethod
+    def gene_trees(tcf: TaskConfig, logger: GrandmaLogger) -> Optional[Dict[int, SmrtTree]]:
+
+        if isinstance(tcf.gts, dict):
+            step = "Loading gene trees from memory"
+            logger.report_step(step, "In progress...")
+            logger.report_step(step, f"Success: {len(tcf.gts)} gene trees loaded from memory")
+            return tcf.gts
+
+        step = "Reading gene trees"
+        logger.report_step(step, "In progress...")
+
+        # Input Validation
+        if tcf.gts is None:
+            if tcf.mode == 'build-mts':
+                logger.report_step(step, "Skipped: 'build-mts' mode")
+                return {}
+            else:
+                logger.write(f"Error: Gene trees input is missing. Required in all modes except 'build-mts' (here: '{tcf.mode}' mode).")
+
+        # Load Raw Contents (File, String, or Folder)
+        tree_list, origins = CommonUtils._load_multi_content(tcf.gts, "gene trees", logger, key="Error")
         
-        logger.report_step(step, "Success: species tree read")
-        return SmrtTree(newick=content)
+        # Process Trees
+        valid_gts = []
+        #st_taxa = {n.name for n in tcf.st.ete_tree.get_leaves()}
+        for i, line in enumerate(tree_list):
+
+            origin = origins[i] if origins else "line " + str(i+1)
+
+            # Check Empty
+            if not line.strip():
+                logger.write(f"Warning: Empty GT in {origin} -- Filtering.")
+                continue
+
+            # Semicolon
+            line = CommonUtils._fix_semicolon(line)
+
+            # Parse
+            try:
+                gt = Tree(line, format=0)
+            except Exception:
+                logger.write(f"Warning: Error reading tree {origin}! -- Filtering.")
+                continue
+
+            # Topology Repair/Check
+            is_valid, msg = TreeLoader._fix_and_validate_topology(gt, tcf.repair)
+            if not is_valid:
+                logger.write(f"Warning: Gene tree {origin}: {msg} -- Filtering.")
+                continue
+
+            # Tips Repair/Check } if tcf.repair
+            #TreeLoader._repair_tips(gt)
+
+            # Taxa Repair/Check } if tcf.repair
+            '''gt_taxa = {n.name for n in gt.ete_tree.get_leaves()}
+            if not gt_taxa.issubset(st_taxa):
+                # Optionally, prune here if fixing is enabled? 
+                # For now, strict filtering based on prompts.
+                logger.write(f"Warning: Gene tree {origin} contains taxa not in Species Tree -- Filtering.")
+                continue'''
+
+            valid_gts.append(gt)
+
+        if len(valid_gts) == 0:
+            logger.write(f"Error: No valid gene trees survived filtering (required in {tcf.mode} mode).")
+        
+        if tcf.repair:
+            CommonUtils._write_handoff_files(tcf.output_dir, gts=valid_gts)
+                
+        logger.report_step(step, f"Success: {len(valid_gts)} gene trees read")
+        return {idx: SmrtTree(tree_obj=gt) for idx, gt in enumerate(valid_gts)}
+
+    # --- Helpers ---
+
+    @staticmethod
+    def _fix_and_validate_topology(t: Tree, attempt_fix: bool) -> Tuple[bool, str]:
+        """
+        Checks for polytomies and unrooted-ness.
+        If attempt_fix is True, resolves polytomies and midpoint roots (if needed).
+        """
+        # Rooting
+        # ETE3 logic: unrooted trees often loaded as rooted with trifurcation at top.
+        # If we just resolved polytomies, we might have arbitrarily binary-ized the root.
+        # A simple check: leaves = internal + 1 is true for any binary tree.
+        # We mainly ensure it effectively acts rooted.
+        if len(t.children) > 2 or not t.get_tree_root():
+            if attempt_fix:
+                # Quickest fix for unrooted top-level polytomy
+                t.resolve_polytomy() 
+            else:
+                return False, "Tree root is not rooted"
+
+        # 2. Rooting via (Num Internal = Num Tips - 1)
+        # Note: ETE3 handles rooting differently, but strict bifurcating tree property holds:
+        # Leaves = N, Internal = N-1.
+        leaves = len(t.get_leaves())
+        internal = len([n for n in t.traverse() if not n.is_leaf()])
+        if internal != (leaves - 1):
+            # This usually happens if the root has only 2 children? 
+            # Actually for rooted bifurcating: N leaves -> N-1 internal (including root).
+            pass
+
+        # Polytomies
+        has_poly = False
+        for n in t.traverse():
+            if len(n.children) > 2:
+                has_poly = True
+                break
+        if has_poly:
+            if attempt_fix:
+                t.resolve_polytomy(recursive=True)
+            else:
+                return False, "Tree contains non-bifurcating nodes"
+
+        return True, ""
+
+    @staticmethod
+    def _validate_mul_status(t: Tree, is_mul_input: bool, logger: GrandmaLogger):
+        """Validates species counts against the flag."""
+        leaves = [n.name for n in t.get_leaves()]
+        counts = {}
+        for l in leaves:
+            counts[l] = counts.get(l, 0) + 1
+        
+        # Detect actual status
+        has_dups = any(v > 1 for v in counts.values())
+        
+        if is_mul_input:
+            # Appear exactly once or twice
+            # Check if any appear > 2 (or 0, implicit)
+            bad_taxa = [k for k, v in counts.items() if v > 2]
+            if bad_taxa:
+                logger.write(f"Error: You have entered a tree type (--multree) of multree, species in your tree should appear exactly once or twice. (Violators: {bad_taxa})")
+        else:
+            # Standard mode, no dups allowed
+            if has_dups:
+                bad_taxa = [k for k, v in counts.items() if v > 1]
+                logger.write("Error: You have not entered a tree type (--multree) of multree, but there are labels in your tree that appear more than once!")
+
+    @staticmethod
+    def _sanitize_line(s: str) -> str:
+        # Remove everything between "'[" and "]'" (Astral cleaning)
+        return re.sub(r"'\[.*?\]'", '', s)
+    
+    @staticmethod
+    def _repair_tips(t: Tree) -> None:
+        leaf_counts = {}
+        for node in t.traverse():
+            if node.name:
+                if node.is_leaf():
+                    clean_name = TreeLoader._sanitize_tip(node.name)
+                    # Ensure unique names
+                    leaf_counts[clean_name] = leaf_counts.get(clean_name, 0) + 1
+                    node.name = f'{leaf_counts[clean_name]}_{clean_name}'
+                else:
+                    node.name = None
+
+    @staticmethod
+    def _sanitize_tip(s: str, old: List[str] = ['_', '.'], new: str = '-') -> str:
+        # Replace any chars in old with new
+        for char in old:
+            s = s.replace(char, new)
+        return s
+
 
 class MulTreeManager:
-    def __init__(self, species_tree: SmrtTree, config: GrandmaConfig, logger: GrandmaLogger):
-        self.st = species_tree
-        self.cfg = config
+    def __init__(self, config: TaskConfig, st: SmrtTree, logger: GrandmaLogger) -> Optional[Dict[str, int]]:
+        self.tcf = config
+        self.st = st
         self.logger = logger
+        self.ploidies = self._parse_ploidy_file(self.tcf.ploidies, logger)
 
-    def _resolve_h_inputs(self, raw_input: str, h_type: str) -> list:
+    @staticmethod
+    def _parse_ploidy_file(ploidies: Optional[Union[Path, str, Dict[str, int]]], logger: GrandmaLogger) -> Dict[str, int]:
+        # No need to reload
+        if isinstance(ploidies, dict):
+            return ploidies
+        if not ploidies:
+            return {}
+        step = "Reading ploidy file"
+        logger.report_step(step, "In progress...")
+        ploidies = CommonUtils._load_single_content(ploidies, "ploidies", logger, key="Error")
+        ploid_dict = {}
+        try:
+            with open(ploidies, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) == 2:
+                        species, ploidy = parts
+                        ploid_dict[species] = int(ploidy)
+        except Exception as e:
+            logger.write(f"Error reading ploidy file: {e}")
+        if not ploid_dict:
+            logger.write("Warning: Ploidy file is empty or invalid.", level=1)
+        logger.report_step(step, f"Success: Loaded ploidy info for {len(ploid_dict)} species")
+        return ploid_dict
+
+    ### Beta
+    def _count_effective_lineages(self) -> Dict[str, Tuple[int, int]]:
+        """
+        Counts effective lineages for each species in the current ST.
+        Returns a dict: {species: (number_of_pure_groups, max_size_of_pure_group)}
+        Logic:
+        1. Pure Groups: A clade where all descendants are the same species.
+        2. Polytomies: Siblings of the same pure species at a mixed node are aggregated 
+           into a single 'group' (e.g., (x,x,y) counts as one x-group of size 2).
+        3. Nested Pure Groups: Only the maximal pure group is counted (e.g., ((x,x),x) is 1 group of size 3).
+        """
+        # Data structure: species -> [count, max_size]
+        counts = {}
+        
+        def update_counts(species, size):
+            if species not in counts:
+                counts[species] = [0, 0]
+            counts[species][0] += 1
+            counts[species][1] = max(counts[species][1], size)
+
+        def get_state(node):
+            """
+            Returns (species, size) if the node represents a pure clade.
+            Returns None if the node is mixed.
+            """
+            if node.is_leaf():
+                # Extract species name (remove '*' if present from previous MUL-tree ops)
+                sp = node.name.replace("*", "")
+                return (sp, 1)
+
+            # Get states of all children
+            child_states = [get_state(child) for child in node.children]
+
+            # Check purity: Are all children pure and of the same species?
+            first_sp = child_states[0][0] if child_states and child_states[0] else None
+            all_same = True
+            total_size = 0
+            
+            for state in child_states:
+                if state is None or state[0] != first_sp:
+                    all_same = False
+                    break
+                total_size += state[1]
+
+            if all_same and first_sp is not None:
+                # This node extends a pure lineage
+                return (first_sp, total_size)
+            
+            # If mixed (or children have different species), finalize the pure children
+            # Aggregate by species to handle polytomies like (x, x, y)
+            current_level_groups = {} # species -> total_size
+            
+            for state in child_states:
+                if state is not None:
+                    sp, size = state
+                    current_level_groups[sp] = current_level_groups.get(sp, 0) + size
+            
+            # Record these finalized groups
+            for sp, size in current_level_groups.items():
+                update_counts(sp, size)
+
+            return None
+
+        # Start traversal from root
+        root_state = get_state(self.st.ete_tree)
+
+        # Edge case: If the entire tree is pure (e.g., ((x,x),x)), 
+        # get_state returns a value for root that hasn't been recorded yet.
+        if root_state is not None:
+            update_counts(root_state[0], root_state[1])
+
+        # Convert lists to tuples for return type consistency
+        return {k: tuple(v) for k, v in counts.items()}
+        
+    ### Beta
+    def _apply_ploidy_constraints(self, h1_candidates: List[str]) -> List[str]:
+        """
+        Filters H1 candidates based on the ploidy file loaded at init.
+        Only H1 is filtered because H1 is the lineage being duplicated.
+        """
+        filtered_h1 = []
+
+        # 1. Get current counts: {species: (num_groups, max_size)}
+        current_stats = self._count_effective_lineages()
+        
+        for node_name in h1_candidates:
+            node = self.st.get_node(node_name)
+            if not node: continue
+            
+            clade_species = {l.name.replace("*", "") for l in node.iter_leaves()}
+            
+            is_valid = True
+            for sp in clade_species:
+                # Ploidy Limit Logic:
+                # Interpretation: The dict value (e.g., x:2) is the Max Number of Groups allowed.
+                # If current_stats[sp] (group count) >= Limit, we cannot add another group.
+                
+                limit = self.ploidies.get(sp, 999) # Default to infinite if not in file
+                
+                num_of_groups, max_size = current_stats.get(sp, (0,0))
+                
+                if num_of_groups >= limit: # or max_size*2 > limit:
+                    is_valid = False
+                    break
+            
+            if is_valid:
+                filtered_h1.append(node_name)
+
+        # H2 candidates are not filtered by ploidy count, as H2 is the *target* of insertion, not the source of duplication.
+        return filtered_h1
+
+    def _resolve_h_inputs(self, raw_input: str, h_type: str) -> List[str]:
         """
         Resolves h1/h2 inputs into a list of node names.
         Optimized to use get_leaf_names() for faster set operations.
@@ -156,12 +523,18 @@ class MulTreeManager:
     def build(self) -> dict:
         mul_trees = {}
         
-        if self.cfg.mode != "st-only":
+        if self.tcf.mode != "st-only":
             step = "Parsing hybrid clades"
             self.logger.report_step(step, "In progress...")
-            h1_resolved = self._resolve_h_inputs(self.cfg.h1_nodes, "h1")
-            h2_resolved = self._resolve_h_inputs(self.cfg.h2_nodes, "h2")
+            h1_resolved = self._resolve_h_inputs(self.tcf.h1_nodes, "h1")
+            h2_resolved = self._resolve_h_inputs(self.tcf.h2_nodes, "h2")
             self.logger.report_step(step, "Success: got H nodes")
+
+            if self.ploidies:
+                step = "Applying ploidy constraints"
+                self.logger.report_step(step, "In progress...")
+                h1_resolved = self._apply_ploidy_constraints(h1_resolved)
+                self.logger.report_step(step, "Success: identified compatible H nodes")
 
             step = "Counting MUL-trees to generate"
             self.logger.report_step(step, "In progress...")
@@ -188,7 +561,7 @@ class MulTreeManager:
         # Index 0 is species tree itself regardless of mode
         mul_trees[0] = MulTree(mt=self.st)
         
-        if self.cfg.mode != "st-only":
+        if self.tcf.mode != "st-only":
             step = "Building MUL-trees"
             self.logger.report_step(step, "In progress...")
             
@@ -205,19 +578,38 @@ class MulTreeManager:
             
             self.logger.report_step(step, f"Success: {mul_num-1} MUL-trees built")
             
-        return mul_trees
-    
-class GeneTreeManager:
-    def __init__(self, config: GrandmaConfig, logger: GrandmaLogger, reconciler: Reconciler):
-        self.cfg = config
-        self.logger = logger
-        self.reconciler = reconciler
+        return mul_trees, h1_resolved, h2_resolved, self.ploidies
 
+
+class GeneTreeManager:
+    def __init__(self, config: TaskConfig, reconciler: Reconciler, logger: GrandmaLogger):
+        self.tcf = config
+        self.reconciler = reconciler
+        self.logger = logger
+        
     def cull(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry):
-        if self.cfg.mode != "st-only":
+        if self.tcf.mode != "st-only":
             self.collapse_groups(mul_trees, gene_trees, registry)
         self.filter_and_check(mul_trees, gene_trees)
         self.write_filtered_trees(gene_trees)
+
+    def _check_registry_safety(self, registry_path: Path, registry: NameRegistry) -> bool:
+        """Registry Persistence Logic"""
+        registry_loaded = False
+        
+        # Try to load the registry snapshot from the previous run
+        if registry_path.exists() and not self.tcf.overwrite:
+            try:
+                with open(registry_path, 'rb') as f:
+                    saved_state = pickle.load(f)
+                    registry.set_state(saved_state)
+                registry_loaded = True
+            except Exception as e:
+                self.logger.write(f"# WARNING: Could not load registry pickle ({e}). Regenerating all groups.")
+        
+        # If we couldn't load the registry, we cannot trust the group pickles 
+        # (they contain IDs that map to the old registry) -> overwrite them.
+        return not registry_loaded
 
     def collapse_groups(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry):
         """
@@ -227,14 +619,18 @@ class GeneTreeManager:
         step = "Collapsing gene tree groupings"
         self.logger.report_step(step, "In progress...")
         
-        pickle_dir = self.cfg.pickle_dir
+        pickle_dir = self.tcf.pickle_dir
         pickle_dir.mkdir(parents=True, exist_ok=True)
+
+        registry_path = pickle_dir / f"{self.tcf.run_prefix}_registry.pickle"
+        force_regenerate = self._check_registry_safety(registry_path, registry)
 
         for m_idx, m_data in mul_trees.items():
             if m_idx == 0: continue
             
-            pickle_path = pickle_dir / f"{self.cfg.run_prefix}_{m_idx}_groups.pickle"
-            if pickle_path.exists() and not self.cfg.overwrite:
+            pickle_path = pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
+            # Skip only if pickles exist AND we successfully restored the registry state
+            if pickle_path.exists() and not self.tcf.overwrite and not force_regenerate:
                 continue
                 
             # Compute groups using the registry for speed
@@ -255,6 +651,13 @@ class GeneTreeManager:
             
             del current_mt_groups
             
+        # Save the registry state so the next run can interpret the IDs in the group pickles
+        try:
+            with open(registry_path, 'wb') as f:
+                pickle.dump(registry.get_state(), f)
+        except Exception as e:
+            self.logger.write(f"Error saving registry pickle: {e}")
+            
         self.logger.report_step(step, "Success")
 
     def filter_and_check(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]):
@@ -265,7 +668,7 @@ class GeneTreeManager:
         step = "Filtering gene trees over group cap"
         self.logger.report_step(step, "In progress...")
         
-        check_path = Path(self.cfg.output_dir) / f"{self.cfg.run_prefix}-checknums.txt"
+        check_path = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-checknums.txt"
         
         gt_failures = {} 
         sorted_mul_ids = sorted(mul_trees.keys())
@@ -302,14 +705,14 @@ class GeneTreeManager:
                 mt_str = format_mt_optimized(m_data.mt, m_data.h_clade, m_idx)
                 
                 h_info = ""
-                if not self.cfg.is_mul_input:
-                     h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
-                     h2_name = m_data.h2_node.name if m_data.h2_node else "NA"
-                     h_info = f"\tH1 Node:{h1_name}\tH2 Node:{h2_name}"
+                if not self.tcf.is_mul_input:
+                    h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
+                    h2_name = m_data.h2_node.name if m_data.h2_node else "NA"
+                    h_info = f"\tH1 Node:{h1_name}\tH2 Node:{h2_name}"
                 
                 f.write(f"# MT-{m_idx}:{mt_str}{h_info}\n")
 
-                pickle_path = self.cfg.pickle_dir / f"{self.cfg.run_prefix}_{m_idx}_groups.pickle"
+                pickle_path = self.tcf.pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
                 if not pickle_path.exists(): continue
                 
                 current_mt_groups = {}
@@ -330,7 +733,7 @@ class GeneTreeManager:
                     total_groups = num_ambig + num_fixed
                     
                     over_cap = "N"
-                    if num_ambig > self.cfg.group_cap:
+                    if num_ambig > self.tcf.group_cap:
                         over_cap = "Y"
                         if g_idx not in gt_failures: gt_failures[g_idx] = []
                         gt_failures[g_idx].append(m_idx)
@@ -357,7 +760,7 @@ class GeneTreeManager:
         step = "Writing filtered gene trees to file"
         self.logger.report_step(step, "In progress...")
         
-        p = Path(self.cfg.output_dir) / f"{self.cfg.run_prefix}-trees-filtered.txt"
+        p = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-trees-filtered.txt"
         count = 0
         with open(p, 'w') as f:
             for idx in sorted(gene_trees.keys()):

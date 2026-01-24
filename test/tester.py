@@ -19,13 +19,13 @@ def time_tool(command: str, tool_name: str):
 
 if __name__ == "__main__":
 
-    path_manual = Path(__file__).parent / "ex_k_back"
-    g = path_manual / 'backbone.txt'
-    s = path_manual / 'astral.tre'
+    #path_manual = Path(__file__).parent / "ex_k_back"
+    #g = path_manual / 'backbone.txt'
+    #s = path_manual / 'astral.tre'
 
-    #path_manual = Path(__file__).parent / "ex_no_w"
-    #g = path_manual / 'manual_gene_trees_no_w.txt'
-    #s = path_manual / 'manual_species_tree_no_w.tre'
+    path_manual = Path(__file__).parent / "ex_w"
+    g = path_manual / 'manual_gene_trees_w.txt'
+    s = path_manual / 'manual_species_tree_w.tre'
 
     other_args = ''
 
@@ -38,9 +38,73 @@ if __name__ == "__main__":
     o_new = path_manual / 'o_new'
 
     time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}/ {other_args}", "new") # --debug --plot
-    #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug --plot", "new")
-    #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_deep/ {other_args} -m full", "new")
+    time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug", "new") #--plot --start 1
+    time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_deep/ {other_args} -m full --debug", "new")
 
     #time_tool(f"python {old_tool} -g {g} -s {s} -o {o_old} --overwrite {other_args} --maps", "old")
 
-    time_tool(f"python {Path(__file__).parent / 'exe_compare.py'} -log {path_manual / 'compare_log.txt'} -old {o_old} -new {o_new}", "compare")
+    #time_tool(f"python {Path(__file__).parent / 'exe_compare.py'} -log {path_manual / 'compare_log.txt'} -old {o_old} -new {o_new}", "compare")
+
+
+
+
+    '''
+    # Initial File Selection
+    st_file = Path(args.spec_tree).resolve()
+    gt_file = Path(args.gene_tree).resolve() if args.gene_tree else None
+
+    # For Full mode only: if resuming, point to previous iteration's output
+    if mode == "full" and i > 0:
+        prev_st = out_dir / str(i-1) / 'multree.tre'
+        prev_gt = out_dir / str(i-1) / 'genetrees.txt'
+        if prev_st.exists():
+            st_file = prev_st
+            gt_file = prev_gt
+
+
+
+        # Sanitize inputs to SmrtTree objects
+   
+    # 3. Determine Initial Inputs for TaskSpec
+    st_file = Path(args.spec_tree).resolve()
+    gt_file = Path(args.gene_tree).resolve() if args.gene_tree else None
+        
+    '''
+
+    '''# Print setup info
+    print(f'\nSetup:')
+    print(f'Iterations: {max_iter} (provided start-point {start})')
+    print(f'Cutoff: {mp_cutoff}')
+    print(f'Handle Nested Hybridizations: {not ignore_nesting}')
+    print(f'Preprocessing Config: {prep_config if prep_config else "None"}')
+    print(f'Output Directory: {base_output_dir}')
+    print(f'Plotting Enabled: {args.plot}')
+    print(f'Debug Mode: {debug}')
+    print(f'Other Args: {unknown_args}')
+
+
+        # Determine initial file paths based on iteration/resume point
+    if i == 0:
+        st_file = Path(args.spec_tree).resolve()
+        gt_file = Path(args.gene_tree).resolve() if args.gene_tree else ""
+    else:
+        # Load the processed files from the PREVIOUS successful iteration
+        st_file = out_dir / str(i-1) / 'multree.tre'
+        gt_file = out_dir / str(i-1) / 'genetrees.txt'
+
+
+
+
+    '''
+
+
+#    def __post_init__(self):
+#        """Debug logging if enabled."""
+#        if self.debug:
+#            # We initialize a temporary logger for debug output
+#            self.output_dir.mkdir(parents=True, exist_ok=True)
+#            logger = GrandmaLogger(log_path=self.log_path, verbosity=self.verbosity, clear_log=False)
+#            '''logger.write("GRANDMA Configuration Initialized:", level=0)
+#            for field_name in self.__slots__:
+#                logger.write(f"  {field_name}: {getattr(self, field_name)}", level=0)'''
+

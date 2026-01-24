@@ -32,6 +32,15 @@ class NameRegistry:
     def size(self) -> int:
         return len(self._int_to_str)
 
+    # --- Persistence Methods ---
+    def get_state(self) -> Tuple[Dict[str, int], List[str]]:
+        """Returns the internal state for pickling."""
+        return self._str_to_int, self._int_to_str
+
+    def set_state(self, state: Tuple[Dict[str, int], List[str]]):
+        """Restores the internal state from pickle."""
+        self._str_to_int, self._int_to_str = state
+
 @dataclass
 class FlatTree:
     """
@@ -60,6 +69,7 @@ class FlatTree:
     
     # --- Fields with defaults must come LAST ---
     name_id_to_node_id: Dict[int, int] = field(default_factory=dict)
+    node_id_to_name_id: Dict[int, int] = field(default_factory=dict)
     rmq_table: List[array.array] = field(default_factory=list) # Sparse table for RMQ
 
     def get_lca(self, u: int, v: int) -> int:
@@ -108,6 +118,7 @@ class TreeLinearizer:
         sorted_nodes = sorted(node_to_id.keys(), key=lambda n: node_to_id[n])
         
         name_id_to_node_id = {}
+        node_id_to_name_id = {}
 
         for node in sorted_nodes:
             nid = node_to_id[node]
@@ -121,17 +132,20 @@ class TreeLinearizer:
                 # Extract species name. 
                 # For GT: "Gene_Species" -> "Species"
                 # For ST (MUL): "Species*" -> "Species*" (Preserves distinction)
+                # A clean name is needed to find matching species in ST
                 sp_name = raw_name.split("_")[-1] 
                 name_idx = registry.get_id(sp_name)
                 
                 # Also index the full leaf name for Group lookup (e.g. "Gene1_Species")
                 full_name_idx = registry.get_id(raw_name)
                 name_id_to_node_id[full_name_idx] = nid
+                node_id_to_name_id[nid] = full_name_idx
                 
             elif raw_name:
-                 # Internal nodes (e.g. "H1")
-                 name_idx = registry.get_id(raw_name)
-                 name_id_to_node_id[name_idx] = nid
+                # Internal nodes (e.g. "H1")
+                name_idx = registry.get_id(raw_name)
+                name_id_to_node_id[name_idx] = nid
+                node_id_to_name_id[nid] = name_idx
 
             node_to_name_id[nid] = name_idx
 
@@ -208,6 +222,7 @@ class TreeLinearizer:
             first_visit=first_visit,
             # Defaults last
             name_id_to_node_id=name_id_to_node_id,
+            node_id_to_name_id=node_id_to_name_id,
             rmq_table=rmq
         )
     

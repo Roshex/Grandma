@@ -15,6 +15,8 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
+is_fatal = lambda x: "Error" if x else "Warning"
+
 class GrandmaLogger:
     def __init__(self, log_path: Path, verbosity: int = 3, parent_logger: 'GrandmaLogger' = None, clear_log: bool = True):
         self.log_path = log_path
@@ -31,16 +33,22 @@ class GrandmaLogger:
             with open(self.log_path, 'w') as f:
                 f.write("")
 
-    def write(self, message: str, level: int = 2, to_screen: bool = True):
+    def write(self, msg: str, level: int = 2, to_screen: bool = True):
         """Writes to log file and optionally to screen based on verbosity."""
+        # Count warnings abd catch errors
+        if msg.startswith("WARNING") or msg.startswith("Warning"):
+            self.warnings += 1
+        elif msg.startswith("ERROR") or msg.startswith("Error"):
+            raise Exception(msg)
+        msg = '# ' + msg
         with open(self.log_path, "a") as f:
-            f.write(message + "\n")
+            f.write(msg + "\n")
         # Propagate to Engine Logger (Cumulative)
         if self.parent_logger:
             # Pass to_screen=False to avoid double-printing to terminal
-            self.parent_logger.write(message, level=level, to_screen=False)
+            self.parent_logger.write(msg, level=level, to_screen=False)
         if to_screen and self.verbosity >= level:
-            print(message)
+            print(msg)
 
     def spaced(self, s, width):
         return str(s) + " " * (width - len(str(s)))
@@ -154,11 +162,11 @@ class GrandmaLogger:
         self.write(f"# Using Python version:               {'.'.join(map(str, sys.version_info[:3]))}", level=start_v)
         self.write(f"#\n# The program was called as:          {' '.join(sys.argv)}\n#", level=start_v)
 
-    def start_run(self, cfg, globs_dict):
+    def start_run(self, ctx: 'GlobalContext', tcf: 'TaskConfig'):
         """Replicates startProg from opt_parse.py"""
         start_v = 1 if self.verbosity == 0 else 3
 
-        if cfg.info_only: return
+        if ctx.norun: return
 
         self.write("# " + "-" * 125, level=start_v)
         self.write("# INPUT/OUTPUT INFO:", level=start_v)
@@ -166,19 +174,19 @@ class GrandmaLogger:
         pad = 40
         
         # Files
-        self.write(self.spaced("# Species tree file:", pad) + str(cfg.species_tree_path), level=start_v)
-        if not cfg.is_mul_input:
-             self.write(self.spaced("# Gene tree file:", pad) + (str(cfg.gene_tree_path) if cfg.gene_tree_path else ""), level=start_v)
+        self.write(self.spaced("# Species tree file:", pad) + str(tcf.st), level=start_v)
+        if not tcf.is_mul_input:
+             self.write(self.spaced("# Gene tree file:", pad) + (str(tcf.gts) if tcf.gts else ""), level=start_v)
         
-        self.write(self.spaced("# Output directory:", pad) + str(cfg.output_dir), level=start_v)
+        self.write(self.spaced("# Output directory:", pad) + str(tcf.output_dir), level=start_v)
         
-        if not cfg.is_mul_input:
-            self.write(self.spaced("# Score file:", pad) + str(Path(cfg.output_dir) / f"{cfg.run_prefix}-scores.txt"), level=start_v)
-            self.write(self.spaced("# Filtered gene trees:", pad) + str(Path(cfg.output_dir) / f"{cfg.run_prefix}-trees-filtered.txt"), level=start_v)
-            self.write(self.spaced("# Check nums file:", pad) + str(Path(cfg.output_dir) / f"{cfg.run_prefix}-checknums.txt"), level=start_v)
-            if cfg.mode != "check-nums":
-                self.write(self.spaced("# Detailed mapping file:", pad) + str(Path(cfg.output_dir) / f"{cfg.run_prefix}-detailed.txt"), level=start_v)
-                self.write(self.spaced("# Duplication count file:", pad) + str(Path(cfg.output_dir) / f"{cfg.run_prefix}-dup-counts.txt"), level=start_v)
+        if not tcf.is_mul_input:
+            self.write(self.spaced("# Score file:", pad) + str(Path(tcf.output_dir) / f"{tcf.run_prefix}-scores.txt"), level=start_v)
+            self.write(self.spaced("# Filtered gene trees:", pad) + str(Path(tcf.output_dir) / f"{tcf.run_prefix}-trees-filtered.txt"), level=start_v)
+            self.write(self.spaced("# Check nums file:", pad) + str(Path(tcf.output_dir) / f"{tcf.run_prefix}-checknums.txt"), level=start_v)
+            if tcf.mode != "check-nums":
+                self.write(self.spaced("# Detailed mapping file:", pad) + str(Path(tcf.output_dir) / f"{tcf.run_prefix}-detailed.txt"), level=start_v)
+                self.write(self.spaced("# Duplication count file:", pad) + str(Path(tcf.output_dir) / f"{tcf.run_prefix}-dup-counts.txt"), level=start_v)
 
         self.write("# " + "-" * 125, level=start_v)
         self.write("# OPTIONS INFO:", level=start_v)
@@ -186,53 +194,53 @@ class GrandmaLogger:
         
         # Options Table
         # -h1
-        h1_str = cfg.h1_nodes if cfg.h1_nodes else "All"
+        h1_str = tcf.h1_nodes if tcf.h1_nodes else "All"
         self.write(self.spaced("# -h1", pad) + self.spaced(h1_str, 30) + "GRAMPA will search these H1 nodes. If none are specified, all nodes will be searched as H1 nodes.", level=start_v)
         # -h2
-        h2_str = cfg.h2_nodes if cfg.h2_nodes else "All"
+        h2_str = tcf.h2_nodes if tcf.h2_nodes else "All"
         self.write(self.spaced("# -h2", pad) + self.spaced(h2_str, 30) + "GRAMPA will search these H2 nodes. If none are specified, all nodes will be searched as H2 nodes.", level=start_v)
         # -c
-        self.write(self.spaced("# -c", pad) + self.spaced(str(cfg.group_cap), 30) + "Gene trees with more than this number of groups/clades with polyploid species for a given h1/h2 combination will be skipped.", level=start_v)
+        self.write(self.spaced("# -c", pad) + self.spaced(str(tcf.group_cap), 30) + "Gene trees with more than this number of groups/clades with polyploid species for a given h1/h2 combination will be skipped.", level=start_v)
         # -f
-        self.write(self.spaced("# -f", pad) + self.spaced(cfg.run_prefix, 30) + "All output files generated will have this string preprended to them.", level=start_v)
+        self.write(self.spaced("# -f", pad) + self.spaced(tcf.run_prefix, 30) + "All output files generated will have this string preprended to them.", level=start_v)
         # -p
-        self.write(self.spaced("# -p", pad) + self.spaced(str(cfg.num_processes), 30) + "GRAMPA will use this number of processes for LCA mapping.", level=start_v)
+        self.write(self.spaced("# -p", pad) + self.spaced(str(ctx.num_processes), 30) + "GRAMPA will use this number of processes for LCA mapping.", level=start_v)
         # -v
         self.write(self.spaced("# -v", pad) + self.spaced(str(self.verbosity), 30) + "Controls the amount of info printed to the screen as GRAMPA is running.", level=start_v)
         # --multree
-        mul_str = "The tree input with -s will be read as a MUL-tree." if cfg.is_mul_input else "The tree input with -s will be read as singly-labeled tree."
-        self.write(self.spaced("# --multree", pad) + self.spaced(str(cfg.is_mul_input), 30) + mul_str, level=start_v)
+        mul_str = "The tree input with -s will be read as a MUL-tree." if tcf.is_mul_input else "The tree input with -s will be read as singly-labeled tree."
+        self.write(self.spaced("# --multree", pad) + self.spaced(str(tcf.is_mul_input), 30) + mul_str, level=start_v)
         # --checknums
-        cn_str = "GRAMPA will count groups to filter gene trees and exit." if cfg.mode == "check-nums" else "GRAMPA will count groups to filter gene trees and then perform reconciliations."
-        self.write(self.spaced("# --checknums", pad) + self.spaced(str(cfg.mode == "check-nums"), 30) + cn_str, level=start_v)
+        cn_str = "GRAMPA will count groups to filter gene trees and exit." if tcf.mode == "check-nums" else "GRAMPA will count groups to filter gene trees and then perform reconciliations."
+        self.write(self.spaced("# --checknums", pad) + self.spaced(str(tcf.mode == "check-nums"), 30) + cn_str, level=start_v)
         # --no-st, --st-only
         st_opt_str = "default"
-        if cfg.mode == "no-st": st_opt_str = "no-st"
-        if cfg.mode == "st-only": st_opt_str = "st-only"
+        if tcf.mode == "no-st": st_opt_str = "no-st"
+        if tcf.mode == "st-only": st_opt_str = "st-only"
         st_desc = "GRAMPA will perform reconciliations to all MUL-trees specified by -h1 and -h2 and the input species tree."
-        if cfg.mode == "no-st": st_desc = "GRAMPA will perform reconciliations to only the MUL-trees specified by -h1 and -h2."
-        if cfg.mode == "st-only": st_desc = "GRAMPA will perform reconciliations to only the input species tree."
+        if tcf.mode == "no-st": st_desc = "GRAMPA will perform reconciliations to only the MUL-trees specified by -h1 and -h2."
+        if tcf.mode == "st-only": st_desc = "GRAMPA will perform reconciliations to only the input species tree."
         self.write(self.spaced("# --no-st, --st-only", pad) + self.spaced(st_opt_str, 30) + st_desc, level=start_v)
         # --maps
-        if cfg.mode != "check-nums":
-             map_desc = "GRAMPA will output node mappings for the lowest scoring tree in the detailed output file." if cfg.maps_opt else "GRAMPA will only output duplication and loss counts in the detailed output file."
-             self.write(self.spaced("# --maps", pad) + self.spaced(str(cfg.maps_opt), 30) + map_desc, level=start_v)
+        if tcf.mode != "check-nums":
+             map_desc = "GRAMPA will output node mappings for the lowest scoring tree in the detailed output file." if tcf.to_map else "GRAMPA will only output duplication and loss counts in the detailed output file."
+             self.write(self.spaced("# --maps", pad) + self.spaced(str(tcf.to_map), 30) + map_desc, level=start_v)
         # --overwrite
-        if cfg.overwrite:
+        if tcf.overwrite:
              self.write(self.spaced("# --overwrite", pad) + self.spaced("True", 30) + "GRAMPA will OVERWRITE the existing files in the specified output directory.", level=start_v)
 
         if self.verbosity == 1:
             self.write("# " + "-" * 125, level=1)
             self.write(f"# {self.get_date_time()} INFO: Starting GRAMPA. With -v 1 set, no more information will be printed to the screen until the end of the run.", level=1)
 
-    def print_end_prog(self, cfg, min_info=None):
+    def print_end_prog(self, tcf, min_info=None):
         """Replicates endProg from reconcore.py"""
         total_time = time.time() - self.start_time
         self.write("# " + "=" * 175, level=self.verbosity)
         self.write("#\n# Done!", level=self.verbosity)
         self.write(f"# The date and time at the end is: {self.get_date_time()}", level=self.verbosity)
         self.write(f"# Total execution time:            {round(total_time, 3)} seconds.", level=self.verbosity)
-        self.write(f"# Output directory for this run:   {cfg.output_dir}", level=self.verbosity)
+        self.write(f"# Output directory for this run:   {tcf.output_dir}", level=self.verbosity)
         self.write(f"# Log file for this run:           {self.log_path}", level=self.verbosity)
 
         if self.warnings > 0:

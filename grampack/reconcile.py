@@ -5,8 +5,8 @@ from functools import partial
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Set, Union
 
-from .config import GrandmaConfig
-from .models import TreeNode, SmrtTree, MulTree, GroupData, Map, ReconResult, StepResult, FlatTree, NameRegistry
+from .config import TaskConfig
+from .models import SmrtTree, MulTree, GroupData, Map, ReconResult, StepResult, FlatTree, NameRegistry
 
 GroupsPickle = Dict[int, GroupData]
 
@@ -55,9 +55,9 @@ def _worker_reconcile_single(
     return mul_idx, total_score
 
 class Reconciler:
-    def __init__(self, species_tree: SmrtTree, config: Any):
-        self.st = species_tree
-        self.cfg = config
+    def __init__(self, config: TaskConfig, num_processes: int = 1):
+        self.tcf = config
+        self.num_processes = num_processes
 
     # --------------------------------------------------------------------------
     # GROUP COLLAPSING LOGIC (Object-based, run once per iter)
@@ -368,16 +368,19 @@ class Reconciler:
                 if u not in lca_maps: continue
                 
                 # Get Names
-                u_name_id = gt.node_to_name_id[u]
+                #u_name_id = gt.node_to_name_id[u]
                 target_id = lca_maps[u]
                 t_name_id = st.node_to_name_id[target_id]
                 
-                u_name = registry.get_name(u_name_id)
+                #u_name = registry.get_name(u_name_id)
                 t_name = registry.get_name(t_name_id)
+
+                u_full_id = gt.node_id_to_name_id[u]
+                u_full_name = registry.get_name(u_full_id)
                 
-                final_maps_str[u_name] = [t_name]
-                if u in node_dups: final_dups_str[u_name] = node_dups[u]
-                if u in node_losses: final_losses_str[u_name] = node_losses[u]
+                final_maps_str[u_full_name] = [t_name]
+                if u in node_dups: final_dups_str[u_full_name] = node_dups[u]
+                if u in node_losses: final_losses_str[u_full_name] = node_losses[u]
                 
             return ReconResult(
                 score=score, 
@@ -543,14 +546,23 @@ class Reconciler:
         logger.report_step(step, "Success")
         return detailed_res
         
-    def run(self, mul_trees: dict, gene_trees: dict, registry: NameRegistry, cfg: GrandmaConfig, logger: Any, writer: Any) -> StepResult:
-        n_lowest, pickle_dir, run_prefix, n_proc = cfg.n_lowest, cfg.pickle_dir, cfg.run_prefix, cfg.num_processes
+    def run(self, mul_trees: dict, gene_trees: dict, registry: NameRegistry, logger: Any, writer: Any) -> StepResult:
+
+        pickle_dir, run_prefix, = self.tcf.pickle_dir, self.tcf.run_prefix
+        n_proc = self.num_processes
         
         if registry is None: registry = NameRegistry()
 
         sorted_scores = self.recon_all(mul_trees, gene_trees, registry, pickle_dir, run_prefix, n_proc, logger)
         
-        # Use new flat map getter
+        # Beta logic for n_lowest
+        if self.tcf.to_map < 0:
+            n_lowest = len(mul_trees)
+        else:
+            if self.tcf.to_map < max(6, self.tcf.max_select):
+                n_lowest = max(6, self.tcf.max_select)
+            else:
+                n_lowest = self.tcf.to_map
         detailed_res = self.get_lowest_maps(sorted_scores, n_lowest, mul_trees, gene_trees, registry, pickle_dir, run_prefix, logger)
         
         writer.write_results(sorted_scores, detailed_res, mul_trees, gene_trees)

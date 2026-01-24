@@ -3,22 +3,31 @@ Replaces params.py and global_vars.py. Holds constants and configuration datacla
 Handles the input parsing logic from opt_parse.py and spec_tree.py
 '''
 
-import os
-import re
-import sys
 import ast
 import json
-import time
 import shutil
 import argparse
-from glob import glob
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Union, List
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace, fields
 
-from .models import Tree, SmrtTree, Map
+from .models import SmrtTree, Map
 from .logger import GrandmaLogger
 
+import datetime
+
+# Replicating the dynamic default logic from the original opt_parse.py
+def get_default_outdir() -> str:
+    return "grandma_out_" + datetime.datetime.now().strftime("%m-%d-%Y.%I-%M-%S")
+
+'''
+missing:
+
+better mem and cpu/processing options?
+
+'''
+
+# --- Package Metadata (Literal) ---
 @dataclass(frozen=True, slots=True)
 class GrandmaMetadata:
     """Immutable metadata about the GRANDMA software."""
@@ -27,7 +36,7 @@ class GrandmaMetadata:
     github: str = "TBD"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "2.0.0 (Modern)"
+    version: str = "2.6.0 (Modern)"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -37,95 +46,102 @@ class GrandmaMetadata:
     source_release: str = "June 2024"
     source_version: str = "1.4.0"
 
-'''
-missing:
-
-seed: int = 42
-max_select: int = 1 # max mts to select for processing per Run (non-overlapping H clades & scoring above ST)
-ploidy_file: str = "" # path to ploidy file
-min_st_lvs: int = 1 # for split mode
-min_gt_lvs: int = 2 # for split mode
-
-better mem and cpu/processing options?
-
-'''
-
+# --- Global Environment (Static) ---
 @dataclass(frozen=True, slots=True)
-class GrandmaConfig:
-    """Immutable configuration object for a GRANDMA run."""
-    # Input/Output
-    #species_tree_path: str = ""
-    #gene_tree_path: str = ""
-    #output_dir: str = ""
-
-    species_tree_path: Path
-    gene_tree_path: Optional[Path]
-    output_dir: Optional[Path]
-    log_path: Optional[Path]
-
-    # Execution Mode
-    # options: single, split, full, build-mts, st-only, no-st, check-nums
-    mode: str = "single"
-
-    # Iteration / Full Mode Control
-    max_iter: Union[int, float] = 0        
-    history: Dict[Tuple[Any, int], Any] = field(default_factory=dict)
-    history_file: Optional[Path] = None
-    start_pt: int = 0      
-    cutoff: Tuple[str, Optional[Union[int, float]]] = ("auto", None)
-    ignore_nesting: bool = False
-
-    # Algorithm Options
-    h1_nodes: Optional[str] = None
-    h2_nodes: Optional[str] = None
-    group_cap: int = 8
-    maps_opt: bool = False
-    orth_opt: bool = False
-    
-    # Modes
-    is_mul_input: bool = False
-    
-    # Execution
+class GlobalContext:
+    """
+    Environmental settings that remain constant throughout the application lifecycle.
+    Passed to the Engine/Run classes upon initialization.
+    """
+    # System Resources
     num_processes: int = 1
     verbosity: int = 3
-    debug: bool = False
-    plot: bool = True
-    info_only: bool = False
     seed: int = 42
+    
+    # Global Flags
+    plot: bool = False
+    norun: bool = False
+    nolog: bool = False
+    debug: bool = False
 
+    # Global Algorithm Options
+    orth_opt: bool = False
+    max_iter: Union[int, float] = 0
+    cutoff: Tuple[str, Optional[Union[int, float]]] = ("auto", None)
+    ignore_nesting: bool = False # for full mode
+    min_st_lvs: int = 1 # for split mode
+    min_gt_lvs: int = 2 # for split mode
+    
+    # Paths that define the "Session"
+    root_dir: Path = field(default_factory=lambda: Path(get_default_outdir()))
+    log_file: Optional[Path] = None
+    
+    # History Tracking (Global State)
+    history: Dict[Tuple[Any, int], Any] = field(default_factory=dict)
+    start_pt: int = 0
+
+    @property
+    def history_file(self) -> Path:
+        """Dynamic property derived from the root output dir."""
+        return self.root_dir / 'history.json'
+
+# --- Unit of Reconciliation (Dynamic) ---
+@dataclass(frozen=True, slots=True)
+class TaskConfig:
+    """
+    Configuration for a SINGLE execution Step.
+    Contains sanitized arguments specific to one reconciliation task (~Grampa).
+    """
+    # I/O for this specific step
+    output_dir: Path
+    st: Union[str, Path, SmrtTree]
+    gts: Optional[Union[str, Path, Dict[int, SmrtTree]]] = None
     run_prefix: str = "grandma"
+
+    # Mode Targets
+    mode: str = "single"
     overwrite: bool = False
+    repair: bool = False
+    
+    # Algorithm Tunables
+    h1_nodes: Optional[Union[str, List[str]]] = None
+    h2_nodes: Optional[Union[str, List[str]]] = None
+    ploidies: Optional[Union[Path, str, Dict[str, int]]] = None
+    group_cap: int = 8
+    to_map: int = 0 # False, True, int for max maps to keep, -1 for all
+    max_select: int = 1 # max mts to select for processing per Run (non-overlapping H clades & scoring above ST)
 
-    pickle_dir: Path = Path("pkls/")
-    n_lowest: int = 6
+    # Legacy Flags
+    is_mul_input: bool = False
 
-    def __post_init__(self):
-        """Debug logging if enabled."""
-        if self.debug:
-            # We initialize a temporary logger for debug output
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            logger = GrandmaLogger(log_path=self.log_path, verbosity=self.verbosity, clear_log=False)
-            '''logger.write("GRANDMA Configuration Initialized:", level=0)
-            for field_name in self.__slots__:
-                logger.write(f"  {field_name}: {getattr(self, field_name)}", level=0)'''
+    @property
+    def pickle_dir(self) -> Path:
+        """Dynamic property derived from the step's output dir."""
+        return self.output_dir / "pkls"
+    
+    @property
+    def log_file(self) -> Path:
+        """Dynamic property for the log file path."""
+        return self.output_dir / f"{self.run_prefix}.log"
+    
+    def update(self, **changes) -> 'TaskConfig':
+        """
+        Returns a new TaskConfig with specific fields updated.
+        Validates that keys exist to prevent silent errors.
+        """
+        # Certain fields should not be allowed to be changed
+        forbidden_keys = {'group_cap', 'to_map', 'max_select', 'run_prefix'}
+        # Safety check to ensure we aren't inventing new fields
+        valid_fields = {f.name for f in fields(self)}
+        for key in changes:
+            if key not in valid_fields:
+                raise TypeError(f"TaskConfig got an unexpected keyword argument '{key}'")
+            if key in forbidden_keys:
+                raise ValueError(f"TaskConfig field '{key}' is not allowed to be changed")
+
+        return replace(self, **changes)
 
 # --- Utility Functions ---
-
-def parse_cutoff(val: str) -> Tuple[str, Optional[Union[float, int]]]:
-    """Parses stopping condition strings into a typed tuple."""
-    if val == 'auto': 
-        return ('auto', None)
-    if val.startswith('rel:'):
-        try: 
-            return ('rel', float(val.split(':')[1]))
-        except (ValueError, IndexError): 
-            raise argparse.ArgumentTypeError(f'Invalid relative cutoff: {val}')
-    if val.startswith('abs:'):
-        try: 
-            return ('abs', int(val.split(':')[1]))
-        except (ValueError, IndexError): 
-            raise argparse.ArgumentTypeError(f'Invalid absolute cutoff: {val}')
-    raise argparse.ArgumentTypeError(f'Invalid cutoff format: "{val}". Use "auto", "rel:<float>", or "abs:<int>".')
 
 def load_history(history_file: Path) -> Dict[Tuple[Any, int], Any]:
     """Loads and deserializes the iteration history."""
@@ -229,57 +245,104 @@ def start_up_prep_2(start_point: Union[str, int], base_output_dir: Path, logger:
 
     return i, history, history_file
 
-def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: GrandmaLogger, mode) -> Tuple[int, Dict, Path]:
-    """Handles folder cleanup and history loading before the engine starts."""
+def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: GrandmaLogger, mode: str) -> Tuple[int, Dict, Path]:
+    """
+    Handles folder cleanup and history loading before the engine starts.
+    Robustly handles both Integer folders (Full mode) and Dot-Notation folders (Split mode).
+    """
     i = 0
-    iter_dirs = []
     history = {}
     history_file = base_output_dir / 'history.json'
 
+    # 1. Load History if exists
     if base_output_dir.exists():
         if history_file.exists():
-            history = load_history(history_file)
-            iter_dirs = sorted(base_output_dir.glob('*/output/'), key=lambda x: int(x.parent.name))
+            try:
+                history = load_history(history_file)
+                logger.write(f"Loaded existing history ({len(history)} entries).", level=1)
+            except Exception as e:
+                logger.write(f"Warning: Failed to load history file ({e}). Starting fresh.", level=1)
+                history = {}
         else:
             logger.write(f"No history file found at {history_file}. Starting from scratch.", level=1)
     else:
         logger.write(f"Previous output directory {base_output_dir} does not exist. Starting from scratch.", level=1)
     
-    # Resolve start point
+    # 2. Resolve Start Point & Mode Logic
+    if mode == "split":
+        # Split mode resumes based on History content (Graph Traversal), not a linear index.
+        # We generally DO NOT delete folders in split mode unless forced, to preserve the recursion tree.
+        if start_point == 0: # Explicit restart request
+             logger.write("Split Mode: Explicit start at 0. Clearing previous history.", level=1)
+             history = {}
+             # We let existing folders be overwritten by the run logic
+        return 0, history, history_file
+
+    # --- Full Mode (Linear) Logic Below ---
+    
+    # Identify existing iteration folders (0, 1, 2...)
+    # Filter out non-integer folders (like 'pkls' or split folders)
+    iter_dirs = []
+    if base_output_dir.exists():
+        for d in base_output_dir.iterdir():
+            if d.is_dir() and d.name.isdigit():
+                iter_dirs.append(d)
+    iter_dirs.sort(key=lambda x: int(x.name))
+
+    # Determine 'i' (Next Iteration Index)
     if isinstance(start_point, int):
         if start_point < 1:
-            raise ValueError(f"--start must be a strictly positive integer or 'auto', got {start_point}.")
-        i = start_point - 1  # We'll read from iteration (start-1)
-        
-        if (i+1, 0) not in history:
-            raise RuntimeError(f'Missing history entry for iteration {i}. Cannot resume at iteration {i+1}.')
-
-        logger.write(f"Resuming from iteration {i+1} (manually specified).", level=1)
+            # Explicit restart
+            logger.write("Manual start at 0. Wiping previous history.", level=1)
+            i = 0
+        else:
+            # Resume at specific point
+            i = start_point - 1  # We read output from (start-1) to begin (start)
+            # Check if required history exists
+            if (i, 0) not in history:
+                logger.write(f"Warning: Missing history for iteration {i}. Cannot resume perfectly. Starting at {i} anyway.", level=1)
+            logger.write(f"Resuming from iteration {i+1} (manually specified).", level=1)
     else:
-        # Auto-detect: try to infer starting iteration from history
-        if iter_dirs:
-            for iter_dir in reversed(iter_dirs):
-                j = int(iter_dir.parent.name) + 1
-                if (j, 0) in history:
-                    i = j
-                    logger.write(f"Auto-detected resume point: Iteration {i+1}.", level=1)
-                    break
+        # Auto-detect from folders + history
+        # Find the highest folder index that is ALSO in history
+        valid_i = -1
+        for folder in reversed(iter_dirs):
+            idx = int(folder.name)
+            if (idx, 0) in history:
+                valid_i = idx
+                break
+        
+        if valid_i >= 0:
+            i = valid_i + 1
+            logger.write(f"Auto-detected resume point: Iteration {i}.", level=1)
+        else:
+            i = 0
 
-    # Clean up folders from iteration i onward for fresh resume
+    # 3. Cleanup Future Data (Full Mode Only)
+    # Delete folders >= i (The iteration we are about to run should be fresh)
+    # Exception: If we have pickles for 'i', we might want to keep them?
+    # Ops.py handles overwrite logic. Ideally we keep the folder but clear the history key.
+    
+    # Clean History Keys > i-1 (We keep history UP TO the previous completed run)
+    keys_to_delete = [k for k in history if isinstance(k[0], int) and k[0] >= i]
+    
+    # If resuming, we usually want to start 'i' fresh, so we might delete folder 'i'
+    # But to support "Resume using pickles", we must NOT delete folder 'i'.
+    # We only delete folders > i.
     for iter_dir in iter_dirs:
-        j = int(iter_dir.parent.name)
-        if j >= i:
-            logger.write(f'Removing existing directory from previous run: {iter_dir.parent}', level=1)
-            shutil.rmtree(iter_dir.parent, ignore_errors=True)
+        j = int(iter_dir.name)
+        if j > i:
+            logger.write(f'Removing future directory: {iter_dir}', level=1)
+            shutil.rmtree(iter_dir, ignore_errors=True)
 
-    # Clean up history keys
-    keys_to_delete = [k for k in history if k[0] > i]
-    for k in keys_to_delete:
-        del history[k]
-    if keys_to_delete and history_file.exists():
-        logger.write(f'Removed history entries: {keys_to_delete}', level=1)
-        with open(history_file, 'w') as f:
-            json.dump({str(k): v for k, v in history.items()}, f, indent=4)
+    # Update History File
+    if keys_to_delete:
+        for k in keys_to_delete:
+            del history[k]
+        if history_file.exists():
+            logger.write(f'Pruning history entries >= {i}', level=1)
+            with open(history_file, 'w') as f:
+                json.dump({str(k): v for k, v in history.items()}, f, indent=4)
 
     return i, history, history_file
 
@@ -305,380 +368,255 @@ def check_loop_length(n: int, i: int, st_file: Path, history: Dict, logger: Gran
 
     return n
 
-def resolve_mode_logic(args: argparse.Namespace, logger: GrandmaLogger) -> str:
-    """
-    Consolidates modern --mode and legacy flags into a single mode string.
-    Returns resolved mode.
-    """
-    lca_opt = "default"
-    if args.buildmultrees: lca_opt = "build-mts"
-    elif args.checknums: lca_opt = "check-nums"
-    elif args.st_only: lca_opt = "st-only"
-    elif args.no_st: lca_opt = "no-st"
-    if args.buildmultrees + args.checknums + args.st_only + args.no_st > 1:
-        logger.write("Warning: Multiple legacy lca_opt (build-mts, checknums, no-st, st-only) flags set! One will be chosen according to precedence.", level=1)
 
-    # Priority 1: Direct --mode selection (if not single)
-    if args.mode != "single" and args.mode != lca_opt:
-        logger.write("Warning: --mode flag overrides legacy lca_opt (build-mts, checknums, no-st, st-only) flags!", level=1)
-        return args.mode
-    
-    # Priority 2: If mode is single and no legacy flags are set
-    if lca_opt == "default":
-        return "single"
-        
-    return lca_opt
+
 
 
 # --- Main Parsing ---
 
-def parse_args() -> GrandmaConfig:
-    parser = argparse.ArgumentParser(description="GRANDMA: Gene-tree Reconciliation Algorithm with MUL-trees.")
-    
-    # Required
-    parser.add_argument("-s", dest="spec_tree", required=True, help="Species tree file")
-    parser.add_argument("-g", dest="gene_tree", help="Gene tree file (required unless --buildmultrees)")
-    
-    # Base Options
-    parser.add_argument("-h1", dest="h1", help="Hybrid clade 1 (space separated nodes/tips)")
-    parser.add_argument("-h2", dest="h2", help="Hybrid clade 2 (space separated nodes/tips)")
-    parser.add_argument("-c", dest="cap", type=int, default=8, help="Max groups (cap)")
-    parser.add_argument("-o", dest="outdir", help="Output directory")
-    parser.add_argument("-p", dest="procs", type=int, default=1, help="Number of processes")
-    parser.add_argument("-f", dest="prefix", default="grandma", help="Output file prefix")
-    parser.add_argument("-v", dest="verbosity", type=int, default=3, choices=range(4), help="Verbosity (0-3)")
+class InitParser:
+    def __init__(self):
+        self.parser = argparse.ArgumentParser(
+            description="GRANDMA: Gene-tree Reconciliation Algorithm with MUL-trees.", ###### TBD
+            epilog="For full documentation, visit: TBD", ###### TBD
+            formatter_class=argparse.RawTextHelpFormatter
+        )
+        self._add_arguments()
+        self.logger = None
 
-    # Mode Options
-    parser.add_argument("-m", "--mode", choices=["single", "split", "full", "build-mts", "checknums", "no-st", "st-only"], default="single",
-                        help="Execution mode (single, split, full, build-mts, checknums, no-st, st-only")
-    parser.add_argument('-i', '--iter', type=int, default=0, help='Number of iterations; <int>, non-positive for infinite mode')
-    parser.add_argument('--prep', type=str, help='Preprocess input files; "0/D/default" for default settings, or <path> for a config json')
-    parser.add_argument('--start', type=str, default='auto', help='Start point when finishing a previous execution; positive <int>, or "auto" for auto-detection')
-    parser.add_argument('--cutoff', type=str, default='auto', help='Stopping condition mode; "auto" for abs:0+lookback, "rel:<float>" for relative, or "abs:<int>" for absolute')
-    parser.add_argument('--ignore-nesting', action='store_true', help='Do not automatically fix nested hybridization events; let GRAMPA iterate normally')
+    def _add_arguments(self):
+        # --- Required Inputs ---
+        g_required = self.parser.add_argument_group("Required Inputs")
+        g_required.add_argument("-s", dest="spec_input", required=True, type=str,
+            help="A file or string containing a newick formatted species tree on which to search "
+                 "for polyploid events. May be a singly-labeled or multi-labeled tree.")
 
-    parser.add_argument('--plot', action='store_true', help='Plot taxon count, MP score, and normalized score over iterations')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode for additional output')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for sampling and reproducibility')
+        # --- Base Options ---
+        g_general = self.parser.add_argument_group("General Options")
+        g_general.add_argument("-g", dest="genes_input", default=None, type=str,
+            help="A file or string containing one or more newick formatted gene trees to reconcile. Known gene "
+                 "names if present should be in the format 'geneID_speciesID', where IDs are separated by the 1st "
+                 "underscore. May be a singly-labeled or multi-labeled tree (required unless --buildmultrees).")
+        g_general.add_argument("-o", "--out", dest="outdir", default=get_default_outdir(), type=str,
+            help="Output directory. If it does not exist, it will be created. Default = 'grandma_out_' + timestamp.")
+        g_general.add_argument("-f", "--prefix", default="grandma", type=str,
+            help="A string prepended to all output files. Default = 'grandma'.")
+        g_general.add_argument("-p", "--procs", type=int, default=1,
+            help="Number of processes to use for parallelizable tasks. Default = 1.")
+        g_general.add_argument("-v", "--verbosity", type=int, default=3, choices=range(4),
+            help="Level of verbosity printed to the screen. 0 = none; 1 = run info; 2 = standard; "
+                 "3 = loud / soft debugging. Default = 3.")
 
-    # Legacy mode flags
-    parser.add_argument("--buildmultrees", action="store_true", help="Only build MUL-trees and exit")
-    parser.add_argument("--checknums", action="store_true", help="Count groups and exit")
-    parser.add_argument("--no-st", action="store_true", help="Skip singly-labeled tree")
-    parser.add_argument("--st-only", action="store_true", help="Only run singly-labeled tree")
+        # --- Algorithmic Options ---
+        g_algo = self.parser.add_argument_group("Algorithmic Options")
+        g_algo.add_argument("-h1", "--h1", type=str,
+            help="A space separated nodes/leaves list of one or more node labels from the species tree to be "
+                 "considered as parental node 1 (H1). If no labels are specified, all nodes "
+                 "in the species tree are considered.")
+        g_algo.add_argument("-h2", "--h2", type=str, help="As -h1, but for parental node 2 (H2).")
+        g_algo.add_argument("-x", "--ploidy", type=str, default=None,
+            help="Ploidy file formatted as a Polyphest Multiset file. If provided, H1 and H2 nodes will be enforced by "
+            "ploidy levels. Default: None.")
+        g_algo.add_argument("-c", "--cap", type=int, default=8,
+            help="The maximum number of groups a gene tree is allowed to have. A gene tree with more than --cap "
+                 "number of groups for a given MUL-tree, will be skipped. Default = 8.")
+        g_algo.add_argument("-n", "--max_select", type=int, default=1,
+            help="Maximum MUL-trees to select per run for parallel inference heuristics. Default: 1, i.e., only the best "
+            "scoring MT is considered per iteration.")
+        g_algo.add_argument("--min_st_lvs", type=int, default=1,
+            help="Minimum species tree leaves for a species tree to be considered valid. Specifically relevant for the "
+            "split mode. Default: 1.")
+        g_algo.add_argument("--min_gt_lvs", type=int, default=2,
+            help="Minimum gene trees leaves per tree for a gene tree to be considered valid. Specifically relevant for "
+            "the split mode. Default: 2.")
 
-    # Other legacy flags
-    parser.add_argument("--maps", action="store_true", help="Output detailed maps")
-    parser.add_argument("--orthologies", action="store_true", help="Run orthology labeling (Beta)")
-    parser.add_argument("--force", action="store_true", dest="overwrite", help="Overwrite existing output")
-    
-    # Compatibility flags (ignored or handled implicitly)
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output")
+        # --- Flow Control Options ---
+        g_flow = self.parser.add_argument_group("Flow Control Options")
+        g_flow.add_argument("-m", "--mode", type=str, default="single",
+            choices=["single", "split", "full", "build-mts", "check-nums", "no-recon", "no-st", "st-only"], 
+            help="Execution mode. Options: single => simple run [default] | split => parallelized binary-recursive | "
+            "full => fully sequencial with nestedness inference | build-mts => build MUL-trees only | check-nums => "
+            "count groups only | no-recon => build MTs & count groups | no-st => skip reconciliation to input | st-only "
+            "=> reconciliation to input only.")
+        g_flow.add_argument('-i', '--iter', type=int, default=0,
+            help="Maximun number of iterations for iterative modes; <int>, non-positive to be unlimited. Default = 0.")
+        g_flow.add_argument('-r', '--repair', action='store_true',
+            help="If set, attempt to repair input files by forcing bifurcating trees, rooting, valid tip names, and more.")
+        g_flow.add_argument('--start', type=str, default='auto',
+            help="Start point when resuming a previous execution; positive <int>, or 'auto' [default] for auto-detection.")
+        g_flow.add_argument('--cutoff', type=str, default='auto',
+            help="Stopping condition when comparing MP score; 'auto' [default] for abs:0+lookback, 'abs:<int>' for "
+            "absolute, or 'rel:<float>' for relative.")
+        g_flow.add_argument('--ignore-nesting', action='store_true',
+            help="If set, do not automatically fix nested hybridization events; let GRANDMA iterate normally without "
+            "corrections. Ignored in all modes except 'full'.")
+        g_flow.add_argument("--orthologies", action="store_true",
+            help="If set, will output an additional file containing the pairwise orthology "
+                 "relationships for each gene tree to the lowest scoring MUL-tree.")
 
-    '''
-# Required
-    parser.add_argument("-s", dest="spec_tree", required=True, help="Species tree file")
-    parser.add_argument("-g", dest="gene_tree", help="Gene tree file (required unless --buildmultrees)")
-    parser.add_argument("-o", dest="outdir", help="Output directory")
-    
-    # Core Options
-    parser.add_argument("-m", "--mode", choices=["single", "split", "full", "parallel", "build-mts", "checknums", "no-st", "st-only"], default="single", help="Execution mode")
-    parser.add_argument('-i', '--iter', type=int, default=0, help='Max iterations (0 for infinite)')
-    parser.add_argument('--start', type=str, default='auto', help='Start point ("auto" or int)')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+        # --- Output Options ---
+        g_output = self.parser.add_argument_group("Output Options")
+        g_output.add_argument("--maps", nargs='?', const=1, default=0, type=int,
+            help="If set, the detailed output file will contain node mappings for each gene tree to the lowest "
+                 "scoring MUL-tree. Specify number to retreive for multiple lowest MTs (default if present: 1, all: -1).")
+        g_output.add_argument('--plot', action='store_true',
+            help="Plot taxon count, MP score, and normalized score over iterations. Relevant only for iterative modes.")
+        g_output.add_argument('--debug', action='store_true',
+            help="Enable debug mode for additional outputs.")
+        g_output.add_argument("--overwrite", action="store_true",
+            help="If set, overwrite existing files in the output directory. Default: exit if files exist.")
+        g_output.add_argument("--norun", action="store_true",
+            help="If set, only print the run info and exit.")
+        g_output.add_argument("--nolog", action="store_true",
+            help="If set, do not write a log file.")
+        g_output.add_argument('--seed', type=int, default=42,
+            help="Random seed for sampling and reproducibility. Default = 42.")
 
-    # Algorithm
-    parser.add_argument("-h1", dest="h1", help="Hybrid clade 1 (space separated nodes)")
-    parser.add_argument("-h2", dest="h2", help="Hybrid clade 2 (space separated nodes)")
-    parser.add_argument("-c", dest="cap", type=int, default=8, help="Group cap")
-    parser.add_argument('--cutoff', type=str, default='auto', help='Stopping condition (auto, rel:X, abs:X)')
-    parser.add_argument('--ignore-nesting', action='store_true', help='Skip nested hybridization checks')
-    
-    # System
-    parser.add_argument("-p", dest="procs", type=int, default=1, help="Processes")
-    parser.add_argument("-f", dest="prefix", default="grandma", help="Output prefix")
-    parser.add_argument("-v", dest="verbosity", type=int, default=3, choices=range(4), help="Verbosity")
-    parser.add_argument("--force", dest="overwrite", action="store_true", help="Overwrite existing files")
-    
-    # Extras
-    parser.add_argument('--prep', type=str, help='Preprocess config')
-    parser.add_argument('--plot', action='store_true', help='Generate plots')
-    parser.add_argument('--debug', action='store_true', help='Debug mode')
+        # --- Legacy Flags ---
+        g_legacy = self.parser.add_argument_group("Legacy Support")
+        g_legacy.add_argument("--multree", dest="is_mul_input", action="store_true",
+            help="If set, the input species tree is parsed as a MUL-tree. The H1 and H2 nodes are inferred "
+                 "from tree topology (parents of the 'H*' and 'H' clades). First iteration / single mode will perform "
+                 "reconciliation only - i.e., no alternative MT search. Auto-detected for multi-labeled input.")
+        g_legacy.add_argument("--buildmultrees", action="store_true",
+            help="If set, only build the MUL-trees from the species tree and exit. "
+                 "No reconciliation will be performed. Equivalent to -m build-mts.")
+        g_legacy.add_argument("--checknums", action="store_true",
+            help="If set, only count the number of groups in each gene tree for each MUL-tree and write them "
+                 "to file. No reconciliation will be performed. Equivalent to -m check-nums.")
+        g_legacy.add_argument("--no-st", dest="no_st", action="store_true",
+            help="If set, the standard reconciliation (reconciling to the singly-labeled species tree) "
+                 "will be skipped. Equivalent to -m no-st.")
+        g_legacy.add_argument("--st-only", dest="st_only", action="store_true",
+            help="If set, only the standard reconciliation (reconciling to the singly-labeled species tree) "
+                 "will be performed. Equivalent to -m st-only.")
 
-    # Legacy Flags
-    parser.add_argument("--buildmultrees", action="store_true")
-    parser.add_argument("--checknums", action="store_true")
-    parser.add_argument("--no-st", action="store_true")
-    parser.add_argument("--st-only", action="store_true")
-    parser.add_argument("--maps", action="store_true", help="Detailed maps")
-    parser.add_argument("--orthologies", action="store_true", help="Orthology labeling")
+    def parse_cutoff(self, val: str) -> Tuple[str, Optional[Union[float, int]]]:
+        """Parses stopping condition strings into a typed tuple."""
+        if val == 'auto': 
+            return ('auto', None)
+        if val.startswith('rel:'):
+            try: 
+                return ('rel', float(val.split(':')[1]))
+            except (ValueError, IndexError): 
+                self.logger.write(f'Error: Invalid relative cutoff: {val}', level=0)
+        if val.startswith('abs:'):
+            try: 
+                return ('abs', int(val.split(':')[1]))
+            except (ValueError, IndexError): 
+                self.logger.write(f'Error: Invalid absolute cutoff: {val}', level=0)
+        self.logger.write(f'Error: Invalid cutoff format: "{val}". Use "auto", "rel:<float>", or "abs:<int>".', level=0)
 
-    # for n_lowest maps ?
-    parser.add_argument(
-    "--maps", 
-    dest="maps_opt", 
-    nargs='?', 
-    const=6,      # Default value if flag is present but empty
-    type=int,     # Ensures the value is treated as an integer
-    default=0,    # Value if the flag is not present at all
-    help="Output detailed maps (optional: specify number of maps, default: 6)"
-    )
-    '''
-
-    args = parser.parse_args()
-    
-    out_dir = args.outdir if args.outdir else f"grandma_out_{int(time.time())}" 
-    out_dir = Path(out_dir).resolve()
-    
-    log_path = out_dir / f"{args.prefix}.log"
-    logger = GrandmaLogger(log_path=log_path, verbosity=args.verbosity)
-    
-    mode = resolve_mode_logic(args, logger)
-
-    # Handle folder deletion and history loading BEFORE the engine starts
-    start = args.start if args.start == 'auto' else int(args.start)
-    
-    # Prepare history/folders
-    i, history, history_file = start_up_prep(start, out_dir, logger, mode)
-
-    # Determine initial file paths based on iteration/resume point
-    if i == 0:
-        st_file = Path(args.spec_tree).resolve()
-        gt_file = Path(args.gene_tree).resolve() if args.gene_tree else ""
-    else:
-        # Load the processed files from the PREVIOUS successful iteration
-        st_file = out_dir / str(i-1) / 'multree.tre'
-        gt_file = out_dir / str(i-1) / 'genetrees.txt'
-
-    '''
-    # Initial File Selection
-    st_file = Path(args.spec_tree).resolve()
-    gt_file = Path(args.gene_tree).resolve() if args.gene_tree else None
-
-    # For Full mode only: if resuming, point to previous iteration's output
-    if mode == "full" and i > 0:
-        prev_st = out_dir / str(i-1) / 'multree.tre'
-        prev_gt = out_dir / str(i-1) / 'genetrees.txt'
-        if prev_st.exists():
-            st_file = prev_st
-            gt_file = prev_gt
-    '''
-
-    '''# Print setup info
-    print(f'\nSetup:')
-    print(f'Iterations: {max_iter} (provided start-point {start})')
-    print(f'Cutoff: {mp_cutoff}')
-    print(f'Handle Nested Hybridizations: {not ignore_nesting}')
-    print(f'Preprocessing Config: {prep_config if prep_config else "None"}')
-    print(f'Output Directory: {base_output_dir}')
-    print(f'Plotting Enabled: {args.plot}')
-    print(f'Debug Mode: {debug}')
-    print(f'Other Args: {unknown_args}')
-    '''
-
-    # Determine true loop length
-    max_iter = check_loop_length(args.iter, i, st_file, history, logger)
-
-    # Optional: Data Preparation
-    if args.prep:
-        step = "Preprocessing"
-        GrandmaLogger().report_step(step, "Preprocessing input files...", start=True)
-        if i == 0:
-            st_file, gt_file = DataPreparer.run(
-                species_tree_path = st_file,
-                gene_tree_path    = gt_file,
-                output_dir        = out_dir,
-                prep_config       = args.prep,
-                logger            = logger
-            )
-            GrandmaLogger().report_step(step, "Success")
-        else:
-            GrandmaLogger().report_step(step, 'Skipped') ### TBD: logger
-            print(f'Skipping preprocessing because a previous run was loaded.')
-
-    # Instantiate the Immutable Config
-    return GrandmaConfig(
-        species_tree_path = st_file,
-        gene_tree_path    = gt_file,
-        output_dir        = out_dir,
-
-        mode              = mode,
-        cutoff            = parse_cutoff(args.cutoff),
-        ignore_nesting    = args.ignore_nesting,
-        debug             = args.debug,
-        plot              = args.plot,
-        log_path          = log_path,
-
-        start_pt          = i,
-        max_iter          = max_iter,
-        history           = history,
-        history_file      = history_file,
-
-        run_prefix        = args.prefix,
-        overwrite         = args.overwrite,
-        h1_nodes          = args.h1,
-        h2_nodes          = args.h2,
-        group_cap         = args.cap,
-        num_processes     = args.procs,
-        verbosity         = args.verbosity,
-
-        # is_mul_input defaults to False, logic handled by mode usually
-        maps_opt          = args.maps,
-        orth_opt          = args.orthologies,
-        pickle_dir        = Path(out_dir) / "pkls/",
-        n_lowest          = 6,
-        seed              = args.seed
-    )
-
-class DataPreparer:
-    @staticmethod
-    def run(species_tree_path: str, gene_tree_path: str, output_dir: str, prep_config: str = None, logger: GrandmaLogger = None) -> Tuple[str, str]:
+    def resolve_mode_logic(self, mode, build_mts, check_nums, st_only, no_st) -> str:
         """
-        Preprocesses input files to ensure they are rooted, bifurcating, and have unique leaf IDs.
+        Consolidates modern --mode and legacy flags into a single mode string.
+        Returns resolved mode.
         """
-        cnfg = {
-            'gt': {
-                'sfx_lookup': '.treefile', #None, #'.tre',
-                'clean_fn': DataPreparer._gt_clean_fn,
-                'name_lambda': lambda x: x.replace('_', '-'), #lambda x: x.rsplit('_', 1)[1],
-                'out_fmt': 9,  # Leafs only
-            },
-            'st': {
-                'clean_fn': DataPreparer._st_clean_fn,
-                'name_lambda': lambda x: x.replace('_', '-'),
-                'out_fmt': 9,  # Leafs only
-            }
-        }
+        m = "default"
+        if build_mts: m = "build-mts"
+        elif check_nums: m = "check-nums"
+        elif st_only: m = "st-only"
+        elif no_st: m = "no-st"
 
-        # Parse config override
-        if prep_config and prep_config not in ['0', 'D', 'default']:
-            if os.path.isfile(prep_config):
-                with open(prep_config, 'r') as f:
-                    cnfg_ = json.load(f)
-                    for key in cnfg_:
-                        cnfg[key] = cnfg_[key]
-            else:
-                raise ValueError(f'Error: Preprocessing config {prep_config} is not valid.')
+        if build_mts and check_nums: m = "no-recon"
+        elif sum([build_mts, check_nums, st_only, no_st]) > 1:
+            self.logger.write("Warning: Multiple legacy [build-mts and/or check-nums, no-st, st-only] flags set! One will be chosen according to precedence.", level=1)
 
-        out_dir = Path(output_dir)
+        # Priority 1: Direct --mode selection (if not single)
+        if mode != "single" and mode != m:
+            self.logger.write("Warning: --mode flag overrides legacy [build-mts, check-nums, no-st, st-only] flags!", level=1)
+            return mode
+        
+        # Priority 2: If mode is single and no legacy flags are set
+        if m == "default":
+            return "single"
+            
+        return m
+
+    def parse(self, args_=None) -> Tuple[GlobalContext, TaskConfig]:
+        """
+        Parses arguments and returns strictly typed configuration objects.
+        """
+        args = self.parser.parse_args(args_)
+        
+        # --- Setup Environment and Banner ---
+        out_dir = args.outdir if args.outdir else get_default_outdir()
+        out_dir = Path(out_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
-
-        # Process Gene Trees
-        new_gt_path = DataPreparer._process_treefiles(gene_tree_path, out_dir, **cnfg['gt'])
         
-        # Process Species Tree
-        new_st_path = DataPreparer._process_spec_tree(species_tree_path, out_dir, **cnfg['st'])
+        log_file = out_dir / f"{args.prefix}.log"
+        self.logger = GrandmaLogger(log_path=log_file, verbosity=args.verbosity)
 
-        return str(new_st_path), str(new_gt_path)
+        self.logger.log_software_banner(GrandmaMetadata())
+        self.logger.write("=" * 73, level=1)
 
-    @staticmethod
-    def _gt_clean_fn(tree):
-        """Clean a tree by removing polytomies and ensuring it is rooted."""
-        def root_tree(t):
-            # Placeholder for rooting logic if needed (ETE3 usually handles unrooted okay for some ops)
-            tre = t.get_tree_root()
-            #t.unroot()
-            return tre
+        ####
+        # Logging strategy:
+        # log the original paths in the banner only!
+        # split start run:
+        # before parsing args: log original args
+        # after parsing args: log sanitized args in tcf - when running the Task
+        ###
 
-        tree.resolve_polytomy(recursive=True)
-        if ancestral_node := root_tree(tree):
-            #tree.set_outgroup(ancestral_node)
-            return True
-        return False
+        # --- Resolve Argument Logistics ---
+        mode = self.resolve_mode_logic(
+            args.mode,
+            args.buildmultrees,
+            args.checknums,
+            args.st_only,
+            args.no_st
+        )
 
-    @staticmethod
-    def _st_clean_fn(x, step='pre'):
-        if step == 'pre':
-            # Remove everything between "'[" and "]'" (legacy cleaning)
-            return re.sub(r"'\[.*?\]'", '', x)
-        return x
-
-    @staticmethod
-    def _process_treefiles(path, out_dir, clean_fn, name_lambda, sfx_lookup='.treefile', out_fmt=9):
-        path = Path(path)
-        tree_txts = []
+        # Handle folder deletion and history loading BEFORE the engine starts
+        start = args.start if args.start == 'auto' else int(args.start)
         
-        if sfx_lookup and path.is_dir():
-            # Directory mode
-            files = glob(os.path.join(path, f'*{sfx_lookup}'))
-            if not files:
-                print(f"No gene tree files found in directory '{path}' with suffix '{sfx_lookup}'.") ### TBD: logger
-                return path
-            tree_txts = [Path(t).read_text().rstrip() for t in files]
-        else:
-            # File mode
-            if not path.exists():
-                print(f"Gene tree file '{path}' does not exist.") ### TBD: logger
-                return path 
-            tree_txts = path.read_text().splitlines()
+        # Prepare history/folders
+        i, history, history_file = start_up_prep(start, out_dir, self.logger, mode)
 
-        if not tree_txts:
-            print(f"No gene trees found in '{path}'.") ### TBD: logger
-            return path
+        # --- Build Global Context ---
+        ctx = GlobalContext(
+            num_processes=  args.procs,
+            verbosity=      args.verbosity,
+            seed=           args.seed,
+            plot=           args.plot,
+            norun=          args.norun,
+            nolog=          args.nolog,
+            debug=          args.debug,
+            orth_opt=       args.orthologies,
+            max_iter=       check_loop_length(args.iter, i, None, history, self.logger),
+            cutoff=         self.parse_cutoff(args.cutoff),
+            ignore_nesting= args.ignore_nesting,
+            min_gt_lvs=     args.min_gt_lvs,
+            min_st_lvs=     args.min_st_lvs,
+            root_dir=       out_dir,
+            log_file=       log_file,
+            history=        history,
+            start_pt=       i
+        )
 
-        clean_lines = []
-        fix_semicolon = lambda x: x if x.endswith(';') else x + ';'
+        # --- Prepare Step Config ---
+        tcf = TaskConfig(
+            output_dir=     ctx.root_dir,
+            st=             args.spec_input,
+            gts=            args.genes_input,
+            run_prefix=     args.prefix,
+            mode=           mode,
+            overwrite=      args.overwrite,
+            repair=         args.repair,
+            h1_nodes=       args.h1,
+            h2_nodes=       args.h2,
+            ploidies=       args.ploidy,
+            group_cap=      args.cap,
+            to_map=         args.maps,
+            max_select=     args.max_select,
+            is_mul_input=   args.is_mul_input,
+        )
 
-        for i, txt in enumerate(tree_txts):
-            try:
-                t = Tree(fix_semicolon(txt.strip()))
-                if not clean_fn(t):
-                    print(f"Skipping tree {i+1} due to cleanup failure.") ### TBD: logger
-                    continue
-                
-                leaf_counts = {}
-                for node in t.traverse():
-                    if node.name:
-                        if node.is_leaf():
-                            clean_name = name_lambda(node.name)
-                            # Ensure unique names
-                            leaf_counts[clean_name] = leaf_counts.get(clean_name, 0) + 1
-                            node.name = f'{leaf_counts[clean_name]}_{clean_name}'
-                        else:
-                            node.name = None
-                clean_lines.append(t.write(format=out_fmt))
-            except Exception as e:
-                print(f"Error processing tree {i+1}: {e}") ### TBD: logger
-                continue
-        print(f'Processed {len(clean_lines)} gene trees.') ### TBD: logger
-        
-        out_path = out_dir / (path.stem + '.txt')
-        with open(out_path, 'w') as f:
-            f.write("\n".join(clean_lines))
-        
-        return out_path
-
-    @staticmethod
-    def _process_spec_tree(path, out_dir, clean_fn, name_lambda, out_fmt=9):
-        path = Path(path)
-        if not path.exists():
-            print(f"Spec tree file '{path}' does not exist.") ### TBD: logger
-            return path
-        
-        txt = path.read_text().strip()
-        txt = clean_fn(txt if txt.endswith(';') else txt+';', step='pre')
-        
-        t = Tree(txt, format=1)
-        for node in t.traverse():
-            if node.name:
-                if node.is_leaf():
-                    node.name = name_lambda(node.name)
-                else:
-                    node.name = None
-        
-        # Post-clean (noop by default)
-        t = clean_fn(t, step='post')
-        
-        out_path = out_dir / (path.stem + '.tre')
-        with open(out_path, 'w') as f:
-            f.write(t.write(format=out_fmt))
-        
-        print(f'Processed the species tree.') ### TBD: logger
-        return out_path
+        return ctx, tcf
 
 class GrandmaWriter:
-    def __init__(self, config: GrandmaConfig, logger: GrandmaLogger):
-        self.cfg = config
+    def __init__(self, config: TaskConfig, logger: GrandmaLogger):
+        self.tcf = config
         self.logger = logger
 
     def write_results(self, sorted_scores: list, detailed_res: dict, mul_trees: dict, gene_trees: dict):
@@ -690,7 +628,7 @@ class GrandmaWriter:
         step = "Writing detailed output file"
         self.logger.report_step(step, "In progress...")
         
-        p = Path(self.cfg.output_dir) / f"{self.cfg.run_prefix}-detailed.txt"
+        p = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-detailed.txt"
         with open(p, 'w') as f:
             f.write("mul.tree\tgene.tree\tdups\tlosses\ttotal.score\tmaps\n")
             for mul_idx, res_dict in detailed_res.items():
@@ -730,7 +668,7 @@ class GrandmaWriter:
         step = "Writing main output file"
         self.logger.report_step(step, "In progress...")
         
-        p = Path(self.cfg.output_dir) / f"{self.cfg.run_prefix}-scores.txt"
+        p = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-scores.txt"
         import re
         with open(p, 'w') as f:
             f.write("mul.tree\th1.node\th2.node\tscore\tlabeled.tree\n")
@@ -745,7 +683,7 @@ class GrandmaWriter:
         self.logger.report_step(step, "Success")
 
     def _write_dup_counts(self, detailed_res: dict, mul_trees: dict):
-        p_dup = Path(self.cfg.output_dir) / f"{self.cfg.run_prefix}-dup-counts.txt"
+        p_dup = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-dup-counts.txt"
         with open(p_dup, 'w') as f:
             f.write("mul.tree\tnode\tdups\n")
             for mul_idx, res_dict in detailed_res.items():
