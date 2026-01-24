@@ -6,7 +6,7 @@ from functools import partial
 from typing import List, Dict, Tuple, Any, Set, Union
 
 from .config import TaskConfig
-from .models import SmrtTree, MulTree, GroupData, Map, ReconResult, StepResult, FlatTree, NameRegistry
+from .models import SmrtTree, MulTree, GroupData, Map, ReconResult, TaskResult, FlatTree, NameRegistry
 
 GroupsPickle = Dict[int, GroupData]
 
@@ -546,7 +546,7 @@ class Reconciler:
         logger.report_step(step, "Success")
         return detailed_res
         
-    def run(self, mul_trees: dict, gene_trees: dict, registry: NameRegistry, logger: Any, writer: Any) -> StepResult:
+    def run(self, mul_trees: dict, gene_trees: dict, registry: NameRegistry, logger: Any, writer: Any) -> TaskResult:
 
         pickle_dir, run_prefix, = self.tcf.pickle_dir, self.tcf.run_prefix
         n_proc = self.num_processes
@@ -576,7 +576,7 @@ class Reconciler:
             if len(detailed_res_limited) >= 1:
                 break
 
-        return StepResult(
+        return TaskResult(
             sorted_scores=sorted_scores,
             mul_trees=mul_trees,
             kept_mul_maps=detailed_res_limited, # this dict is sorted

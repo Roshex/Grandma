@@ -10,7 +10,7 @@ from .logger import GrandmaLogger
 from .models import Tree, SmrtTree, MulTree, GroupData, NameRegistry
 from .reconcile import Reconciler
 
-class CommonUtils:
+class CommonOps:
     @staticmethod
     def _fix_semicolon(tree_str: str) -> str:
         """Ensures tree strings end with a semicolon."""
@@ -53,7 +53,7 @@ class CommonUtils:
     @staticmethod
     def _load_single_content(input: Union[Path, str], desc: str, logger: GrandmaLogger, key: str="Error") -> str:
         """Loads a single tree string from Path or String."""
-        kind, paths = CommonUtils._identify_path(input)
+        kind, paths = CommonOps._identify_path(input)
         if kind == "raw":
             return input
         elif kind == "file":
@@ -72,7 +72,7 @@ class CommonUtils:
         Handles File, Raw String, or Folder input.
         Returns List of (content, source_name).
         """
-        kind, paths = CommonUtils._identify_path(input)
+        kind, paths = CommonOps._identify_path(input)
         if kind == "raw":
             return input, None
         elif kind == "file":
@@ -131,11 +131,11 @@ class TreeLoader:
             logger.write("Error: Species tree not found. Please check the input.")
 
         # Load Raw Content
-        line = CommonUtils._load_single_content(tcf.st, "species tree", logger)
+        line = CommonOps._load_single_content(tcf.st, "species tree", logger)
         
         # Basic Formatting
         line = TreeLoader._sanitize_line(line)
-        line = CommonUtils._fix_semicolon(line)
+        line = CommonOps._fix_semicolon(line)
 
         # Parse
         try:
@@ -154,7 +154,7 @@ class TreeLoader:
         TreeLoader._validate_mul_status(t, tcf.is_mul_input, logger)
 
         if tcf.repair:
-            CommonUtils._write_handoff_files(tcf.output_dir, st=t)
+            CommonOps._write_handoff_files(tcf.output_dir, st=t)
 
         logger.report_step(step, "Success: Species tree read")
         return SmrtTree(tree_obj=t)
@@ -180,7 +180,7 @@ class TreeLoader:
                 logger.write(f"Error: Gene trees input is missing. Required in all modes except 'build-mts' (here: '{tcf.mode}' mode).")
 
         # Load Raw Contents (File, String, or Folder)
-        tree_list, origins = CommonUtils._load_multi_content(tcf.gts, "gene trees", logger, key="Error")
+        tree_list, origins = CommonOps._load_multi_content(tcf.gts, "gene trees", logger, key="Error")
         
         # Process Trees
         valid_gts = []
@@ -195,7 +195,7 @@ class TreeLoader:
                 continue
 
             # Semicolon
-            line = CommonUtils._fix_semicolon(line)
+            line = CommonOps._fix_semicolon(line)
 
             # Parse
             try:
@@ -227,7 +227,7 @@ class TreeLoader:
             logger.write(f"Error: No valid gene trees survived filtering (required in {tcf.mode} mode).")
         
         if tcf.repair:
-            CommonUtils._write_handoff_files(tcf.output_dir, gts=valid_gts)
+            CommonOps._write_handoff_files(tcf.output_dir, gts=valid_gts)
                 
         logger.report_step(step, f"Success: {len(valid_gts)} gene trees read")
         return {idx: SmrtTree(tree_obj=gt) for idx, gt in enumerate(valid_gts)}
@@ -341,7 +341,7 @@ class MulTreeManager:
             return {}
         step = "Reading ploidy file"
         logger.report_step(step, "In progress...")
-        ploidies = CommonUtils._load_single_content(ploidies, "ploidies", logger, key="Error")
+        ploidies = CommonOps._load_single_content(ploidies, "ploidies", logger, key="Error")
         ploid_dict = {}
         try:
             with open(ploidies, 'r') as f:

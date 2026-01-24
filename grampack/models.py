@@ -552,7 +552,7 @@ class MulTree:
     h2_node: Optional[TreeNode] = None
 
 @dataclass(slots=True, frozen=True)
-class StepResult:
+class TaskResult:
     """Return payload from a GRAMPA step."""
     
     # List of (MulTreeID, Score) tuples, sorted by Score ASC

@@ -9,8 +9,8 @@ from pathlib import Path
 from functools import partial
 
 from .config import GlobalContext
-from .models import Tree, TreeNode, SmrtTree, StepResult
-from .ops import CommonUtils
+from .models import Tree, TreeNode, SmrtTree, TaskResult
+from .ops import CommonOps
 
 class HCounterState:
     """Tracks hybridization events to detect nested patterns."""
@@ -154,7 +154,7 @@ class FlowManager:
             return ((self_score - best_score) / self_score) > cutoff_val
         return True
 
-    def _to_proceed(self, res: StepResult, i_str: str) -> bool:
+    def _to_proceed(self, res: TaskResult, i_str: str) -> bool:
         """
         Unified logic to validate scores, apply cutoffs, and rename trees.
         """
@@ -205,7 +205,7 @@ class FlowManager:
         plot_data = []
         for k, ((i, j), v) in enumerate(self.ctx.history.items()):
             score = v['score_tuple'][1]
-            taxa = Tree(CommonUtils._fix_semicolon(v['multree']), format=8).get_leaves()
+            taxa = Tree(CommonOps._fix_semicolon(v['multree']), format=8).get_leaves()
             filled = True if j==0 else False  # If j > 0, it is a nested fix; otherwise, it is the first event
             if (i, j) == (1, 0): # Manually add initial condition
                 plot_data.append({
@@ -216,7 +216,7 @@ class FlowManager:
             # Last event
             if k == len(self.ctx.history) - 1:
                 if v['other_tree'] != '':
-                    taxa_len = len(Tree(CommonUtils._fix_semicolon(v['other_tree']), format=8).get_leaves())
+                    taxa_len = len(Tree(CommonOps._fix_semicolon(v['other_tree']), format=8).get_leaves())
                 else:
                     taxa_len = len(taxa)
                 plot_data.append({
@@ -474,7 +474,7 @@ class FlowManager:
 
     # --- Handlers for the Full mode ---
 
-    def rename_trees_for_next_iter(self, res: StepResult) -> pd.Series:
+    def rename_trees_for_next_iter(self, res: TaskResult) -> pd.Series:
 
         best_mt_idx = res.mt_idx()
         best_mt = res.mul_trees[best_mt_idx]
@@ -523,7 +523,7 @@ class FlowManager:
         
         return best_mt.mt, mapped_gts_list
 
-    def handle_iteration_result(self, i: int, res: StepResult, iter_out: Path, engine_callback, iter_logger) -> Optional[Tuple[SmrtTree, Dict[int, SmrtTree]]]:
+    def handle_iteration_result(self, i: int, res: TaskResult, iter_out: Path, engine_callback, iter_logger) -> Optional[Tuple[SmrtTree, Dict[int, SmrtTree]]]:
         """
         Handles the end of a 'Full' mode iteration.
         Returns: (next_st, next_gts) or None if stopping.
@@ -564,13 +564,13 @@ class FlowManager:
         next_gts = {idx: SmrtTree(tree_obj=gt) for idx, gt in enumerate(final_gts_list)}
         
         # Write handoff files for resume support
-        CommonUtils.write_handoff_files(iter_out.parent, final_mt['tree'], final_gts_list)
+        CommonOps.write_handoff_files(iter_out.parent, final_mt['tree'], final_gts_list)
         
         return next_st, next_gts
 
     # --- Handlers for the Split mode ---
     
-    def extract_subproblems(self, res: StepResult, depth: int, idx: int) -> None:
+    def extract_subproblems(self, res: TaskResult, depth: int, idx: int) -> None:
         """
         Refined binary recursion split using ETE3-safe surgery and O(N) GT extraction.
         1. Inner: Extracts independent 'pure' subtrees for each hybrid lineage.
@@ -693,7 +693,7 @@ class FlowManager:
             next_tasks.append((SmrtTree(tree_obj=outer_st_obj), outer_gts, f"{depth + 1}.{idx * 2 + 1}"))
         return next_tasks
 
-    def handle_split_result(self, bin_id, res: StepResult, iter_out: Path, iter_logger) -> List[Tuple[SmrtTree, Dict[int, SmrtTree], str]]:
+    def handle_split_result(self, bin_id, res: TaskResult, iter_out: Path, iter_logger) -> List[Tuple[SmrtTree, Dict[int, SmrtTree], str]]:
         """
         Processes a split worker result.
         Returns: List of new sub-tasks or empty list.
@@ -726,7 +726,7 @@ class FlowManager:
             task_out = iter_out.parent / task_id
             task_out.mkdir(parents=True, exist_ok=True)
             print(f"# Written handoff files for task {task_id} at {task_out.relative_to(iter_out.parent.parent.parent)}, with {len(task_gts)} GTs.")
-            CommonUtils.write_handoff_files(task_out, task_st.ete_tree, [gt.ete_tree for gt in task_gts.values()])
+            CommonOps.write_handoff_files(task_out, task_st.ete_tree, [gt.ete_tree for gt in task_gts.values()])
 
         self.logger = backup_logger
         return next_tasks

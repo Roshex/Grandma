@@ -10,7 +10,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 from .config import InitParser, GlobalContext, TaskConfig, GrandmaWriter
 from .flow import FlowManager
 from .logger import GrandmaLogger
-from .models import SmrtTree, NameRegistry, StepResult
+from .models import SmrtTree, NameRegistry, TaskResult
 from .ops import TreeLoader, GeneTreeManager, MulTreeManager
 from .orthology import OrthologyLabeler
 from .reconcile import Reconciler
@@ -85,7 +85,7 @@ class Task:
         self.gene_mgr = None
         self.writer = None # Initialized in execute when we have a TaskSpec
              
-    def execute(self, tcf: TaskConfig) -> Tuple[Optional[StepResult], Dict[str, Any]]:
+    def execute(self, tcf: TaskConfig) -> Tuple[Optional[TaskResult], Dict[str, Any]]:
 
         # 0. Setup for this task & log banner
         Path(tcf.output_dir).mkdir(parents=True, exist_ok=True)
