@@ -1,8 +1,8 @@
 import pickle
 import itertools
 import multiprocessing as mp
-from functools import partial
 from pathlib import Path
+from functools import partial
 from typing import List, Dict, Tuple, Any, Set, Union
 
 from .config import TaskConfig

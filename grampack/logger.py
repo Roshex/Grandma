@@ -15,8 +15,6 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
-is_fatal = lambda x: "Error" if x else "Warning"
-
 class GrandmaLogger:
     def __init__(self, log_path: Path, verbosity: int = 3, parent_logger: 'GrandmaLogger' = None, clear_log: bool = True):
         self.log_path = log_path

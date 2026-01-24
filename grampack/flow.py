@@ -4,14 +4,13 @@ import json
 import random
 import pandas as pd
 from typing import Tuple, List, Optional, Dict, Any
-from dataclasses import dataclass, field
 from collections import defaultdict
 from pathlib import Path
 from functools import partial
 
-from .models import Tree, TreeNode, SmrtTree, StepResult
-from .ops import TreeLoader, CommonUtils
 from .config import GlobalContext
+from .models import Tree, TreeNode, SmrtTree, StepResult
+from .ops import CommonUtils
 
 class HCounterState:
     """Tracks hybridization events to detect nested patterns."""

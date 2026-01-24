@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Union, List
 from dataclasses import dataclass, field, replace, fields
 
-from .models import SmrtTree, Map
 from .logger import GrandmaLogger
+from .models import SmrtTree, Map
 
 import datetime
 

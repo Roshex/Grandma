@@ -1,15 +1,13 @@
 import os
 import re
 import sys
-import json
 import pickle
-from glob import glob
 from pathlib import Path
-from typing import Tuple, List, Optional, Dict, Set, Any, Union
+from typing import Tuple, List, Optional, Dict, Union
 
-from .models import Tree, SmrtTree, MulTree, GroupData, NameRegistry
 from .config import TaskConfig
-from .logger import GrandmaLogger, is_fatal
+from .logger import GrandmaLogger
+from .models import Tree, SmrtTree, MulTree, GroupData, NameRegistry
 from .reconcile import Reconciler
 
 class CommonUtils:

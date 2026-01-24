@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List, Union
 
 from .config import InitParser, GlobalContext, TaskConfig, GrandmaWriter
+from .flow import FlowManager
 from .logger import GrandmaLogger
 from .models import SmrtTree, NameRegistry, StepResult
 from .ops import TreeLoader, GeneTreeManager, MulTreeManager
-from .flow import FlowManager
-from .reconcile import Reconciler
 from .orthology import OrthologyLabeler
+from .reconcile import Reconciler
 
 import psutil
 HAS_PSUTIL = psutil is not None

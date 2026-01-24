@@ -1,15 +1,8 @@
-from ete3 import Tree, TreeNode
-from typing import List, Set, Dict, Optional, Tuple
-from dataclasses import dataclass, field
-
-
-
-
-#import sys
 import math
-#from typing import List, Dict, Tuple, Optional
-#from dataclasses import dataclass, field
 import array
+from ete3 import Tree, TreeNode
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass, field
 
 class NameRegistry:
     """
