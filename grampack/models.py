@@ -1,7 +1,7 @@
 import math
 import array
 from ete3 import Tree, TreeNode
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass, field
 
 class NameRegistry:
@@ -597,22 +597,9 @@ class TaskResult:
         # Return tuple item [1] (score), as [0] (index) is always 0
         return self.sorted_scores[self._input_rank][1]
 
-'''
-@dataclass(slots=True)
-class HEvent:
-    """Represents a confirmed hybridization event in the flow.
-    Stores data that can be extracted from written outputs, to enable resuming flows.
-    """
-    prev_tree: Tree #GrandmaTree?
-    prev_score: int
-    curr_tree: Tree #GrandmaTree?
-    curr_score: int
-    self_score: int
-    gt_num: int
 
-    h1_node: TreeNode # redundant - just store the MulData?
-    h2_node: TreeNode # redundant - just store the MulData?
-    score: float
-    score_tuple: Tuple[float, float]
-    other_tree: Tree #GrandmaTree?
-'''
+# --- Type aliases ---
+
+HistoryType = Dict[Tuple[int, int], Dict[str, Any]]
+ConcurrTask = Tuple[SmrtTree, Dict[int, SmrtTree], str]
+

@@ -91,7 +91,7 @@ class CommonOps:
                         content.append(txt)
                 except Exception as e:
                     logger.write(f"{key}: Could not read {p}: {e}")
-            return content, [p.name for p in paths]
+            return content, [f'from {p.name}' for p in paths]
         elif kind == "nonexistent":
             logger.write(f"{key}: {desc} file '{input}' not found.")
         else:
@@ -120,7 +120,7 @@ class TreeLoader:
             # Do nothing, already loaded
             step = "Loading species tree from memory"
             logger.report_step(step, "In progress...")
-            logger.report_step(step, "Success: Species tree loaded from memory")
+            logger.report_step(step, "Success: species tree loaded")
             return tcf.st
 
         step = "Reading species tree"
@@ -156,7 +156,7 @@ class TreeLoader:
         if tcf.repair:
             CommonOps._write_handoff_files(tcf.output_dir, st=t)
 
-        logger.report_step(step, "Success: Species tree read")
+        logger.report_step(step, "Success: species tree read")
         return SmrtTree(tree_obj=t)
 
     @staticmethod
@@ -165,7 +165,7 @@ class TreeLoader:
         if isinstance(tcf.gts, dict):
             step = "Loading gene trees from memory"
             logger.report_step(step, "In progress...")
-            logger.report_step(step, f"Success: {len(tcf.gts)} gene trees loaded from memory")
+            logger.report_step(step, f"Success: {len(tcf.gts)} gene trees loaded")
             return tcf.gts
 
         step = "Reading gene trees"
@@ -187,7 +187,7 @@ class TreeLoader:
         #st_taxa = {n.name for n in tcf.st.ete_tree.get_leaves()}
         for i, line in enumerate(tree_list):
 
-            origin = origins[i] if origins else "line " + str(i+1)
+            origin = origins[i] if origins else "on line " + str(i+1)
 
             # Check Empty
             if not line.strip():

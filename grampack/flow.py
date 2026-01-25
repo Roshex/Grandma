@@ -1,20 +1,21 @@
-import os
+from asyncio import events
 import re
 import json
 import random
 import pandas as pd
-from typing import Tuple, List, Optional, Dict, Any
+from typing import Tuple, List, Optional, Dict, Set
 from collections import defaultdict
 from pathlib import Path
 from functools import partial
 
 from .config import GlobalContext
-from .models import Tree, TreeNode, SmrtTree, TaskResult, MulTree
+from .models import Tree, TreeNode, SmrtTree, TaskResult, MulTree, HistoryType, ConcurrTask
 from .ops import CommonOps
+from .logger import GrandmaLogger
 
 class HCounterState:
     """Tracks hybridization events to detect nested patterns."""
-    def __init__(self, history=None):
+    def __init__(self, history: Optional[HistoryType] = None):
         self.base_to_full = defaultdict(set)
         self.sets_by_key = []
         self.h_counter = {}
@@ -22,7 +23,7 @@ class HCounterState:
             self._integrate_history(history)
             self._rebuild_h_counter()
 
-    def _integrate_history(self, history):
+    def _integrate_history(self, history: HistoryType):
         for data in history.values():
             combined = data["h1.node"] + data["h2.node"]
             base_names = set()
@@ -38,23 +39,32 @@ class HCounterState:
             full_names = {n for name in name_set for n in self.base_to_full[name]}
             self.h_counter[frozenset(name_set)] = HCounterState.group_by_suffix(HCounterState.clean_nested(full_names))
 
-    def update(self, new_history_entry):
+    def update(self, new_history_entry: HistoryType):
         # new_history_entry is a single dict {run_id: data}
         self._integrate_history(new_history_entry)
         self._rebuild_h_counter()
 
     @staticmethod
-    def get_base_name(name):
-        return name.split('.', 1)[0]
+    def get_base_name(name: str) -> str:
+        #return name.split('.', 1)[0]
+        # Rather, split by dots, and cut at the first wholy numeric segment (e.g., A.2B.1.2 -> A.2B)
+        # TEMP FIX
+        parts = name.split('.')
+        base_parts = []
+        for part in parts:
+            if part.isdigit():
+                break
+            base_parts.append(part)
+        return '.'.join(base_parts)
 
     @staticmethod
-    def is_nested(small, big):
+    def is_name_nested(small: str, big: str) -> bool:
         return big.startswith(small + '.')
 
     @staticmethod
-    def clean_nested(names):
+    def clean_nested(names: List[str]) -> List[str]:
         """Keep only the deepest versions of names (no prefixes)."""
-        return [n for n in names if not any(HCounterState.is_nested(n, o) for o in names if o != n)]
+        return [n for n in names if not any(HCounterState.is_name_nested(n, o) for o in names if o != n)]
 
     #TBD: optimize
     @staticmethod
@@ -85,7 +95,7 @@ class HCounterState:
         return keep
 
     @staticmethod
-    def reduce_group_sets(group_list):
+    def reduce_group_sets(group_list: List[set]) -> List[set]:
         item_to_groups = defaultdict(set)
         for i, s in enumerate(group_list):
             for item in s:
@@ -97,7 +107,7 @@ class HCounterState:
         return [set(group) for _, group in sorted_groups]
 
     @staticmethod
-    def group_by_suffix(name_set):
+    def group_by_suffix(name_set: Set[str]) -> List[List[str]]:
         groups = defaultdict(list)
         for name in name_set:
             parts = name.split('.')
@@ -106,7 +116,7 @@ class HCounterState:
         return list(groups.values())
 
 class FlowManager:
-    def __init__(self, ctx: GlobalContext, mode, logger):
+    def __init__(self, ctx: GlobalContext, mode: str, logger: GrandmaLogger):
         self.ctx = ctx
         self.mode = mode
         self.h_counter = HCounterState() if self.ctx.ignore_nesting or self.ctx.start_pt == 0 else HCounterState(self.ctx.history)
@@ -115,7 +125,7 @@ class FlowManager:
         
     # --- Init Methods ---
 
-    def set_sampling_func(self, n):
+    def set_sampling_func(self, n: int) -> callable:
         if self.ctx.debug:
             if self.ctx.seed:
                 def _random_spacing(iterable, n):
@@ -133,7 +143,7 @@ class FlowManager:
             return []
         return _noop
 
-    # --- Methods for both iterative modes ---
+    # --- Overlapping Methods for Full and Split Modes ---
 
     def _check_if_passed(self, i: int, j: int) -> bool:
         """Returns True if the event should be accepted."""
@@ -193,7 +203,7 @@ class FlowManager:
         nonin_rank = self._get_nonin_rank(res)
         return res.mt_idx(nonin_rank)
 
-    def _update_history(self, i, j, res: TaskResult, hold: bool = False) -> None:
+    def _update_history(self, i: int, j: int, res: TaskResult, hold: bool = False) -> None:
         """
         Logs the input and best, or, if input is best, input and second-best
         MulTree data for history tracking.
@@ -228,76 +238,170 @@ class FlowManager:
 
     # --- Output methods ---
 
-    def plot(self, dir_path):
+    def plot(self):
         import matplotlib.pyplot as plt
-        from matplotlib.ticker import MaxNLocator
+        from matplotlib.ticker import MaxNLocator, FixedLocator
+        from matplotlib.lines import Line2D
+        import numpy as np
 
-        # Get plot data from history
-        plot_data = []
-        for k, ((i, j), v) in enumerate(self.ctx.history.items()):
-            score = v['score_tuple'][1]
-            taxa = Tree(CommonOps._fix_semicolon(v['multree']), format=8).get_leaves()
-            filled = True if j==0 else False  # If j > 0, it is a nested fix; otherwise, it is the first event
-            if (i, j) == (1, 0): # Manually add initial condition
-                plot_data.append({
-                    'taxa': len(taxa) - len(v['h2.node']),
-                    'score': v['score_tuple'][0],
-                    'filled': True
-                })
-            # Last event
-            if k == len(self.ctx.history) - 1:
-                if v['other_tree'] != '':
-                    taxa_len = len(Tree(CommonOps._fix_semicolon(v['other_tree']), format=8).get_leaves())
-                else:
-                    taxa_len = len(taxa)
-                plot_data.append({
-                    'taxa': taxa_len,
-                    'score': score,
-                    'filled': True
-                })
-            else:
-                plot_data.append({
-                    'taxa': len(taxa),
-                    'score': score,
-                    'filled': filled
-                })
+        # --- 1. Data Parsing & Grouping ---
+        def get_taxa_count(tree_str):
+            try:
+                t_str = CommonOps._fix_semicolon(tree_str)
+                return len(Tree(t_str, format=1).get_leaves())
+            except:
+                return 0
 
-        df_plot = pd.DataFrame(plot_data)
+        # Data container: grouped_history[i] = list of (j, data_dict)
+        # Split Mode: i=depth, j=index
+        # Full Mode: i=iteration, j=nested_id
+        grouped_history = defaultdict(list)
+        
+        for key, val in self.ctx.history.items():
+            i, j = key
+            
+            # --- Metrics Calculation ---
+            out_taxa = get_taxa_count(val['nonin_mt'])
+            out_score = val['nonin_score']
+            h2_len = len(val.get('h2_node', []))
+            in_taxa = max(0, out_taxa - h2_len)
+            in_score = val['input_score']
+            
+            out_norm = out_score / out_taxa if out_taxa > 0 else 0
+            in_norm = in_score / in_taxa if in_taxa > 0 else 0
 
-        df_plot['call'] = range(1, len(df_plot) + 1)
-        df_plot['norm_score'] = df_plot['score'] / df_plot['taxa']
-        df_plot['filled'] = df_plot['filled'].astype(bool)
+            entry = {
+                'key': key,
+                'in':  {'score': in_score,  'taxa': in_taxa,  'norm': in_norm},
+                'out': {'score': out_score, 'taxa': out_taxa, 'norm': out_norm}
+            }
+            grouped_history[i].append((j, entry))
 
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        if not grouped_history:
+            self.logger.write("No history data available to plot.", level=1)
+            return
 
-        for ax, y, title, ylabel in zip(
-            axes,
-            ['score', 'taxa', 'norm_score'],
-            ['MP Score per Call', 'Number of Taxa per Call', 'Normalized MP Score per Call'],
-            ['MP Score', 'Taxa Count', 'MP Score / Taxa']
-        ):
-            # Plot full line
-            ax.plot(df_plot['call'], df_plot[y], color='black', linewidth=1)
+        sorted_iters = sorted(grouped_history.keys())
 
-            # Overlay markers
-            filled = df_plot[df_plot['filled']]
-            hollow = df_plot[~df_plot['filled']]
+        # --- 2. Setup Plot ---
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        metrics = [
+            ('score', 'MP Score', 'MP Score (Input vs Inferred)'), 
+            ('taxa', 'Taxa Count', 'Taxa Count'), 
+            ('norm', 'MP Score / Taxa', 'Normalized Score')
+        ]
 
-            ax.scatter(filled['call'], filled[y], marker='o', color='black', label='Iteration')
-            ax.scatter(hollow['call'], hollow[y], marker='o', facecolors='none', edgecolors='black', label='Nested fix')
+        # --- 3. Drawing Logic ---
+        for ax, (m_key, y_label, title) in zip(axes, metrics):
+            
+            # Coordinate Cache for connections: Key -> {'in': (x,y), 'out': (x,y)}
+            # Key is (depth, idx) for split, or (iter, sub) for full
+            coord_map = {}
+            
+            # Track previous bin's last output for Full mode sequential connections
+            last_bin_coords = None 
 
+            for i in sorted_iters:
+                events = sorted(grouped_history[i], key=lambda x: x[0])
+                n_events = len(events)
+                
+                # Intra-bin connection tracker
+                prev_sub_x, prev_sub_y = None, None
+                
+                # Bin Logic
+                bin_width = 0.8
+
+                for k, (j, data) in enumerate(events):
+                    # X Coordinates
+                    if self.mode == 'split':
+                        # Split Mode: No spreading. All events at this depth share the same center.
+                        # The "2 points" (slope) width is fixed.
+                        slot_center = i
+                        slot_width = bin_width
+                    else:
+                        # Full Mode: Spread events across the bin width to show nesting order
+                        slot_width = bin_width / n_events
+                        slot_center = (i - bin_width/2) + (slot_width * (k + 0.5))
+                    
+                    half_line = (slot_width * 0.8) / 2
+                    x_in = slot_center - half_line
+                    x_out = slot_center + half_line
+                    
+                    y_in = data['in'][m_key]
+                    y_out = data['out'][m_key]
+                    
+                    # Store exact coords for later connection logic
+                    coord_map[(i, j)] = {'in': (x_in, y_in), 'out': (x_out, y_out)}
+
+                    # Marker Style
+                    is_nested = (self.mode != 'split' and j > 0)
+                    marker_shape = 'D' if is_nested else 'o'
+                    marker_size = 40 if not is_nested else 30
+
+                    # Plot Slope & Points
+                    ax.plot([x_in, x_out], [y_in, y_out], color='black', linewidth=1, zorder=3)
+                    ax.scatter(x_in, y_in, facecolors='white', edgecolors='black', marker=marker_shape, s=marker_size, zorder=4)
+                    ax.scatter(x_out, y_out, color='black', marker=marker_shape, s=marker_size, zorder=4)
+
+                    # --- Connections (Immediate) ---
+                    if self.mode != 'split':
+                        # Full Mode Intra-bin: Connect Nested to previous in same bin
+                        if prev_sub_x is not None:
+                            ax.plot([prev_sub_x, x_in], [prev_sub_y, y_in], color='black', linestyle=':', linewidth=1, zorder=2)
+                        # Full Mode Inter-bin: Connect 1st event to last event of prev bin
+                        elif last_bin_coords is not None:
+                            ax.plot([last_bin_coords[0], x_in], [last_bin_coords[1], y_in], color='black', linestyle=':', linewidth=1, zorder=1)
+
+                    prev_sub_x, prev_sub_y = x_out, y_out
+
+                # End of Bin Loop
+                last_bin_coords = (prev_sub_x, prev_sub_y)
+
+            # --- Connections (Post-Plotting for Split Mode) ---
+            if self.mode == 'split':
+                for (depth, idx), curr in coord_map.items():
+                    if depth > 0:
+                        # Parent Key Logic: Depth-1, Index//2
+                        parent_key = (depth - 1, idx // 2)
+                        if parent_key in coord_map:
+                            prev = coord_map[parent_key]
+                            # Connect Parent OUT to Child IN
+                            ax.plot([prev['out'][0], curr['in'][0]], 
+                                    [prev['out'][1], curr['in'][1]], 
+                                    color='black', linestyle=':', linewidth=1, zorder=2)
+
+            # --- 4. Styling & Grid ---
             ax.set_title(title)
-            ax.set_xlabel('Call')
-            ax.set_ylabel(ylabel)
-            ax.grid(True)
-            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-            ax.legend()
+            ax.set_ylabel(y_label)
+            if self.mode == 'split': ax.set_xlabel('Recursion Depth')
+            else: ax.set_xlabel('Iteration Number')
+
+            x_min, x_max = ax.get_xlim()
+            x_integers = np.arange(np.floor(x_min), np.ceil(x_max) + 1, 1)
+            ax.xaxis.set_major_locator(FixedLocator(x_integers))
+            ax.xaxis.set_minor_locator(FixedLocator(x_integers + 0.5))
+            
+            ax.grid(visible=True, which='minor', axis='x', linestyle='-', alpha=0.5)
+            ax.grid(visible=True, which='major', axis='y', linestyle='-', alpha=0.3)
+            ax.grid(visible=False, which='major', axis='x')
+            
+            # --- 5. Legend ---
+            legend_elements = [
+                Line2D([0], [0], marker='o', color='w', label='Input', markerfacecolor='w', markeredgecolor='black', markersize=6),
+                Line2D([0], [0], marker='o', color='w', label='Inferred', markerfacecolor='black', markeredgecolor='black', markersize=6),
+            ]
+            if self.mode != 'split':
+                legend_elements.append(
+                    Line2D([0], [0], marker='D', color='w', label='Nested fix', markerfacecolor='grey', markeredgecolor='grey', markersize=4)
+                )
+            
+            if m_key == 'score': 
+                ax.legend(handles=legend_elements, loc='best', fontsize='small')
 
         plt.tight_layout()
-        output_file = dir_path / 'metrics_plot.png'
+        output_file = self.ctx.root_dir / 'metrics_plot.png'
         plt.savefig(output_file, dpi=600)
-        print(f'\nPlot saved to {output_file}')
-        #plt.show()
+        self.logger.write(f'Plot saved to {output_file}')
         plt.close()
 
     def _debug_tree(self, title: str, ete_tree: Tree) -> None:
@@ -315,7 +419,7 @@ class FlowManager:
         return None
 
     @staticmethod
-    def _get_base_name(name):
+    def _get_base_name(name: str) -> str:
         return name.split('.', 1)[0]
         
     def check_and_fix_nested(self, multree: MulTree, genetrees: List[SmrtTree], iter: int, engine_callback: callable) -> None:
@@ -401,10 +505,10 @@ class FlowManager:
                                         ",".join(h_main_node.get_leaf_names()), 
                                         ",".join(filtered_targets),
                                         fix_dir
-                                        )
+                    )
 
                     curr_mt, curr_gts = self.handle_iteration_result(
-                        iter, res, fix_dir, engine_callback, self.logger, j=event_id
+                        iter, res, engine_callback, fix_dir, self.logger, j=event_id
                     )
 
                     # Update hybrid counter for the new nested event
@@ -419,7 +523,7 @@ class FlowManager:
 
                 if found_nested_event: break
             if not found_nested_event: break
-        self.logger.write(f"# Iteration {iter} produced {event_id} event(s) after nested checks.", level=1)
+        self.logger.write(f"Iteration {iter} found {event_id} event(s) during nested checks.", level=1)
     
     def _rename_best_mt(self, res: TaskResult, best_mt_idx: int) -> Tuple[SmrtTree, List[str], Dict[str, str]]:
 
@@ -473,7 +577,13 @@ class FlowManager:
         
         return new_gts_list
 
-    def handle_iteration_result(self, i: int, res: TaskResult, iter_out: Path, engine_callback, iter_logger, j=0) -> Optional[Tuple[SmrtTree, Dict[int, SmrtTree]]]:
+    def handle_iteration_result(
+            self, i: int, res: TaskResult,
+            engine_callback: callable,
+            iter_out: Path,
+            iter_logger: GrandmaLogger,
+            j: int = 0
+        ) -> Optional[Tuple[SmrtTree, Dict[int, SmrtTree]]]:
         """
         Handles the end of a 'Full' mode iteration.
         Returns: (next_st, next_gts) or None if stopping.
@@ -491,9 +601,12 @@ class FlowManager:
         # Check if passed cutoff
         passed = self._check_if_passed(i, j)
         if not passed:
-            self.logger.write(f"# Iteration {i} did not pass cutoff.", level=1)
+            self.logger.write(f"Cutoff reached: no parsimonious events found at Iteration {i}.", level=1)
             return next_mt, None
         
+        if j == 0:
+            self.logger.write(f"Reticulation found at Iteration {i} with score {res.mt_score()}.", level=1)
+
         # Rename Trees for Next Iteration
         new_gts_list = self._partition_gt_leaves(res, nonin_idx, disallowed_lvs, distance_map)
 
@@ -641,7 +754,11 @@ class FlowManager:
             next_tasks.append((SmrtTree(tree_obj=outer_st_obj), outer_gts, f"{depth + 1}.{idx * 2 + 1}"))
         return next_tasks
 
-    def handle_split_result(self, bin_id, res: TaskResult, iter_out: Path, iter_logger) -> List[Tuple[SmrtTree, Dict[int, SmrtTree], str]]:
+    def handle_split_result(
+            self, bin_id: str, res: TaskResult,
+            iter_out: Path,
+            iter_logger: GrandmaLogger
+        ) -> List[ConcurrTask]:
         """
         Processes a split worker result.
         Returns: List of new sub-tasks or empty list.
@@ -656,10 +773,10 @@ class FlowManager:
 
         # 2. Validation & Cutoff
         if not self._check_if_passed(depth, idx):
-        #if not self._to_proceed(res, f"Depth {depth}, Index {idx}"):
+            self.logger.write(f"Cutoff reached: no parsimonious events found at Depth {depth}, Index {idx}.", level=1)
             return []
 
-        self.logger.write(f"# Reticulation found at Depth {depth}, Index {idx} with score {res.mt_score()}.", level=1)
+        self.logger.write(f"Reticulation found at Depth {depth}, Index {idx} with score {res.mt_score()}.", level=1)
         
         # 3. Extract Subproblems
         #try:
@@ -676,7 +793,7 @@ class FlowManager:
         for task_st, task_gts, task_id in next_tasks:
             task_out = iter_out.parent / task_id
             task_out.mkdir(parents=True, exist_ok=True)
-            print(f"# Written handoff files for task {task_id} at {task_out.relative_to(iter_out.parent.parent.parent)}, with {len(task_gts)} GTs.")
+            print(f"Written handoff files for task {task_id} at {task_out.relative_to(iter_out.parent.parent.parent)}, with {len(task_gts)} GTs.")
             CommonOps.write_handoff_files(task_out, task_st.ete_tree, [gt.ete_tree for gt in task_gts.values()])
 
         self.logger = backup_logger
@@ -684,7 +801,7 @@ class FlowManager:
 
     # --- Post-processing for Split mode ---
 
-    def glue_split_results(self, output_dir: Path, original_st_path: Path, logger) -> None:
+    def glue_split_results(self, output_dir: Path, original_st_path: Path, logger: GrandmaLogger) -> None:
         """
         Recombines recursive sub-analyses into a single global hybridization record.
         Iterates reverse (deepest first), updating leaf names with .1/.2 suffixes.
@@ -832,9 +949,9 @@ class FlowManager:
         self.logger.report_step(step, "Success: Merged trees written.")
         
         # replace .1 with + and .2 with *, and log to logger
-        self.logger.write(f"# Merged tree inferred: {sl_str.replace('.1', '+').replace('.2', '*')}")
+        self.logger.write(f"Merged inferred tree: {sl_str.replace('.1', '+').replace('.2', '*')}")
 
-    def fast_forward_split(self, current_tasks):
+    def fast_forward_split(self, current_tasks: List[ConcurrTask]) -> List[ConcurrTask]:
         """
         Reconstructs the task queue from disk state based on history.
         Uses BFS to traverse solved nodes and identify the frontier.

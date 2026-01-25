@@ -228,7 +228,7 @@ class Engine:
         Creates a dedicated folder and Run instance for each iteration.
         Passes tree objects in memory to avoid reloading.
         """
-        self.flow_logger.write("# Starting Fully Sequential Mode", level=1)
+        self.flow_logger.write("Starting Fully Sequential Mode", level=1)
 
         # Setup: initial parameters must have been parsed already in io.py
         i = self.ctx.start_pt
@@ -247,7 +247,9 @@ class Engine:
             while i < max_iter:
 
                 self.flow_logger.write(
-                    f'#\n##### Iteration {i}' + (' (inf mode) #####\n#' if max_iter == float('inf') else f' of {int(max_iter)} #####\n#'))#∞
+                    f'\n# ----- Iteration {i} '
+                    + '(inf mode)' if max_iter == float('inf') else f'of {int(max_iter)}'
+                    + ' -----\n#') # ∞
 
                 # Run worker
                 # We pass the persistent config (which might have parsed ploidies from iter 1)
@@ -267,8 +269,9 @@ class Engine:
                 # Process result and handle potential nesting
                 # This returns the trees prepared for the NEXT iteration
                 next_st, next_gts = self.flow_mgr.handle_iteration_result(
-                    i, res, perm_tcf.output_dir, 
+                    i, res,
                     engine_callback=lambda st, gts, h1, h2, out: self._run_nested_subproblem(st, gts, h1, h2, out),
+                    iter_out = self.ctx.root_dir / str(i) / "output", 
                     iter_logger=iter_logger,
                 )
 
@@ -280,12 +283,11 @@ class Engine:
                 current_st, current_gts = next_st, next_gts
                 
         except KeyboardInterrupt:
-            self.flow_logger.write("# Interrupted by user.", level=1)
+            self.flow_logger.write("Interrupted by user.", level=1)
 
-        if self.cfg.plot:
-            self.flow_mgr.plot(self.ctx.root_dir)
+        if self.ctx.plot: self.flow_mgr.plot()
         
-        self.flow_logger.write("# Fully Sequential Mode Finished.")
+        self.flow_logger.write("Fully Sequential Mode Finished.")
 
     def _run_nested_subproblem(self, st_obj, gt_objs, h1_str, h2_str, fix_dir):
         """Helper to run a constrained nested fix run."""
@@ -315,7 +317,7 @@ class Engine:
         Tracking should be Process-Safe and Unified.
         Matches the recursive sub-problem architecture: folder 'Depth.Index' (as tracked in 'history').
         """
-        self.flow_logger.write("# Starting Parallelized Split Mode (Binary Recursive Search)", level=1)
+        self.flow_logger.write("Starting Parallelized Split Mode (Binary Recursive Search)", level=1)
         
         # Initialize Task Queue to the root problem
         perm_tcf = self.tcf
@@ -326,7 +328,7 @@ class Engine:
         # If we have history, we might have completed the root or others.
         # We need to reconstruct the frontier.
         if self.ctx.history:
-            self.flow_logger.write(f"# History found ({len(self.ctx.history)} entries). Checking for resume...", level=1)
+            self.flow_logger.write(f"History found ({len(self.ctx.history)} entries). Checking for resume...", level=1)
             current_tasks = self.flow_mgr.fast_forward_split(current_tasks)
 
         pool = mp.Pool(processes=self.ctx.num_processes)
@@ -338,7 +340,7 @@ class Engine:
 
         while current_tasks:
 
-            #self.flow_logger.write(f"# Dispatching {len(current_tasks)} sub-problems at Depth {depth}...", level=1)
+            #self.flow_logger.write(f"Dispatching {len(current_tasks)} sub-problems at Depth {depth}...", level=1)
             #step = f"Processing Depth {depth}"
             #self.flow_logger.report_step(step, "", start=True)
             self.flow_logger.report_step(f"Depth {depth}", f"Dispatching {len(current_tasks)} tasks", start=True)
@@ -383,10 +385,9 @@ class Engine:
 
         self.flow_mgr.glue_split_results(self.ctx.root_dir, self.tcf.st, self.flow_logger)
 
-        if self.ctx.plot:
-            self.flow_mgr.plot(self.ctx.root_dir)
+        if self.ctx.plot: self.flow_mgr.plot()
 
-        self.flow_logger.write("# Parallelized Split Mode Finished.")
+        self.flow_logger.write("Parallelized Split Mode Finished.")
 
 def main():
     ctx, tcf = InitParser().parse()

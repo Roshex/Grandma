@@ -12,7 +12,7 @@ from typing import Optional, Tuple, Dict, Any, Union, List
 from dataclasses import dataclass, field, replace, fields
 
 from .logger import GrandmaLogger
-from .models import SmrtTree, Map
+from .models import SmrtTree, Map, HistoryType
 
 import datetime
 
@@ -36,7 +36,7 @@ class GrandmaMetadata:
     github: str = "TBD"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "2.7.0 (Modern)"
+    version: str = "2.7.2 (Modern)"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -77,7 +77,7 @@ class GlobalContext:
     log_file: Optional[Path] = None
     
     # History Tracking (Global State)
-    history: Dict[Tuple[Any, int], Any] = field(default_factory=dict)
+    history: HistoryType = field(default_factory=dict)
     start_pt: int = 0
 
     @property
@@ -627,7 +627,7 @@ class InitParser:
             ploidies=       args.ploidy,
             group_cap=      args.cap,
             to_map=         args.maps,
-            max_select=     args.max_select,
+            max_select=     max(args.max_select, 1),
             is_mul_input=   args.is_mul_input,
         )
 
@@ -650,7 +650,11 @@ class GrandmaWriter:
         p = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-detailed.txt"
         with open(p, 'w') as f:
             f.write("mul.tree\tgene.tree\tdups\tlosses\ttotal.score\tmaps\n")
+            i = 0
+            to_map = self.tcf.to_map
             for mul_idx, res_dict in detailed_res.items():
+                if to_map >= 0 and i >= to_map:
+                    break
                 for gene_idx, res in res_dict.items():
                     gt_obj = gene_trees[gene_idx]
                     # Handle multiple maps if present
@@ -659,6 +663,7 @@ class GrandmaWriter:
                     for map in res.maps:
                         map_str = GrandmaWriter.detailed_out_string(gt_obj, map.cor, map.dups)
                         f.write(f"{mul_idx}\t{gene_idx}\t{map.n_dups}\t{map.n_losses}\t{res.score}\t{map_str}\n")
+                i += 1
                          
         self.logger.report_step(step, "Success")
 
@@ -719,3 +724,4 @@ class GrandmaWriter:
                 for node, count in main_dups.items():
                     out_node = node + "+" if node in hybrid_clade else node
                     f.write(f"{mul_idx}\t{out_node}\t{count}\n")
+                    
