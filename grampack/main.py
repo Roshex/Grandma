@@ -212,7 +212,7 @@ class Engine:
         final_res = None
         if self.tcf.mode in ["full", "split"]:
             # Flow Manager Init for Iterative Modes
-            self.flow_mgr = FlowManager(self.ctx)
+            self.flow_mgr = FlowManager(self.ctx, self.tcf.mode, self.flow_logger)
             if self.tcf.mode == "full":
                 final_res = self.run_full()
             else:
@@ -245,7 +245,7 @@ class Engine:
         # Iteration Loop
         try:
             while i < max_iter:
-                i += 1
+
                 self.flow_logger.write(
                     f'#\n##### Iteration {i}' + (' (inf mode) #####\n#' if max_iter == float('inf') else f' of {int(max_iter)} #####\n#'))#∞
 
@@ -253,7 +253,7 @@ class Engine:
                 # We pass the persistent config (which might have parsed ploidies from iter 1)
                 # worker will apply transient updates (output_dir, st, gts) internally
                 _, res, updates, iter_log = task_worker(
-                    payload=(current_st, current_gts, str(i-1)), # ID is 0-indexed usually
+                    payload=(current_st, current_gts, str(i)),
                     context=self.ctx,      # Pass Global Context
                     config=perm_tcf,       # Pass updated Task Config 
                     verbosity=self.ctx.verbosity,
@@ -261,24 +261,24 @@ class Engine:
                 )
                 iter_logger = GrandmaLogger(iter_log, self.ctx.verbosity, parent_logger=self.flow_logger, clear_log=False)
 
-                if not res:
-                    self.flow_logger.write("# No results generated in iteration.")
-                    break
-
                 # Update persistent config for next iteration
                 perm_tcf = perm_tcf.update(**updates)
 
                 # Process result and handle potential nesting
                 # This returns the trees prepared for the NEXT iteration
-                next_trees = self.flow_mgr.handle_iteration_result(
+                next_st, next_gts = self.flow_mgr.handle_iteration_result(
                     i, res, perm_tcf.output_dir, 
                     engine_callback=lambda st, gts, h1, h2, out: self._run_nested_subproblem(st, gts, h1, h2, out),
                     iter_logger=iter_logger,
                 )
 
-                if not next_trees: break
-                current_st, current_gts = next_trees
-
+                if not next_gts:
+                    self.flow_logger.write(f"No further events found. Terminating at iteration {i}.")
+                    break
+                
+                i += 1
+                current_st, current_gts = next_st, next_gts
+                
         except KeyboardInterrupt:
             self.flow_logger.write("# Interrupted by user.", level=1)
 

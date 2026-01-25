@@ -36,7 +36,7 @@ class GrandmaMetadata:
     github: str = "TBD"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "2.6.0 (Modern)"
+    version: str = "2.7.0 (Modern)"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -513,7 +513,7 @@ class InitParser:
     def parse_cutoff(self, val: str) -> Tuple[str, Optional[Union[float, int]]]:
         """Parses stopping condition strings into a typed tuple."""
         if val == 'auto': 
-            return ('auto', None)
+            return ('auto', 0)
         if val.startswith('rel:'):
             try: 
                 return ('rel', float(val.split(':')[1]))

@@ -591,7 +591,7 @@ class TaskResult:
         return self.sorted_scores[rank][1]
 
     @property
-    def self_score(self) -> int:
+    def input_score(self) -> int:
         """O(1) retrieval of the input species tree score."""
         if self._input_rank == -1: return float('inf')
         # Return tuple item [1] (score), as [0] (index) is always 0

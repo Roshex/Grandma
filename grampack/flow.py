@@ -9,7 +9,7 @@ from pathlib import Path
 from functools import partial
 
 from .config import GlobalContext
-from .models import Tree, TreeNode, SmrtTree, TaskResult
+from .models import Tree, TreeNode, SmrtTree, TaskResult, MulTree
 from .ops import CommonOps
 
 class HCounterState:
@@ -106,11 +106,14 @@ class HCounterState:
         return list(groups.values())
 
 class FlowManager:
-    def __init__(self, ctx: GlobalContext):
+    def __init__(self, ctx: GlobalContext, mode, logger):
         self.ctx = ctx
+        self.mode = mode
         self.h_counter = HCounterState() if self.ctx.ignore_nesting or self.ctx.start_pt == 0 else HCounterState(self.ctx.history)
         self.sample = self.set_sampling_func(2)
-        self.logger = None
+        self.logger = logger
+        
+    # --- Init Methods ---
 
     def set_sampling_func(self, n):
         if self.ctx.debug:
@@ -130,72 +133,100 @@ class FlowManager:
             return []
         return _noop
 
-    ### New from-objs parsing ###
+    # --- Methods for both iterative modes ---
 
-    def update_cutoff_val(self, self_score):
-        """Updates the dynamic baseline for 'auto' cutoff mode."""
-        self.prev_self_score = self_score
-
-    def check_cutoff(self, self_score, best_score):
+    def _check_if_passed(self, i: int, j: int) -> bool:
         """Returns True if the event should be accepted."""
-        # Baseline: if it's not improving over self-mapping, it's usually the end
-        if best_score == self_score:
-            return False
-        
-        cutoff_mode, cutoff_val = self.ctx.cutoff
-        
-        print(self.ctx.cutoff)
-        if cutoff_mode == 'auto':
-            # In 'auto', we compare against 0 improvement or the previous iteration's score
-            return best_score < (cutoff_val if cutoff_val is not None else self_score)
-        elif cutoff_mode == 'abs':
-            return (self_score - best_score) > cutoff_val
-        elif cutoff_mode == 'rel':
-            return ((self_score - best_score) / self_score) > cutoff_val
-        return True
+        cut_type, cut_val = self.ctx.cutoff
+        curr_event = self.ctx.history[(i, j)]
 
-    def _to_proceed(self, res: TaskResult, i_str: str) -> bool:
+        if self.ctx.debug:
+            print(i, j, curr_event)
+
+        # In split mode, always compare within current event
+        if self.mode == 'split':
+            if cut_type == 'rel': cut_val *= curr_event['input_score']
+            return cut_val < curr_event['input_score'] - curr_event['nonin_score']
+        
+        # In full mode, compare to previous event (unless within nested fix or first iteration)
+        if j > 0:
+            # Called from nested fix
+            return True
+        else:
+            if i == 0:
+                if cut_type == 'rel': cut_val *= curr_event['input_score']
+                return cut_val < curr_event['input_score'] - curr_event['nonin_score']
+            else:
+                # harder condition - may want to have a flag for it, but stops infinite loops
+                prev_event = self._get_prev_event(i, j)
+                if cut_type == 'rel': cut_val *= prev_event['nonin_score']
+                return cut_val < prev_event['nonin_score'] - curr_event['nonin_score']
+
+    def _get_prev_event(self, i: int, j: int) -> Optional[dict]:
         """
-        Unified logic to validate scores, apply cutoffs, and rename trees.
+        Retrieves the previous event data from history.
         """
-        min_idx = res.mt_idx()
-        if min_idx == 0:
-            self.logger.write(f"# Cutoff reached: no events found at {i_str}.", level=1)
-            return False
+        if i == 0:
+            return None
+        else:
+            if self.mode == 'split':
+                # In the split mode, the depth i and index j represent binary recursion
+                return self.ctx.history.get((i-1, j//2))
+            else:
+                if self.ctx.cutoff[0] == 'auto' and j == 0:
+                    prev_event = self.ctx.history.get((i-1, 0))
+                else:
+                    if j > 0:
+                        prev_event = self.ctx.history.get((i, j-1))
+                    else:
+                        prev_event = self.ctx.history.get((i-1, 0))
+        return prev_event
 
-        self_score = res.self_score
-        best_score = res.mt_score()
-        
-        if self.ctx.debug: print(f"[DEBUG] Self-mapping score: {self_score}, Best non-self score: {best_score}")
-        
-        if not self.check_cutoff(self_score, best_score): 
-            self.logger.write(f"# Cutoff reached: no events found at {i_str}.", level=1)
-            return False
+    def _get_nonin_rank(self, res: TaskResult) -> int:
+        """Returns the index of the best non-input MulTree."""
+        # If input is best (idx 0), return idx of the second-best tree (rank 1)
+        # Else, return idx of the best tree (rank 0)
+        return 1 if res.mt_idx() == 0 else 0
+    
+    def _get_nonin_idx(self, res: TaskResult) -> int:
+        """Returns the MulTree index of the best non-input MulTree."""
+        nonin_rank = self._get_nonin_rank(res)
+        return res.mt_idx(nonin_rank)
 
-        return True
+    def _update_history(self, i, j, res: TaskResult, hold: bool = False) -> None:
+        """
+        Logs the input and best, or, if input is best, input and second-best
+        MulTree data for history tracking.
+        Holds off writing to disk if `hold` is True, until nested fixes are done in Full mode.
+        """
+        best_idx = res.mt_idx()
+        nonin_rank = self._get_nonin_rank(res)
+        input_score = res.input_score
+        nonin_idx = res.mt_idx(nonin_rank)
+        nonin_score = res.mt_score(nonin_rank)
+        if self.ctx.debug: self.logger.write(f"[DEBUG] Input map score: {input_score}, Best non-input map score: {nonin_score}")
+        best_mt = res.mul_trees[best_idx]
+        nonin_mt = res.mul_trees[nonin_idx]
 
-    ### Output methods ###
+        if self.ctx.debug:
+            print(nonin_idx, best_idx, nonin_mt)
+            self._debug_tree("Best MulTree:", best_mt.mt.ete_tree)
+            self._debug_tree("Best Non-input MulTree:", nonin_mt.mt.ete_tree)
 
+        self.ctx.history[(i, j)] = {
+            'best_mt': best_mt.mt.ete_tree.write(format=8), # may be input tree
+            'nonin_mt': nonin_mt.mt.ete_tree.write(format=8),
+            'h1_node': nonin_mt.h1_node.get_leaf_names(),
+            'h2_node': nonin_mt.h2_node.get_leaf_names(),
+            'input_score': input_score,
+            'nonin_score': nonin_score,
+            'num_gts': len(res.gene_trees),
+        }
+        if not hold: # For full mode, until nested fixes are done (to not pollute history with partial events)
+            with open(self.ctx.history_file, 'w') as f:
+                json.dump({str(k): v for k, v in self.ctx.history.items()}, f, indent=4)
 
-    def update_history(self, i, new_events):
-        for j, v in new_events.items():
-            # v is StepResult
-            gts = v.gene_trees
-            mt = v.mul_trees[v.mt_idx()]
-            score = v.mt_score()
-            score_tuple = (v.self_score, score)
-            other_tree = ''
-            self.ctx.history[(i, j)] = {
-                'multree': mt.mt.ete_tree.write(format=8),
-                'gt_file': len(gts) if gts is not None else 'NA',
-                'score': score,
-                'h1.node': mt.h1_node.get_leaf_names() if isinstance(mt.h1_node, Tree) else mt.h1_node,
-                'h2.node': mt.h2_node.get_leaf_names() if isinstance(mt.h2_node, Tree) else mt.h2_node,
-                'score_tuple': score_tuple,
-                'other_tree': other_tree # already a string
-            }
-        with open(self.ctx.history_file, 'w') as f:
-            json.dump({str(k): v for k, v in self.ctx.history.items()}, f, indent=4)
+    # --- Output methods ---
 
     def plot(self, dir_path):
         import matplotlib.pyplot as plt
@@ -269,7 +300,12 @@ class FlowManager:
         #plt.show()
         plt.close()
 
-    # --- Nested event detection and handling ---
+    def _debug_tree(self, title: str, ete_tree: Tree) -> None:
+        if self.ctx.debug:
+            print(f"\n[DEBUG] {title}")
+            print(ete_tree.get_ascii(show_internal=True, attributes=['name']))
+
+    # --- Handlers for the Full mode ---
 
     def _find_subset_key(self, lst, counter_dict):
         lst_set = set(lst)
@@ -278,205 +314,115 @@ class FlowManager:
                 if lst_set.issubset(set(l)): return k
         return None
 
-    #def check_and_fix_nested(grampa, current_dir, mt_dict, genetrees, h_counter_state, ignore_nesting, debug=False):
-    '''def check_and_fix_nested(self, mt_dict, genetrees, engine_callback, h_counter_state=None, ignore_nesting=None, debug=False):
-        """Fixes nested events by triggering sub-runs via the engine_callback."""
-        new_events = {0: [mt_dict, genetrees]}
+    @staticmethod
+    def _get_base_name(name):
+        return name.split('.', 1)[0]
         
-        if self.ignore_nesting or genetrees is None:
-            return new_events
+    def check_and_fix_nested(self, multree: MulTree, genetrees: List[SmrtTree], iter: int, engine_callback: callable) -> None:
+        """Original nested fix logic maintained, but uses unified preparer."""
 
-        curr_mt = mt_dict
-        curr_gts = genetrees
+        if self.ctx.ignore_nesting:
+            return
+        
+        curr_mt, curr_gts = multree, genetrees
         event_id = 0
 
         while True:
-            multree = curr_mt["tree"]
-            h1_node = curr_mt["h1.node"]
-            h2_node = curr_mt["h2.node"]
-            h1_lnames = h1_node.get_leaf_names()
-            h2_lnames = h2_node.get_leaf_names()
+            h1_node, h2_node = curr_mt.h1_node, curr_mt.h2_node
+            h1_leaves, h2_leaves = h1_node.get_leaf_names(), h2_node.get_leaf_names()
 
-            # Update counter with current state
             self.h_counter.update({
-                f"iter_{self.curr_i}_{event_id}": {
-                    "h1.node": h1_lnames,
-                    "h2.node": h2_lnames,
+                len(self.h_counter.h_counter): {
+                    "h1.node": h1_leaves,
+                    "h2.node": h2_leaves,
                 }
             })
 
-            h1_sis = h1_node.get_sisters()[0] if h1_node.get_sisters() else None
-            h2_sis = h2_node.get_sisters()[0] if h2_node.get_sisters() else None
+            if self.ctx.debug:
+                self.logger.write(f'\nH1: {h1_node.name} {h1_leaves} | H2: {h2_node.name} {h2_leaves}')
+                self.logger.write(f'Current h_counter: {self.h_counter.h_counter}')
+
+            h1_sis = h1_node.get_sisters()[0]
+            h2_sis = h2_node.get_sisters()[0]
             
             found_nested_event = False
             for h_sis_node, h_main_node in [(h1_sis, h2_node), (h2_sis, h1_node)]:
                 if not h_sis_node: continue
                 
                 sis_leaves = h_sis_node.get_leaf_names()
-                # Find if this sister group is actually a previously collapsed hybrid
                 h_group_key = self._find_subset_key(sis_leaves, self.h_counter.h_counter)
 
-                if h_group_key is None: continue
+                if self.ctx.debug:
+                    self.logger.write(f'\nChecking sister node: {h_sis_node.name} with leaves {sis_leaves}')
+                    self.logger.write(f'H Group Key found: {h_group_key}')
 
-                # Look for targets within that group that aren't yet handled
+                if h_group_key is None:
+                    continue
+
+                if any(self._get_base_name(leaf) in h_group_key for leaf in h1_leaves):
+                    continue
+
                 for targets in self.h_counter.h_counter[h_group_key]:
-                    filter_base = {self.get_base_name(f) for f in sis_leaves}
-                    filtered_targets = [t for t in targets if self.get_base_name(t) in filter_base]
+                    filter_base = {n.split('.', 1)[0] for n in sis_leaves}
+                    filtered_targets = [t for t in targets if t.split('.', 1)[0] in filter_base]
 
                     if not filtered_targets or set(filtered_targets) == set(sis_leaves):
                         continue
 
-                    # Trigger nested sub-run via engine
-                    # Note: engine_callback expects (st, gts, h1_str, h2_str)
-                    res = engine_callback(
-                        multree, curr_gts, 
-                        ",".join(h_main_node.get_leaf_names()), 
-                        ",".join(filtered_targets)
-                    )
+                    multree = curr_mt.mt.ete_tree
 
-                    if res and res['min_idx'] != 0:
-                        # Process results of nested run
-                        curr_mt, curr_gts = self.process_prev_iter(res)
-                        event_id += 1
-                        new_events[event_id] = [curr_mt, curr_gts]
-                        found_nested_event = True
-                        break
-                
-                if found_nested_event: break
-            if not found_nested_event: break
+                    target_lvs = [multree.search_nodes(name=t)[0] for t in filtered_targets]
+                    target_node = multree.get_common_ancestor(target_lvs) if len(target_lvs) > 1 else target_lvs[0]
 
-        return new_events'''
-        
-    def check_and_fix_nested(self, mt_dict, genetrees, engine_callback, curr_i, out):
-        """Original nested fix logic maintained, but uses unified preparer."""
-        new_events = {0: [mt_dict, genetrees]}
-        if self.ctx.ignore_nesting or genetrees is None:
-            return new_events
-
-        curr_mt, curr_gts = mt_dict, genetrees
-        event_id = 0
-
-        while True:
-            h1_node, h2_node = curr_mt["h1.node"], curr_mt["h2.node"]
-            self.h_counter.update({
-                f"iter_{curr_i}_{event_id}": {
-                    "h1.node": h1_node.get_leaf_names(),
-                    "h2.node": h2_node.get_leaf_names(),
-                }
-            })
-
-            h1_sis = h1_node.get_sisters()[0] if h1_node.get_sisters() else None
-            h2_sis = h2_node.get_sisters()[0] if h2_node.get_sisters() else None
-            
-            found_nested_event = False
-            for h_sis_node, h_main_node in [(h1_sis, h2_node), (h2_sis, h1_node)]:
-                if not h_sis_node: continue
-                
-                h_group_key = self._find_subset_key(h_sis_node.get_leaf_names(), self.h_counter.h_counter)
-                if h_group_key is None: continue
-
-                for targets in self.h_counter.h_counter[h_group_key]:
-                    filter_base = {n.split('.', 1)[0] for n in h_sis_node.get_leaf_names()}
-                    filtered_targets = [t for t in targets if t.split('.', 1)[0] in filter_base]
-
-                    if not filtered_targets or set(filtered_targets) == set(h_sis_node.get_leaf_names()):
+                    if any(ft in h1_leaves or ft in h2_leaves for ft in filtered_targets):
                         continue
 
-                    res = engine_callback(curr_mt["tree"], curr_gts, 
+                    if self.ctx.debug:
+                        self.logger.write(f"\nOriginal targets: {targets}")
+                        self.logger.write(f"Filtered targets: {filtered_targets}")
+                        self.logger.write(f"Target leaves: {target_lvs}")
+
+                    # Find the sister of the target nodes in the multree
+                    target_sis = target_node.get_sisters()[0]
+                    target_sis_lvs = target_sis.get_leaf_names()
+                    # Check if base names match: target_sis_leaves and H1_leaves
+                    base_tsl = {t.split('.', 1)[0] for t in target_sis_lvs}
+                    base_h1l = {h.split('.', 1)[0] for h in h1_leaves}
+                    if base_h1l == base_tsl:
+                        continue
+
+                    self.logger.write(f"\n### Nested Hybridization Detected ###\n")
+
+                    event_id += 1
+                    found_nested_event = True
+                    fix_dir = self.ctx.root_dir / f'{iter}.{event_id}' / 'output'
+
+                    res = engine_callback(curr_mt.tree, curr_gts, 
                                         ",".join(h_main_node.get_leaf_names()), 
                                         ",".join(filtered_targets),
-                                        out / f"nf_{event_id}"
+                                        fix_dir
                                         )
 
-                    if res and res['min_idx'] != 0:
-                        curr_mt, curr_gts = self._prepare_next_step_data(res, None, None)
-                        event_id += 1
-                        new_events[event_id] = [curr_mt, curr_gts]
-                        found_nested_event = True
-                        break
+                    curr_mt, curr_gts = self.handle_iteration_result(
+                        iter, res, fix_dir, engine_callback, self.logger, j=event_id
+                    )
+
+                    # Update hybrid counter for the new nested event
+                    self.h_counter.update({
+                        len(self.h_counter.h_counter): {
+                            "h1.node": curr_mt.h1_node.get_leaf_names(),
+                            "h2.node": curr_mt.h2_node.get_leaf_names(),
+                        }
+                    })
+
+                    break  # go back to outer loop with new mt/gts, save event
+
                 if found_nested_event: break
             if not found_nested_event: break
-
-        return new_events
+        self.logger.write(f"# Iteration {iter} produced {event_id} event(s) after nested checks.", level=1)
     
-    # --- Overlapping logic for Full and Split modes ---
+    def _rename_best_mt(self, res: TaskResult, best_mt_idx: int) -> Tuple[SmrtTree, List[str], Dict[str, str]]:
 
-    @staticmethod
-    def __get_actual_h2(mt_wrapper: SmrtTree, h2_sister_name: str, h_clade: list) -> TreeNode:
-        """
-        Consistently identifies the H2 insertion node.
-        It is the node that is a child of the backbone but contains the H* clade.
-        """
-        '''# 1. Get any leaf that belongs to the star-clade
-        star_leaf_name = f"{h_clade[0]}*"
-        star_leaf = mt_wrapper.get_node(star_leaf_name)
-        
-        # 2. Trace up from the star leaf to find the highest node that 
-        # consists ONLY of star-leaves. This is the root of the grafted H clade.
-        curr = star_leaf
-        while curr.up and all(l.name.endswith('*') for l in curr.up.get_leaves()):
-            curr = curr.up
-            
-        # 3. The 'Actual H2' for surgery purposes is the parent of this grafted clade
-        # because that is the node created by to_mul_tree to join the backbone.
-        return curr.up if curr.up else curr'''
-
-        # for now, find the common ancestor of all leaves with star suffix
-        star_leaves = [mt_wrapper.get_node(f"{name}*") for name in h_clade]
-        if len(star_leaves) == 1:
-            return star_leaves[0]
-        return mt_wrapper.ete_tree.get_common_ancestor(star_leaves)
-
-    def _debug_tree(self, title: str, ete_tree: Tree) -> None:
-        if self.ctx.debug:
-            print(f"\n[DEBUG] {title}")
-            print(ete_tree.get_ascii(show_internal=True, attributes=['name']))
-
-    def __prepare_handled_data(self, res) -> Tuple[Optional[dict], Optional[pd.Series]]:
-        """
-        Unified logic to validate scores, apply cutoffs, and rename trees.
-        Refactored from process_prev_iter.
-        """
-        min_idx = res['min_idx']
-        if min_idx == 0: return None
-
-        # Self map is index 0; score 999999 if missing as a very high score
-        self_score = res['sorted_scores_dict'].get(0, 999999)
-        best_score = res['min_score']
-        if self.ctx.debug: print(f"[DEBUG] Self-mapping score: {self_score}, Best non-self score: {best_score}")
-        
-        # Cutoff Check (Uses update_mp_cutoff logic from iter_mode)
-        if not self.check_cutoff(self_score, best_score): 
-            return None
-
-        # Resolve H nodes
-        mul_data = res['mul_data']
-        # Direct O(1) dictionary lookup in GrandmaTree instead of O(N) search_nodes of ete3
-        #h1_node = mul_data.mt.get_node(mul_data.h1_node)
-        h1_node = mul_data.h1_node
-
-        # Correctly identify H2 node (sister of the sister provided in results): TBC!!!
-        #h2_sister = engine_res['mul_data'].mt.get_node(engine_res['mul_data'].h2_node)
-        #h2_node = [c for c in h2_sister.up.get_children() if c != h2_sister][0]
-        h2_node = self.get_actual_h2(mul_data.mt, mul_data.h2_node, mul_data.h_clade)
-        
-        self._debug_tree(f"Split Context: {mul_data.h1_node} (H1) | {mul_data.h2_node} (H2 [sister]) | {h2_node.name} (H2 [actual])", mul_data.mt.ete_tree)
-
-        # Finalize MT structure for return
-        meta = {
-            'h1.node': h1_node,
-            'h2.node': h2_node,
-            'score': best_score,
-            'score_tuple': (self_score, best_score),
-            'other_tree': ''
-        }
-        return meta
-
-    # --- Handlers for the Full mode ---
-
-    def rename_trees_for_next_iter(self, res: TaskResult) -> pd.Series:
-
-        best_mt_idx = res.mt_idx()
         best_mt = res.mul_trees[best_mt_idx]
 
         h1_node = best_mt.h1_node
@@ -493,37 +439,41 @@ class FlowManager:
             d2 = n.get_distance(h2_node, topology_only=True)
             distance_map[n.name] = ".1" if d1 < d2 else ".2"
 
-        mapped_gts_list = []
-        gts = res.gene_trees
-        min_maps = res.kept_mul_maps[best_mt_idx]
-        
-        debug_sample = self.sample(min_maps.keys())
-
-        for g_idx, recon_res in min_maps.items():
-            gt_ete = gts[g_idx].ete_tree.copy() # Operations on copies
-
-            if g_idx in debug_sample:
-                print(f"ReconResult: {recon_res}")
-                self._debug_tree(f"Original GT {g_idx}:", gt_ete)
-
-            for l in gt_ete.iter_leaves():
-                if l.name.split('_')[1] in disallowed_lvs:
-                    # For now, default for the first map when there are multiple options
-                    l.name += distance_map[recon_res.maps[l.name][0]]
-            mapped_gts_list.append(gt_ete)
-
-            if g_idx in debug_sample:
-                self._debug_tree(f"Renamed GT {g_idx}:", gt_ete)
-        
         # Rename MT nodes for next step logic
         for l in h1_leaves: l.name += ".1"
         for l in h2_leaves: l.name = l.name.replace("*", "") + ".2"
 
         self._debug_tree("Renamed MT for next iteration:", best_mt.mt.ete_tree)
         
-        return best_mt.mt, mapped_gts_list
+        return best_mt.mt, disallowed_lvs, distance_map
 
-    def handle_iteration_result(self, i: int, res: TaskResult, iter_out: Path, engine_callback, iter_logger) -> Optional[Tuple[SmrtTree, Dict[int, SmrtTree]]]:
+    def _partition_gt_leaves(self, res: TaskResult, best_mt_idx: int, disallowed_lvs: List[str], distance_map: Dict[str, str]) -> List[Tree]:
+
+        new_gts_list = []
+        gts = res.gene_trees
+        min_maps = res.kept_mul_maps[best_mt_idx]
+        
+        debug_sample = self.sample(min_maps.keys())
+
+        for g_idx, map_obj in min_maps.items():
+            gt_ete = gts[g_idx].ete_tree.copy() # Operations on copies
+
+            if g_idx in debug_sample:
+                print(f"ReconResult Map: {map_obj}")
+                self._debug_tree(f"Original GT {g_idx}:", gt_ete)
+
+            for l in gt_ete.iter_leaves():
+                if l.name.split('_')[1] in disallowed_lvs:
+                    # For now, default for the first map when there are multiple options
+                    l.name += distance_map[map_obj.cor[l.name][0]]
+            new_gts_list.append(gt_ete)
+
+            if g_idx in debug_sample:
+                self._debug_tree(f"Renamed GT {g_idx}:", gt_ete)
+        
+        return new_gts_list
+
+    def handle_iteration_result(self, i: int, res: TaskResult, iter_out: Path, engine_callback, iter_logger, j=0) -> Optional[Tuple[SmrtTree, Dict[int, SmrtTree]]]:
         """
         Handles the end of a 'Full' mode iteration.
         Returns: (next_st, next_gts) or None if stopping.
@@ -531,40 +481,38 @@ class FlowManager:
         # Set logger for this iteration - not applicable for the split mode
         self.logger = iter_logger
 
-        # 1. Validation & Cutoff
-        if not self._to_proceed(res, f'Iteration {i}'):
-            return None
+        # Rename best non-input MT
+        nonin_idx = self._get_nonin_idx(res)
+        next_mt, disallowed_lvs, distance_map = self._rename_best_mt(res, nonin_idx)
 
-        # 2. Rename Trees for Next Iteration
-        next_mt, next_gts = self.rename_trees_for_next_iter(res)
-        res.mul_data.mt.ete_tree = next_mt.ete_tree  # Update tree object
+        # Update history
+        self._update_history(i, j, res)
 
-        # 3. Check for Nested Hybridization
-        # This encapsulates the while-loop for recursive sub-fixes
-        new_events = self.check_and_fix_nested(
-            mt_dict=res,
-            genetrees=next_gts,
-            engine_callback=lambda st, gts, h1, h2, out: engine_callback(st, gts, h1, h2, out),
-            curr_i=i,
-            out=iter_out
-        )
-
-        self.logger.write(f"# Iteration {i} produced {len(new_events)} event(s) after nested checks.", level=1)
-        """if genetrees is None:
-                    print(f'\nNo further events found. Terminating GRAMPS at iteration {i}.')
-                    break"""
-
-        # 4. Update History & Disk
-        self.update_history(i, new_events)
-        last_idx = max(new_events.keys())
-        final_mt, final_gts_list = new_events[last_idx]
+        # Check if passed cutoff
+        passed = self._check_if_passed(i, j)
+        if not passed:
+            self.logger.write(f"# Iteration {i} did not pass cutoff.", level=1)
+            return next_mt, None
         
+        # Rename Trees for Next Iteration
+        new_gts_list = self._partition_gt_leaves(res, nonin_idx, disallowed_lvs, distance_map)
+
+        if j == 0:
+            # Check for Nested Hybridization
+            # This encapsulates the while-loop for recursive sub-fixes
+            self.check_and_fix_nested(
+                multree         = res.mul_trees[nonin_idx],
+                genetrees       = new_gts_list,
+                iter            = i,
+                engine_callback = lambda st, gts, h1, h2, out: engine_callback(st, gts, h1, h2, out),
+            )
+
         # Convert list back to Dict for GrandmaTree consumption
-        next_st = SmrtTree(tree_obj=final_mt['tree'])
-        next_gts = {idx: SmrtTree(tree_obj=gt) for idx, gt in enumerate(final_gts_list)}
+        next_st = SmrtTree(tree_obj=next_mt.ete_tree)
+        next_gts = {idx: SmrtTree(tree_obj=gt) for idx, gt in enumerate(new_gts_list)}
         
         # Write handoff files for resume support
-        CommonOps.write_handoff_files(iter_out.parent, final_mt['tree'], final_gts_list)
+        CommonOps.write_handoff_files(iter_out.parent, next_mt.ete_tree, new_gts_list)
         
         return next_st, next_gts
 
@@ -704,8 +652,11 @@ class FlowManager:
         # 1. Determine Depth and Index from Binary ID
         depth, idx = (int(x) for x in bin_id.split('.')) if '.' in bin_id else (0, 0)
 
+        self._update_history(depth, idx, res)
+
         # 2. Validation & Cutoff
-        if not self._to_proceed(res, f"Depth {depth}, Index {idx}"):
+        if not self._check_if_passed(depth, idx):
+        #if not self._to_proceed(res, f"Depth {depth}, Index {idx}"):
             return []
 
         self.logger.write(f"# Reticulation found at Depth {depth}, Index {idx} with score {res.mt_score()}.", level=1)
@@ -719,7 +670,7 @@ class FlowManager:
         #    return []
         
         # 4. Update History
-        self.update_history(depth, {idx: res})
+        #self.update_history(depth, {idx: res})
 
         # Write handoff files for resume support
         for task_st, task_gts, task_id in next_tasks:
@@ -790,18 +741,18 @@ class FlowManager:
             event = self.ctx.history[key]
             
             # A. Extract Topology Info from Event
-            h1_names = event['h1.node'] # Base names defining the lineage
+            h1_names = event['h1_node'] # Base names defining the lineage
             
             # We need to find the Sister of H2 to know WHERE to graft.
             # We parse the local event tree string to find this relationship.
-            local_mt = Tree(event['multree'], format=1) 
+            local_mt = Tree(event['best_mt'], format=1) 
             
             # Find H2 leaves in local tree (they usually have '*' or are the second occurence)
             # In split mode history, h2.node names usually come with '*' suffix from the run
             h2_leaves_local = []
             for n in local_mt.get_leaves():
                 # Match against recorded h2 names
-                if n.name in event['h2.node']:
+                if n.name in event['h2_node']:
                     h2_leaves_local.append(n)
             
             if not h2_leaves_local:

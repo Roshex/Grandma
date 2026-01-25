@@ -19,31 +19,36 @@ def time_tool(command: str, tool_name: str):
 
 if __name__ == "__main__":
 
-    #path_manual = Path(__file__).parent / "ex_k_back"
-    #g = path_manual / 'backbone.txt'
-    #s = path_manual / 'astral.tre'
+    datasets = [
+        ("ex_no_w", "manual_gene_trees_no_w.txt", "manual_species_tree_no_w.tre"),
+        ("ex_w", "manual_gene_trees_w.txt", "manual_species_tree_w.tre"),
+        ("ex_w_snested", "manual_gene_trees_w_sn.txt", "manual_species_tree_w_sn.tre"),
+        ("ex_k_back", "backbone.txt", "astral.tre"),
+    ]
 
-    path_manual = Path(__file__).parent / "ex_w"
-    g = path_manual / 'manual_gene_trees_w.txt'
-    s = path_manual / 'manual_species_tree_w.tre'
+    for ds_name, g_file, s_file in datasets:
 
-    other_args = ''
+        path_manual = Path(__file__).parent / ds_name
+        g = path_manual / g_file
+        s = path_manual / s_file
 
-    #old_tool = "C:\\Users\\psfsitaymay\\Downloads\\Grampa_RT_etc\\grandma\\grampa.py"
-    old_tool = "E:\\Synced\\Studies\\Grampa_RT_etc\\grandma\\grampa.py"
+        other_args = ''
 
-    new_tool = path_manual.parent.parent / "gran.py"
+        #old_tool = "C:\\Users\\psfsitaymay\\Downloads\\Grampa_RT_etc\\grandma\\grampa.py"
+        old_tool = "E:\\Synced\\Studies\\Grampa_RT_etc\\grandma\\grampa.py"
 
-    o_old = path_manual / 'o_old/'
-    o_new = path_manual / 'o_new'
+        new_tool = path_manual.parent.parent / "gran.py"
 
-    time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}/ {other_args}", "new") # --debug --plot
-    time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug", "new") #--plot --start 1
-    time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_deep/ {other_args} -m full --debug", "new")
+        o_old = path_manual / 'o_old/'
+        o_new = path_manual / 'o_new'
 
-    #time_tool(f"python {old_tool} -g {g} -s {s} -o {o_old} --overwrite {other_args} --maps", "old")
+        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}/ {other_args} --debug", "new") # --debug --plot
+        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug", "new") #--plot --start 1
+        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_deep/ {other_args} -m full --debug", "new")
 
-    #time_tool(f"python {Path(__file__).parent / 'exe_compare.py'} -log {path_manual / 'compare_log.txt'} -old {o_old} -new {o_new}", "compare")
+        #time_tool(f"python {old_tool} -g {g} -s {s} -o {o_old} --overwrite {other_args} --maps", "old")
+
+        #time_tool(f"python {Path(__file__).parent / 'exe_compare.py'} -log {path_manual / 'compare_log.txt'} -old {o_old} -new {o_new}", "compare")
 
 
 
