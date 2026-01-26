@@ -325,6 +325,13 @@ class SmrtTree:
         self.ete_tree = state
         self.refresh()
 
+    # Legacy
+
+    def report_labels(self):
+        """Prints the species tree with internal nodes labeled."""
+        print("\n# The input species tree with internal nodes labeled:")
+        print(self.to_string(internal_labels=True) + "\n")
+
 
 
 '''# replacing GrandmaTree, just the name is different

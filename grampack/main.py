@@ -7,9 +7,9 @@ from functools import partial
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List, Union
 
-from .config import InitParser, GlobalContext, TaskConfig, GrandmaWriter
+from .config import InitParser, GlobalContext, TaskConfig, GranWriter
 from .flow import FlowManager
-from .logger import GrandmaLogger
+from .logger import GranLogger
 from .models import SmrtTree, NameRegistry, TaskResult
 from .ops import TreeLoader, GeneTreeManager, MulTreeManager
 from .orthology import OrthologyLabeler
@@ -51,7 +51,7 @@ def task_worker(payload: Tuple[Any, Any, str], context: GlobalContext, config: T
 
     # If no parent logger provided (preferred in multiprocessing)
     # create logger without forwarding to parent
-    logger = GrandmaLogger(iter_tcf.log_file, verbosity, parent_logger=parent_logger)
+    logger = GranLogger(iter_tcf.log_file, verbosity, no_log=context.nolog, debug=context.debug, parent_logger=parent_logger)
 
     # Execute Task
     # Task.execute returns (StepResult, updates)
@@ -59,7 +59,7 @@ def task_worker(payload: Tuple[Any, Any, str], context: GlobalContext, config: T
     task = Task(iter_ctx, logger=logger)
     res, updates = task.execute(iter_tcf)
 
-    return task_id, res, updates, logger.log_path
+    return task_id, res, updates, logger.log_file
 
 # --- Core Classes --- #
 
@@ -69,7 +69,7 @@ class Task:
     It contains its own logger, writer, and configuration state specific to this execution.
     It does not know about iteration history or other runs.
     """
-    def __init__(self, context: GlobalContext, logger: GrandmaLogger = None):
+    def __init__(self, context: GlobalContext, logger: GranLogger = None):
         self.ctx = context
         self.logger = logger
         
@@ -92,22 +92,38 @@ class Task:
         if not self.logger:
             # Create a new logger if one wasn't passed (standard behavior)
             log_file = Path(tcf.output_dir) / f"{tcf.run_prefix}.log"
-            self.logger = GrandmaLogger(log_file, tcf.verbosity)
-        self.writer = GrandmaWriter(tcf, self.logger)
+            self.logger = GranLogger(log_file, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug)
+        self.writer = GranWriter(tcf, self.logger)
         self.logger.start_run(self.ctx, tcf)
+
+        # --norun Implementation
+        if self.ctx.norun:
+            self.logger.log("ONLY PRINTING RUNTIME INFO (due to --norun).", 'i')
+            return None, {}
+
         self.logger.report_step("", "", start=True)
 
         # 1. Load Species Tree
         self.spec_tree = TreeLoader.spec_tree(tcf, self.logger)
 
-        # (Re)Init components with current trees
-        self.reconciler = Reconciler(tcf, self.ctx.num_processes)
+        if tcf.mode == "label-sp":
+            self.spec_tree.report_labels()
+            return None, {}
+        
+        # Re-init component with current task
         self.mul_mgr = MulTreeManager(tcf, self.spec_tree, self.logger)
-        self.gene_mgr = GeneTreeManager(tcf, self.reconciler, self.logger)
+
+        if tcf.mode == "count-mts":
+            self.mul_mgr.report_num_trees()
+            return None, {}
+
+        if tcf.mode == "build-mts":
+            self.mul_mgr.report_build_multrees()
+            return None, {}
 
         # 2. Build MUL-Trees
         self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build()
-        if tcf.mode == "build-mts": return None, {}
+        #if tcf.mode == "build-mts": return None, {}
 
         # 3. Load Gene Trees
         self.gene_trees = TreeLoader.gene_trees(tcf, self.logger)
@@ -124,6 +140,10 @@ class Task:
                 ginfo[n.name] = [n.dist, n.up.name if n.up else None, n_type, n.support]
             print(f"Gene Tree {gene_num}: {gt_obj.to_string(internal_labels=True)}, Node Info: {ginfo}")
         print(f"Species Tree: {self.spec_tree.to_string(internal_labels=True)})"""
+
+        # Re-init component with current task
+        self.reconciler = Reconciler(tcf, self.ctx.num_processes)
+        self.gene_mgr = GeneTreeManager(tcf, self.reconciler, self.logger)
 
         # 4. Collapse & Filter Groups
         # Note: In iterative modes, we are filtering the *memory* gene trees, 
@@ -194,7 +214,7 @@ class Engine:
         
         # In Single mode, we don't need a separate engine logger.
         # In Full mode, we might want a flow logger.
-        self.flow_logger = GrandmaLogger(self.ctx.log_file, self.ctx.verbosity, clear_log=False)
+        self.flow_logger = GranLogger(self.ctx.log_file, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug, clear_log=False)
         """# In resume, append to log, don't clear
         is_resume = (self.tcf.history is not None and len(self.tcf.history) > 0)
         self.flow_logger = GrandmaLogger(log_path, self.cfg.verbosity, clear_log=not is_resume)"""
@@ -210,7 +230,7 @@ class Engine:
 
     def run(self):
         final_res = None
-        if self.tcf.mode in ["full", "split"]:
+        if self.tcf.mode in ["full", "split"] and not self.ctx.norun:
             # Flow Manager Init for Iterative Modes
             self.flow_mgr = FlowManager(self.ctx, self.tcf.mode, self.flow_logger)
             if self.tcf.mode == "full":
@@ -228,11 +248,12 @@ class Engine:
         Creates a dedicated folder and Run instance for each iteration.
         Passes tree objects in memory to avoid reloading.
         """
-        self.flow_logger.write("Starting Fully Sequential Mode", level=1)
+        self.flow_logger.log("Starting Fully Sequential Mode", 'i')
 
         # Setup: initial parameters must have been parsed already in io.py
         i = self.ctx.start_pt
         max_iter = self.ctx.max_iter
+        iter_msg = '(inf mode)' if max_iter == float('inf') else f'of {int(max_iter)}' # ∞
         
         perm_tcf = self.tcf
         current_st = perm_tcf.st
@@ -244,12 +265,12 @@ class Engine:
        
         # Iteration Loop
         try:
-            while i < max_iter:
+            while True:
+                if i >= max_iter:
+                    self.flow_logger.log(f"Finished maximum iterations ({max_iter}). Terminating.", 'i')
+                    break
 
-                self.flow_logger.write(
-                    f'\n# ----- Iteration {i} '
-                    + '(inf mode)' if max_iter == float('inf') else f'of {int(max_iter)}'
-                    + ' -----\n#') # ∞
+                self.flow_logger.log(f'\n# ----- Iteration {i} {iter_msg} -----\n#', 'i')
 
                 # Run worker
                 # We pass the persistent config (which might have parsed ploidies from iter 1)
@@ -261,14 +282,15 @@ class Engine:
                     verbosity=self.ctx.verbosity,
                     parent_logger=self.flow_logger
                 )
-                iter_logger = GrandmaLogger(iter_log, self.ctx.verbosity, parent_logger=self.flow_logger, clear_log=False)
+                iter_logger = GranLogger(iter_log, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug,
+                                         parent_logger=self.flow_logger, clear_log=False)
 
                 # Update persistent config for next iteration
                 perm_tcf = perm_tcf.update(**updates)
 
                 # Process result and handle potential nesting
                 # This returns the trees prepared for the NEXT iteration
-                next_st, next_gts = self.flow_mgr.handle_iteration_result(
+                next_mt, next_gts = self.flow_mgr.handle_iteration_result(
                     i, res,
                     engine_callback=lambda st, gts, h1, h2, out: self._run_nested_subproblem(st, gts, h1, h2, out),
                     iter_out = self.ctx.root_dir / str(i) / "output", 
@@ -276,26 +298,23 @@ class Engine:
                 )
 
                 if not next_gts:
-                    self.flow_logger.write(f"No further events found. Terminating at iteration {i}.")
+                    self.flow_logger.log(f"No further events found. Terminating at iteration {i}.", 'i')
                     break
-                
+
                 i += 1
-                current_st, current_gts = next_st, next_gts
+                current_st, current_gts = next_mt.mt, next_gts
                 
         except KeyboardInterrupt:
-            self.flow_logger.write("Interrupted by user.", level=1)
+            self.flow_logger.log("Interrupted by user.", 'i')
 
         if self.ctx.plot: self.flow_mgr.plot()
         
-        self.flow_logger.write("Fully Sequential Mode Finished.")
+        self.flow_logger.log("Fully Sequential Mode Finished.", 'i')
 
-    def _run_nested_subproblem(self, st_obj, gt_objs, h1_str, h2_str, fix_dir):
+    def _run_nested_subproblem(self, mem_st: SmrtTree, mem_gts: Dict[int, SmrtTree], h1_str: str, h2_str: str, fix_dir: Path) -> TaskResult:
         """Helper to run a constrained nested fix run."""
         # Use self.tcf as base, explicitly overriding params
         # Note: verbosity is passed in a quiet context to the Task.
-
-        mem_st = SmrtTree(tree_obj=st_obj)
-        mem_gts = {k: SmrtTree(tree_obj=v) for k, v in enumerate(gt_objs)}
         
         fix_tcf = self.tcf.update(
                         st = mem_st,
@@ -317,18 +336,19 @@ class Engine:
         Tracking should be Process-Safe and Unified.
         Matches the recursive sub-problem architecture: folder 'Depth.Index' (as tracked in 'history').
         """
-        self.flow_logger.write("Starting Parallelized Split Mode (Binary Recursive Search)", level=1)
+        self.flow_logger.log("Starting Parallelized Split Mode (Binary Recursive Search)", 'i')
         
         # Initialize Task Queue to the root problem
         perm_tcf = self.tcf
         root_task = (perm_tcf.st, perm_tcf.gts, "0")
         current_tasks = [root_task]
+        max_iter = self.ctx.max_iter
         
         # Fast-Forward (Resume) Logic
         # If we have history, we might have completed the root or others.
         # We need to reconstruct the frontier.
         if self.ctx.history:
-            self.flow_logger.write(f"History found ({len(self.ctx.history)} entries). Checking for resume...", level=1)
+            self.flow_logger.log(f"History found ({len(self.ctx.history)} entries). Checking for resume...", 'i')
             current_tasks = self.flow_mgr.fast_forward_split(current_tasks)
 
         pool = mp.Pool(processes=self.ctx.num_processes)
@@ -339,6 +359,10 @@ class Engine:
             depth = int(str(current_tasks[0][2]).split('.')[0])
 
         while current_tasks:
+
+            if depth >= max_iter:
+                self.flow_logger.log(f"Reached maximum depth ({max_iter}). Terminating.", 'i')
+                break
 
             #self.flow_logger.write(f"Dispatching {len(current_tasks)} sub-problems at Depth {depth}...", level=1)
             #step = f"Processing Depth {depth}"
@@ -369,7 +393,8 @@ class Engine:
 
                 # Logic to determine branching vs termination moved to flow_mgr
                 # Note: We reconstruct path here to avoid passing it back from workers
-                iter_logger = GrandmaLogger(iter_log, self.ctx.verbosity, parent_logger=self.flow_logger, clear_log=False)
+                iter_logger = GranLogger(iter_log, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug,
+                                         parent_logger=self.flow_logger, clear_log=False)
                 next_tasks.extend(
                     self.flow_mgr.handle_split_result(
                         task_id, res,
@@ -387,7 +412,7 @@ class Engine:
 
         if self.ctx.plot: self.flow_mgr.plot()
 
-        self.flow_logger.write("Parallelized Split Mode Finished.")
+        self.flow_logger.log("Parallelized Split Mode Finished.", 'i')
 
 def main():
     ctx, tcf = InitParser().parse()

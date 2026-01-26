@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Union, List
 from dataclasses import dataclass, field, replace, fields
 
-from .logger import GrandmaLogger
+from .logger import GranLogger
 from .models import SmrtTree, Map, HistoryType
 
 import datetime
@@ -29,14 +29,14 @@ better mem and cpu/processing options?
 
 # --- Package Metadata (Literal) ---
 @dataclass(frozen=True, slots=True)
-class GrandmaMetadata:
+class GranMetadata:
     """Immutable metadata about the GRANDMA software."""
     authors: str = "Ronen Shtein"
     doi: str = "TBD"
     github: str = "TBD"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "2.7.2 (Modern)"
+    version: str = "2.7.5 (Modern)"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -170,7 +170,7 @@ def load_history(history_file: Path) -> Dict[Tuple[Any, int], Any]:
         # but ast.literal_eval handles "(0, 0)" safely.
         return {ast.literal_eval(k): v for k, v in json.load(f).items()}
 
-def start_up_prep_2(start_point: Union[str, int], base_output_dir: Path, logger: GrandmaLogger, mode: str = "full") -> Tuple[int, Dict, Path]:
+def start_up_prep_2(start_point: Union[str, int], base_output_dir: Path, logger: GranLogger, mode: str = "full") -> Tuple[int, Dict, Path]:
     """
     Handles folder cleanup and history loading.
     Supports both integer-based iteration folders (Full) and Depth.Index folders (Split).
@@ -184,9 +184,9 @@ def start_up_prep_2(start_point: Union[str, int], base_output_dir: Path, logger:
         history = load_history(history_file)
         is_resume = True
     elif not base_output_dir.exists():
-        logger.write(f"Creating new output directory at {base_output_dir}", level=2)
+        logger.log(f"Creating new output directory at {base_output_dir}", 's')
     else:
-        logger.write(f"No history file found at {history_file}. Starting from scratch.", level=1)
+        logger.log(f"No history file found at {history_file}. Starting from scratch.", 'i')
 
     # Resolve start point logic
     if mode == "split":
@@ -195,7 +195,7 @@ def start_up_prep_2(start_point: Union[str, int], base_output_dir: Path, logger:
         # Clean up any folder that is NOT in history? Or just trust history?
         # A simple approach: Trust history. If user passes --start 0, we wipe everything.
         if isinstance(start_point, int) and start_point == 0:
-             logger.write("Split mode: --start 0 implies fresh run. Wiping history.", level=1)
+             logger.log("Split mode: --start 0 implies fresh run. Wiping history.", 'i')
              is_resume = False
              history = {}
              # shutil.rmtree(base_output_dir) # Dangerous? Better to just clear history and let overwrite handle it.
@@ -214,7 +214,7 @@ def start_up_prep_2(start_point: Union[str, int], base_output_dir: Path, logger:
     if isinstance(start_point, int):
         if start_point < 1:
              # Manual override to 0 means fresh start
-             logger.write("Manual start at 0. Wiping previous history.", level=1)
+             logger.log("Manual start at 0. Wiping previous history.", 'i')
              i = 0
              keys_to_delete = list(history.keys()) # Delete all
         else:
@@ -223,7 +223,7 @@ def start_up_prep_2(start_point: Union[str, int], base_output_dir: Path, logger:
                 # If we want to start at 5, we need history for 4.
                 # If history is empty, we can't start at 5.
                 raise RuntimeError(f'Missing history entry for iteration {i}. Cannot resume at iteration {i+1}.')
-            logger.write(f"Resuming from iteration {i+1} (manually specified).", level=1)
+            logger.log(f"Resuming from iteration {i+1} (manually specified).", 'i')
             # We delete everything AFTER i
             keys_to_delete = [k for k in history if isinstance(k[0], int) and k[0] > i]
     else:
@@ -239,7 +239,7 @@ def start_up_prep_2(start_point: Union[str, int], base_output_dir: Path, logger:
                         valid_i = j
                         break
             i = valid_i + 1
-            logger.write(f"Auto-detected resume point: Iteration {i+1}.", level=1)
+            logger.log(f"Auto-detected resume point: Iteration {i+1}.", 'i')
             keys_to_delete = [k for k in history if isinstance(k[0], int) and k[0] >= i] # Should be empty usually
         else:
             keys_to_delete = []
@@ -249,7 +249,7 @@ def start_up_prep_2(start_point: Union[str, int], base_output_dir: Path, logger:
     for item in base_output_dir.iterdir():
         if item.is_dir() and item.name.isdigit():
             if int(item.name) >= i and i > 0: # Don't delete 0 if we are starting at 0, overwrites happen later
-                 logger.write(f'Removing future directory: {item}', level=1)
+                 logger.log(f'Removing future directory: {item}', 'i')
                  shutil.rmtree(item, ignore_errors=True)
             elif i == 0 and item.name.isdigit():
                  shutil.rmtree(item, ignore_errors=True)
@@ -264,7 +264,7 @@ def start_up_prep_2(start_point: Union[str, int], base_output_dir: Path, logger:
 
     return i, history, history_file
 
-def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: GrandmaLogger, mode: str) -> Tuple[int, Dict, Path]:
+def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: GranLogger, mode: str) -> Tuple[int, Dict, Path]:
     """
     Handles folder cleanup and history loading before the engine starts.
     Robustly handles both Integer folders (Full mode) and Dot-Notation folders (Split mode).
@@ -278,21 +278,21 @@ def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: G
         if history_file.exists():
             try:
                 history = load_history(history_file)
-                logger.write(f"Loaded existing history ({len(history)} entries).", level=1)
+                logger.log(f"Loaded existing history ({len(history)} entries).", 'i')
             except Exception as e:
-                logger.write(f"Warning: Failed to load history file ({e}). Starting fresh.", level=1)
+                logger.log(f"Failed to load history file ({e}). Starting fresh.", 'w')
                 history = {}
         else:
-            logger.write(f"No history file found at {history_file}. Starting from scratch.", level=1)
+            logger.log(f"No history file found at {history_file}. Starting from scratch.", 'i')
     else:
-        logger.write(f"Previous output directory {base_output_dir} does not exist. Starting from scratch.", level=1)
+        logger.log(f"Previous output directory {base_output_dir} does not exist. Starting from scratch.", 'i')
     
     # 2. Resolve Start Point & Mode Logic
     if mode == "split":
         # Split mode resumes based on History content (Graph Traversal), not a linear index.
         # We generally DO NOT delete folders in split mode unless forced, to preserve the recursion tree.
         if start_point == 0: # Explicit restart request
-             logger.write("Split Mode: Explicit start at 0. Clearing previous history.", level=1)
+             logger.log("Split Mode: Explicit start at 0. Clearing previous history.", 'i')
              history = {}
              # We let existing folders be overwritten by the run logic
         return 0, history, history_file
@@ -312,15 +312,15 @@ def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: G
     if isinstance(start_point, int):
         if start_point < 1:
             # Explicit restart
-            logger.write("Manual start at 0. Wiping previous history.", level=1)
+            logger.log("Manual start at 0. Wiping previous history.", 'i')
             i = 0
         else:
             # Resume at specific point
             i = start_point - 1  # We read output from (start-1) to begin (start)
             # Check if required history exists
             if (i, 0) not in history:
-                logger.write(f"Warning: Missing history for iteration {i}. Cannot resume perfectly. Starting at {i} anyway.", level=1)
-            logger.write(f"Resuming from iteration {i+1} (manually specified).", level=1)
+                logger.log(f"Missing history for iteration {i}. Cannot resume perfectly. Starting at {i} anyway.", 'w')
+            logger.log(f"Resuming from iteration {i+1} (manually specified).", 'i')
     else:
         # Auto-detect from folders + history
         # Find the highest folder index that is ALSO in history
@@ -333,7 +333,7 @@ def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: G
         
         if valid_i >= 0:
             i = valid_i + 1
-            logger.write(f"Auto-detected resume point: Iteration {i}.", level=1)
+            logger.log(f"Auto-detected resume point: Iteration {i}.", 'i')
         else:
             i = 0
 
@@ -351,7 +351,7 @@ def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: G
     for iter_dir in iter_dirs:
         j = int(iter_dir.name)
         if j > i:
-            logger.write(f'Removing future directory: {iter_dir}', level=1)
+            logger.log(f'Removing future directory: {iter_dir}', 'i')
             shutil.rmtree(iter_dir, ignore_errors=True)
 
     # Update History File
@@ -359,21 +359,21 @@ def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: G
         for k in keys_to_delete:
             del history[k]
         if history_file.exists():
-            logger.write(f'Pruning history entries >= {i}', level=1)
+            logger.log(f'Pruning history entries >= {i}', 'i')
             with open(history_file, 'w') as f:
                 json.dump({str(k): v for k, v in history.items()}, f, indent=4)
 
     return i, history, history_file
 
-def check_loop_length(n: int, i: int, st_file: Path, history: Dict, logger: GrandmaLogger) -> Union[int, float]:
+def check_loop_length(n: int, i: int, st_file: Path, history: Dict, logger: GranLogger) -> Union[int, float]:
     """Determines the true loop length based on input and history."""
     # If n is non-positive, run while True, otherwise run n times
     if n <= 0:
-        logger.write('\nImportant: -i (--iter) is set to 0 or less, running indefinitely until no new H-nodes are found.', level=1)
+        logger.log('Important: -i (--iter) is set to 0 or less, running indefinitely until no new H-nodes are found.', 'i')
         n = float('inf')
     if i > 0:
         if history[(i, 0)]['gt_file'] == 'NA' and st_file.exists():
-            logger.write(f'\nPrevious run was completed. No further iterations needed.', level=1)
+            logger.log(f'Previous run was completed. No further iterations needed.', 'i')
             n = -1
     '''
     # Check if the "previous" run actually signaled completion
@@ -381,7 +381,7 @@ def check_loop_length(n: int, i: int, st_file: Path, history: Dict, logger: Gran
     # Adjust logic based on how flow.py writes history.
     if i > 0 and (i-1, 0) in history:
         if history[(i-1, 0)].get('gt_file') == 'NA' and st_file.exists():
-            logger.write(f'\nPrevious run seems completed (No GTs passed forward). No further iterations needed.', level=1)
+            logger.log(f'\nPrevious run seems completed (No GTs passed forward). No further iterations needed.', 'i')
             n = -1
     '''
 
@@ -422,9 +422,9 @@ class InitParser:
             help="A string prepended to all output files. Default = 'grandma'.")
         g_general.add_argument("-p", "--procs", type=int, default=1,
             help="Number of processes to use for parallelizable tasks. Default = 1.")
-        g_general.add_argument("-v", "--verbosity", type=int, default=3, choices=range(4),
+        g_general.add_argument("-v", "--verbosity", type=int, default=2, choices=range(5),
             help="Level of verbosity printed to the screen. 0 = none; 1 = run info; 2 = standard; "
-                 "3 = loud / soft debugging. Default = 3.")
+                 "3 = debug; 4 = verbose debugging. Default = 2.")
 
         # --- Algorithmic Options ---
         g_algo = self.parser.add_argument_group("Algorithmic Options")
@@ -452,13 +452,14 @@ class InitParser:
         # --- Flow Control Options ---
         g_flow = self.parser.add_argument_group("Flow Control Options")
         g_flow.add_argument("-m", "--mode", type=str, default="single",
-            choices=["single", "split", "full", "build-mts", "check-nums", "no-recon", "no-st", "st-only"], 
+            choices=["single", "split", "full", "label-sp", "count-mts", "build-mts", "check-nums", "no-recon", "no-st", "st-only"], 
             help="Execution mode. Options: single => simple run [default] | split => parallelized binary-recursive | "
-            "full => fully sequencial with nestedness inference | build-mts => build MUL-trees only | check-nums => "
+            "full => fully sequencial with nestedness inference | label-sp => only label input species tree internal "
+            "nodes | count-mts => count possible MUL-trees only | build-mts => build MUL-trees only | check-nums => "
             "count groups only | no-recon => build MTs & count groups | no-st => skip reconciliation to input | st-only "
             "=> reconciliation to input only.")
         g_flow.add_argument('-i', '--iter', type=int, default=0,
-            help="Maximun number of iterations for iterative modes; <int>, non-positive to be unlimited. Default = 0.")
+            help="Maximun number of iterations or depth for iterative modes; <int>, non-positive to be unlimited. Default = 0.")
         g_flow.add_argument('-r', '--repair', action='store_true',
             help="If set, attempt to repair input files by forcing bifurcating trees, rooting, valid tip names, and more.")
         g_flow.add_argument('--start', type=str, default='auto',
@@ -481,7 +482,7 @@ class InitParser:
         g_output.add_argument('--plot', action='store_true',
             help="Plot taxon count, MP score, and normalized score over iterations. Relevant only for iterative modes.")
         g_output.add_argument('--debug', action='store_true',
-            help="Enable debug mode for additional outputs.")
+            help="Enable debug mode for additional outputs to the log file (whereas --v 3 only prints debug messages to screen).")
         g_output.add_argument("--overwrite", action="store_true",
             help="If set, overwrite existing files in the output directory. Default: exit if files exist.")
         g_output.add_argument("--norun", action="store_true",
@@ -497,6 +498,10 @@ class InitParser:
             help="If set, the input species tree is parsed as a MUL-tree. The H1 and H2 nodes are inferred "
                  "from tree topology (parents of the 'H*' and 'H' clades). First iteration / single mode will perform "
                  "reconciliation only - i.e., no alternative MT search. Auto-detected for multi-labeled input.")
+        g_legacy.add_argument("--labeltree", action="store_true",
+            help="If set, the program will read the species tree, print it with internal nodes labeled, and exit.")
+        g_legacy.add_argument("--numtrees", action="store_true",
+            help="If set, the program will count the number of possible MUL-trees from the inputs and exit.")
         g_legacy.add_argument("--buildmultrees", action="store_true",
             help="If set, only build the MUL-trees from the species tree and exit. "
                  "No reconciliation will be performed. Equivalent to -m build-mts.")
@@ -518,32 +523,34 @@ class InitParser:
             try: 
                 return ('rel', float(val.split(':')[1]))
             except (ValueError, IndexError): 
-                self.logger.write(f'Error: Invalid relative cutoff: {val}', level=0)
+                self.logger.log(f'Invalid relative cutoff: {val}', 'e')
         if val.startswith('abs:'):
             try: 
                 return ('abs', int(val.split(':')[1]))
             except (ValueError, IndexError): 
-                self.logger.write(f'Error: Invalid absolute cutoff: {val}', level=0)
-        self.logger.write(f'Error: Invalid cutoff format: "{val}". Use "auto", "rel:<float>", or "abs:<int>".', level=0)
+                self.logger.log(f'Invalid absolute cutoff: {val}', 'e')
+        self.logger.log(f'Invalid cutoff format: "{val}". Use "auto", "rel:<float>", or "abs:<int>".', 'e')
 
-    def resolve_mode_logic(self, mode, build_mts, check_nums, st_only, no_st) -> str:
+    def resolve_mode_logic(self, mode, label_sp, count_mts, build_mts, check_nums, st_only, no_st) -> str:
         """
         Consolidates modern --mode and legacy flags into a single mode string.
         Returns resolved mode.
         """
         m = "default"
-        if build_mts: m = "build-mts"
+        if label_sp: m = "label-sp"
+        elif count_mts: m = "count-mts"
+        elif build_mts: m = "build-mts"
         elif check_nums: m = "check-nums"
         elif st_only: m = "st-only"
         elif no_st: m = "no-st"
 
         if build_mts and check_nums: m = "no-recon"
-        elif sum([build_mts, check_nums, st_only, no_st]) > 1:
-            self.logger.write("Warning: Multiple legacy [build-mts and/or check-nums, no-st, st-only] flags set! One will be chosen according to precedence.", level=1)
+        elif sum([label_sp, count_mts, build_mts, check_nums, st_only, no_st]) > 1:
+            self.logger.log("Multiple legacy flags set! One will be chosen according to precedence.", 'w')
 
         # Priority 1: Direct --mode selection (if not single)
         if mode != "single" and mode != m:
-            self.logger.write("Warning: --mode flag overrides legacy [build-mts, check-nums, no-st, st-only] flags!", level=1)
+            self.logger.log("--mode flag overrides legacy flags!", 'w')
             return mode
         
         # Priority 2: If mode is single and no legacy flags are set
@@ -564,10 +571,10 @@ class InitParser:
         out_dir.mkdir(parents=True, exist_ok=True)
         
         log_file = out_dir / f"{args.prefix}.log"
-        self.logger = GrandmaLogger(log_path=log_file, verbosity=args.verbosity)
+        self.logger = GranLogger(log_file=log_file, verbosity=args.verbosity, no_log=args.nolog, debug=args.debug)
 
-        self.logger.log_software_banner(GrandmaMetadata())
-        self.logger.write("=" * 73, level=1)
+        self.logger.log_software_banner(GranMetadata())
+        self.logger.log("=" * 73, 'i')
 
         ####
         # Logging strategy:
@@ -580,6 +587,8 @@ class InitParser:
         # --- Resolve Argument Logistics ---
         mode = self.resolve_mode_logic(
             args.mode,
+            args.labeltree,
+            args.numtrees,
             args.buildmultrees,
             args.checknums,
             args.st_only,
@@ -633,8 +642,8 @@ class InitParser:
 
         return ctx, tcf
 
-class GrandmaWriter:
-    def __init__(self, config: TaskConfig, logger: GrandmaLogger):
+class GranWriter:
+    def __init__(self, config: TaskConfig, logger: GranLogger):
         self.tcf = config
         self.logger = logger
 
@@ -661,7 +670,7 @@ class GrandmaWriter:
                     if (maps_len := len(res.maps)) > 1:
                         f.write(f"# GT-{gene_idx} to MT-{mul_idx}\t{maps_len} maps found!\n")
                     for map in res.maps:
-                        map_str = GrandmaWriter.detailed_out_string(gt_obj, map.cor, map.dups)
+                        map_str = GranWriter.detailed_out_string(gt_obj, map.cor, map.dups)
                         f.write(f"{mul_idx}\t{gene_idx}\t{map.n_dups}\t{map.n_losses}\t{res.score}\t{map_str}\n")
                 i += 1
                          

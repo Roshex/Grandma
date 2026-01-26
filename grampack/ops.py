@@ -2,11 +2,14 @@ import os
 import re
 import sys
 import pickle
+import multiprocessing as mp
+from tqdm import tqdm
 from pathlib import Path
+from functools import partial
 from typing import Tuple, List, Optional, Dict, Union
 
 from .config import TaskConfig
-from .logger import GrandmaLogger
+from .logger import GranLogger
 from .models import Tree, SmrtTree, MulTree, GroupData, NameRegistry
 from .reconcile import Reconciler
 
@@ -51,7 +54,7 @@ class CommonOps:
         return "nonexistent", []
     
     @staticmethod
-    def _load_single_content(input: Union[Path, str], desc: str, logger: GrandmaLogger, key: str="Error") -> str:
+    def _load_single_content(input: Union[Path, str], desc: str, logger: GranLogger, key: str="e") -> str:
         """Loads a single tree string from Path or String."""
         kind, paths = CommonOps._identify_path(input)
         if kind == "raw":
@@ -60,14 +63,14 @@ class CommonOps:
             try:
                 return paths[0].read_text()
             except Exception as e:
-                logger.write(f"{key} reading {desc} file '{paths[0]}': {e}")
+                logger.log(f"reading {desc} file '{paths[0]}': {e}", key)
         elif kind == "nonexistent":
-            logger.write(f"{key}: {desc} file '{input}' not found.")
+            logger.log(f"{desc} file '{input}' not found.", key)
         else:
-            logger.write(f"{key}: Invalid input type for {desc}.")
+            logger.log(f"Invalid input type for {desc}.", key)
 
     @staticmethod
-    def _load_multi_content(input: Union[Path, str], desc: str, logger: GrandmaLogger, key: str="Error") -> Tuple[List[str], Optional[List[str]]]:
+    def _load_multi_content(input: Union[Path, str], desc: str, logger: GranLogger, key: str="e") -> Tuple[List[str], Optional[List[str]]]:
         """
         Handles File, Raw String, or Folder input.
         Returns List of (content, source_name).
@@ -79,7 +82,7 @@ class CommonOps:
             try:
                 return paths[0].read_text().splitlines(), None
             except Exception as e:
-                logger.write(f"{key} reading {desc} file '{paths[0]}': {e}")
+                logger.log(f"reading {desc} file '{paths[0]}': {e}", key)
         elif kind == "directory" or kind == "pattern":
             if kind == "directory":
                 paths = list(paths[0].glob('*'))
@@ -90,31 +93,19 @@ class CommonOps:
                     if txt:
                         content.append(txt)
                 except Exception as e:
-                    logger.write(f"{key}: Could not read {p}: {e}")
+                    logger.log(f"Could not read {p}: {e}", key)
             return content, [f'from {p.name}' for p in paths]
         elif kind == "nonexistent":
-            logger.write(f"{key}: {desc} file '{input}' not found.")
+            logger.log(f"{desc} file '{input}' not found.", key)
         else:
-            logger.write(f"{key}: Invalid input type for {desc}.")
-
-
-    """
-                if not gt:
-                    warnings.append(f"# WARNING: Gene tree on line {i+1}: {msg} -- Filtering.")
-                    logger.warnings += 1
-
-        logger.report_step(step, f"Success: {valid_count} gene trees read")
-        for w in warnings: logger.write(w)
-
-        return gene_trees"""
-
+            logger.log(f"Invalid input type for {desc}.", key)
 
 class TreeLoader:
     """
     Handles loading, verification, and optional repais of Species and Gene trees.
     """
     @staticmethod
-    def spec_tree(tcf: TaskConfig, logger: GrandmaLogger) -> SmrtTree:
+    def spec_tree(tcf: TaskConfig, logger: GranLogger) -> SmrtTree:
 
         if isinstance(tcf.st, SmrtTree):
             # Do nothing, already loaded
@@ -128,7 +119,7 @@ class TreeLoader:
 
         # Input Validation
         if not tcf.st:
-            logger.write("Error: Species tree not found. Please check the input.")
+            logger.log("Species tree not found. Please check the input.", 'e')
 
         # Load Raw Content
         line = CommonOps._load_single_content(tcf.st, "species tree", logger)
@@ -142,13 +133,13 @@ class TreeLoader:
             # Format 1 allows internal node names, which we might need
             t = Tree(line, format=0)
         except Exception as e:
-            logger.write(f"Error reading species tree file: {e}")
+            logger.log(f"reading species tree file: {e}", 'e')
 
         # Topology Fixes & Checks (Polytomies, Rooting)
         # We error on ST issues unless repair is requested, as ST must be robust.
         is_valid, msg = TreeLoader._fix_and_validate_topology(t, tcf.repair)
         if not is_valid:
-            logger.write(f"Error: Species tree invalid: {msg}")
+            logger.log(f"Species tree invalid: {msg}", 'e')
 
         # MUL-Tree Validation
         TreeLoader._validate_mul_status(t, tcf.is_mul_input, logger)
@@ -160,7 +151,7 @@ class TreeLoader:
         return SmrtTree(tree_obj=t)
 
     @staticmethod
-    def gene_trees(tcf: TaskConfig, logger: GrandmaLogger) -> Optional[Dict[int, SmrtTree]]:
+    def gene_trees(tcf: TaskConfig, logger: GranLogger) -> Optional[Dict[int, SmrtTree]]:
 
         if isinstance(tcf.gts, dict):
             step = "Loading gene trees from memory"
@@ -177,10 +168,10 @@ class TreeLoader:
                 logger.report_step(step, "Skipped: 'build-mts' mode")
                 return {}
             else:
-                logger.write(f"Error: Gene trees input is missing. Required in all modes except 'build-mts' (here: '{tcf.mode}' mode).")
+                logger.log(f"Gene trees input is missing. Required in all modes except 'build-mts' (here: '{tcf.mode}' mode).", 'e')
 
         # Load Raw Contents (File, String, or Folder)
-        tree_list, origins = CommonOps._load_multi_content(tcf.gts, "gene trees", logger, key="Error")
+        tree_list, origins = CommonOps._load_multi_content(tcf.gts, "gene trees", logger, key="e")
         
         # Process Trees
         valid_gts = []
@@ -191,7 +182,7 @@ class TreeLoader:
 
             # Check Empty
             if not line.strip():
-                logger.write(f"Warning: Empty GT in {origin} -- Filtering.")
+                logger.log(f"Empty GT in {origin} -- Filtering.", 'w')
                 continue
 
             # Semicolon
@@ -201,13 +192,13 @@ class TreeLoader:
             try:
                 gt = Tree(line, format=0)
             except Exception:
-                logger.write(f"Warning: Error reading tree {origin}! -- Filtering.")
+                logger.log(f"Error reading tree {origin}! -- Filtering.", 'w')
                 continue
 
             # Topology Repair/Check
             is_valid, msg = TreeLoader._fix_and_validate_topology(gt, tcf.repair)
             if not is_valid:
-                logger.write(f"Warning: Gene tree {origin}: {msg} -- Filtering.")
+                logger.log(f"Gene tree {origin}: {msg} -- Filtering.", 'w')
                 continue
 
             # Tips Repair/Check } if tcf.repair
@@ -224,7 +215,7 @@ class TreeLoader:
             valid_gts.append(gt)
 
         if len(valid_gts) == 0:
-            logger.write(f"Error: No valid gene trees survived filtering (required in {tcf.mode} mode).")
+            logger.log(f"No valid gene trees survived filtering (required in {tcf.mode} mode).", 'e')
         
         if tcf.repair:
             CommonOps._write_handoff_files(tcf.output_dir, gts=valid_gts)
@@ -277,7 +268,7 @@ class TreeLoader:
         return True, ""
 
     @staticmethod
-    def _validate_mul_status(t: Tree, is_mul_input: bool, logger: GrandmaLogger):
+    def _validate_mul_status(t: Tree, is_mul_input: bool, logger: GranLogger):
         """Validates species counts against the flag."""
         leaves = [n.name for n in t.get_leaves()]
         counts = {}
@@ -292,12 +283,12 @@ class TreeLoader:
             # Check if any appear > 2 (or 0, implicit)
             bad_taxa = [k for k, v in counts.items() if v > 2]
             if bad_taxa:
-                logger.write(f"Error: You have entered a tree type (--multree) of multree, species in your tree should appear exactly once or twice. (Violators: {bad_taxa})")
+                logger.log(f"You have entered a tree type (--multree) of multree, species in your tree should appear exactly once or twice. (Violators: {bad_taxa})", 'w')
         else:
             # Standard mode, no dups allowed
             if has_dups:
                 bad_taxa = [k for k, v in counts.items() if v > 1]
-                logger.write("Error: You have not entered a tree type (--multree) of multree, but there are labels in your tree that appear more than once!")
+                logger.log("You have not entered a tree type (--multree) of multree, but there are labels in your tree that appear more than once!", 'w')
 
     @staticmethod
     def _sanitize_line(s: str) -> str:
@@ -324,16 +315,15 @@ class TreeLoader:
             s = s.replace(char, new)
         return s
 
-
 class MulTreeManager:
-    def __init__(self, config: TaskConfig, st: SmrtTree, logger: GrandmaLogger) -> Optional[Dict[str, int]]:
+    def __init__(self, config: TaskConfig, st: SmrtTree, logger: GranLogger) -> Optional[Dict[str, int]]:
         self.tcf = config
         self.st = st
         self.logger = logger
         self.ploidies = self._parse_ploidy_file(self.tcf.ploidies, logger)
 
     @staticmethod
-    def _parse_ploidy_file(ploidies: Optional[Union[Path, str, Dict[str, int]]], logger: GrandmaLogger) -> Dict[str, int]:
+    def _parse_ploidy_file(ploidies: Optional[Union[Path, str, Dict[str, int]]], logger: GranLogger) -> Dict[str, int]:
         # No need to reload
         if isinstance(ploidies, dict):
             return ploidies
@@ -341,7 +331,7 @@ class MulTreeManager:
             return {}
         step = "Reading ploidy file"
         logger.report_step(step, "In progress...")
-        ploidies = CommonOps._load_single_content(ploidies, "ploidies", logger, key="Error")
+        ploidies = CommonOps._load_single_content(ploidies, "ploidies", logger, key="e")
         ploid_dict = {}
         try:
             with open(ploidies, 'r') as f:
@@ -351,9 +341,9 @@ class MulTreeManager:
                         species, ploidy = parts
                         ploid_dict[species] = int(ploidy)
         except Exception as e:
-            logger.write(f"Error reading ploidy file: {e}")
+            logger.log(f"reading ploidy file: {e}", 'e')
         if not ploid_dict:
-            logger.write("Warning: Ploidy file is empty or invalid.", level=1)
+            logger.log("Ploidy file is empty or invalid.", 'w')
         logger.report_step(step, f"Success: Loaded ploidy info for {len(ploid_dict)} species")
         return ploid_dict
 
@@ -492,7 +482,7 @@ class MulTreeManager:
             for item in clade:
                 name_to_check = f"<{item}>" if item.isdigit() else item
                 if not self.st.get_node(name_to_check):
-                    self.logger.write(f"Error: Node {name_to_check} not found in tree (specified in -{h_type}).")
+                    self.logger.log(f"Node {name_to_check} not found in tree (specified in -{h_type}).", 'e')
                     sys.exit(1)
                 cleaned_clade.append(name_to_check)
 
@@ -573,14 +563,165 @@ class MulTreeManager:
                     if mt_wrapper:
                         mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, h2_obj)
                         mul_num += 1
-            
+
             self.logger.report_step(step, f"Success: {mul_num-1} MUL-trees built")
             
         return mul_trees, h1_resolved, h2_resolved, self.ploidies
+    
+    # --- Legacy Support ---
 
+    def report_num_trees(self):
+        """Replicates the --numtrees output from legacy mul_tree.py"""
+        
+        # 1. Parse H inputs (logic borrowed from build())
+        h1_resolved = self._resolve_h_inputs(self.tcf.h1_nodes, "h1")
+        h2_resolved = self._resolve_h_inputs(self.tcf.h2_nodes, "h2")
+        
+        # 2. Count Logic (Legacy implementation)
+        # Note: We use the already loaded self.st which is a SmrtTree
+        st_ete = self.st.ete_tree
+        nt = len([n for n in st_ete.traverse()])
+        n_tips = len(st_ete.get_leaves())
+        
+        num_mul_trees = 0
+        for n1 in h1_resolved:
+            n1_node = self.st.get_node(n1)
+            # Get clade for containment check
+            if n1_node.is_leaf():
+                n1_clade_names = set()
+            else:
+                n1_clade_names = {n.name for n in n1_node.iter_descendants()}
+
+            ni = 0
+            for n2 in h2_resolved:
+                if n2 not in n1_clade_names:
+                    ni += 1
+            num_mul_trees += ni
+
+        # 3. Print Block
+        # Using print directly as this is a specific CLI report tool
+        print()
+        print(f"Total nodes in species tree: {nt}")
+        print(f"Total tips in species tree.: {n_tips}")
+        print(f"H1 nodes...................: {','.join(h1_resolved)}")
+        print(f"H2 nodes...................: {','.join(h2_resolved)}")
+        print(f"Possible MUL-trees.........: {num_mul_trees}")
+        print()
+
+    def report_build_multrees(self):
+        """Replicates --buildmultrees output loop."""
+        # Reuse existing build() logic
+        mul_trees, h1_res, h2_res, _ = self.build()
+        
+        # Legacy prints headers to log/screen depending on verbosity
+        # GRANDMA has unified logging. We log as 'i' (Info/High Priority).
+        
+        # Headers: mul.tree, h1.node, h2.node, labeled.tree
+        headers = ["mul.tree", "h1.node", "h2.node", "labeled.tree"]
+        self.logger.log("\t".join(headers), 'i')
+        
+        for idx in sorted(mul_trees.keys()):
+            if idx == 0: continue # Legacy buildmultrees skips the ST (Index 0)
+            
+            mt_data = mul_trees[idx]
+            
+            # Format tree string (add + to hybrid clade)
+            tree_str = mt_data.mt.to_string(internal_labels=True)
+            for spec in mt_data.h_clade:
+                # Regex: spec not followed by *
+                import re
+                tree_str = re.sub(f"{spec}(?!\\*)", f"{spec}+", tree_str)
+                tree_str = tree_str.replace("+*", "*")
+            
+            h1_name = mt_data.h1_node.name if mt_data.h1_node else "NA"
+            h2_name = mt_data.h2_node.name if mt_data.h2_node else "NA"
+            
+            line = f"{idx}\t{h1_name}\t{h2_name}\t{tree_str}"
+            self.logger.log(line, 'i')
+
+# --- Multiprocessing Workers ---
+
+_worker_data = {}
+
+def _init_collapse_worker(gts, reg, rec):
+    _worker_data['gts'] = gts
+    _worker_data['reg'] = reg
+    _worker_data['rec'] = rec
+
+def _collapse_worker(item):
+    m_idx, m_data = item
+    rec = _worker_data['rec']
+    h1_sis, h2_sis = rec.get_sister_clades(m_data)
+    
+    current_mt_groups = {}
+    for g_idx, gt_obj in _worker_data['gts'].items():
+        # Reconciler logic is pure, safe to call here
+        group_data = rec.compute_groups(gt_obj, m_data, _worker_data['reg'], h1_sis, h2_sis)
+        current_mt_groups[g_idx] = group_data
+    return m_idx, current_mt_groups
+
+# Worker for parallel filtering
+def _check_worker(payload):
+    """
+    Worker to process a single MUL-tree's checknums logic.
+    Returns: (m_idx, formatted_string_buffer, failures_dict)
+    """
+    m_idx, m_data, pickle_path, sorted_gene_ids, group_cap, is_mul_input = payload
+    
+    buffer = []
+    local_failures = {} # g_idx -> list of m_idxs (just [m_idx])
+
+    # 1. Format Tree String (Regex logic localized)
+    # We re-compile regex per worker task (negligible overhead for one regex)
+    # Pattern: \b(SpecA|SpecB)(?!\*)
+    pattern_str = r'\b(' + '|'.join(map(re.escape, m_data.h_clade)) + r')(?!\*)'
+    regex = re.compile(pattern_str)
+    
+    mt_str = m_data.mt.to_string(internal_labels=True)
+    if mt_str.endswith(';'): mt_str = mt_str[:-1]
+    
+    mt_str = regex.sub(r'\1+', mt_str)
+    mt_str = mt_str.replace("+*", "*")
+    
+    h_info = ""
+    if not is_mul_input:
+        h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
+        h2_name = m_data.h2_node.name if m_data.h2_node else "NA"
+        h_info = f"\tH1 Node:{h1_name}\tH2 Node:{h2_name}"
+    
+    buffer.append(f"# MT-{m_idx}:{mt_str}{h_info}\n")
+
+    # 2. Process Pickle Data
+    if os.path.exists(pickle_path):
+        try:
+            with open(pickle_path, 'rb') as pf:
+                current_mt_groups = pickle.load(pf)
+                
+            for g_idx in sorted_gene_ids:
+                if g_idx not in current_mt_groups: continue
+                
+                groups = current_mt_groups[g_idx]
+                num_ambig = len(groups.ambiguous_groups)
+                num_fixed = len(groups.fixed_groups)
+                total_groups = num_ambig + num_fixed
+                
+                over_cap = "N"
+                if num_ambig > group_cap:
+                    over_cap = "Y"
+                    local_failures[g_idx] = [m_idx]
+
+                combos = 1 << num_ambig 
+                buffer.append(f"{m_idx}\t{g_idx}\t{total_groups}\t{num_fixed}\t{combos}\t{over_cap}\n")
+                
+        except Exception:
+            # If pickle fails in worker, we might log or ignore? 
+            # For now, append error to buffer so it appears in file
+            buffer.append(f"# Error processing groups for MT-{m_idx}\n")
+            
+    return m_idx, "".join(buffer), local_failures
 
 class GeneTreeManager:
-    def __init__(self, config: TaskConfig, reconciler: Reconciler, logger: GrandmaLogger):
+    def __init__(self, config: TaskConfig, reconciler: Reconciler, logger: GranLogger):
         self.tcf = config
         self.reconciler = reconciler
         self.logger = logger
@@ -603,7 +744,7 @@ class GeneTreeManager:
                     registry.set_state(saved_state)
                 registry_loaded = True
             except Exception as e:
-                self.logger.write(f"# WARNING: Could not load registry pickle ({e}). Regenerating all groups.")
+                self.logger.log(f"Could not load registry pickle ({e}). Regenerating all groups.", 'w')
         
         # If we couldn't load the registry, we cannot trust the group pickles 
         # (they contain IDs that map to the old registry) -> overwrite them.
@@ -616,6 +757,22 @@ class GeneTreeManager:
         """
         step = "Collapsing gene tree groupings"
         self.logger.report_step(step, "In progress...")
+
+        n_proc = self.reconciler.num_processes
+
+        # --- CRITICAL FIX: PRIME REGISTRY ---
+        # We must register all gene tree taxa in the main registry BEFORE forking.
+        # Otherwise, workers create divergent ID mappings (e.g., 'TaxonA' is ID 5 in Worker 1, but ID 8 in Main).
+        # We assume compute_groups uses registry.get_id(name). 
+        # By iterating and 'touching' names here, we lock the IDs globally.
+        if n_proc > 1:
+            for gt in gene_trees.values():
+                for node in gt.ete_tree.traverse():
+                    if node.name:
+                        registry.get_id(node.name)
+        # This step may be costly for large GT sets - if we later fix the tips to follow an easier scheme, we can optimize this.
+        # This is because the st will have all the species
+        # ------------------------------------
         
         pickle_dir = self.tcf.pickle_dir
         pickle_dir.mkdir(parents=True, exist_ok=True)
@@ -623,7 +780,9 @@ class GeneTreeManager:
         registry_path = pickle_dir / f"{self.tcf.run_prefix}_registry.pickle"
         force_regenerate = self._check_registry_safety(registry_path, registry)
 
-        for m_idx, m_data in mul_trees.items():
+        '''#for m_idx, m_data in mul_trees.items():
+        # Disable if verbosity < 3
+        for m_idx, m_data in tqdm(mul_trees.items(), desc="Processing MUL-trees", unit="mt", disable=self.logger.verbosity < 3):
             if m_idx == 0: continue
             
             pickle_path = pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
@@ -645,20 +804,125 @@ class GeneTreeManager:
                 with open(pickle_path, 'wb') as f:
                     pickle.dump(current_mt_groups, f)
             except Exception as e:
-                self.logger.write(f"Error saving pickle {pickle_path}: {e}")
+                self.logger.log(f"saving pickle {pickle_path}: {e}", 'e')
             
-            del current_mt_groups
+            del current_mt_groups'''
+        
+        # Prepare Tasks (skip 0)
+        # Only process if pickle doesn't exist or forced
+        tasks = []
+        for m_idx, m_data in mul_trees.items():
+            if m_idx == 0: continue
+            
+            pickle_path = pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
+            if pickle_path.exists() and not self.tcf.overwrite and not force_regenerate:
+                continue
+            tasks.append((m_idx, m_data))
+
+        # Parallel Execution
+        
+        def save_result(res):
+            m_idx, groups = res
+            pickle_path = pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
+            try:
+                with open(pickle_path, 'wb') as f:
+                    pickle.dump(groups, f)
+            except Exception as e:
+                self.logger.log(f"saving pickle {pickle_path}: {e}", 'e')
+
+        if tasks:
+            if n_proc > 1:
+                # Pass gene_trees and registry once via initializer to avoid repeated pickling overhead
+                with mp.Pool(processes=n_proc, initializer=_init_collapse_worker, initargs=(gene_trees, registry, self.reconciler)) as pool:
+                    for res in tqdm(pool.imap_unordered(_collapse_worker, tasks), total=len(tasks), desc="Collapsing", unit="mt", disable=self.logger.verbosity < 3):
+                        save_result(res)
+            else:
+                _init_collapse_worker(gene_trees, registry, self.reconciler)
+                for item in tqdm(tasks, desc="Collapsing", unit="mt", disable=self.logger.verbosity < 3):
+                    res = _collapse_worker(item)
+                    save_result(res)
             
         # Save the registry state so the next run can interpret the IDs in the group pickles
         try:
             with open(registry_path, 'wb') as f:
                 pickle.dump(registry.get_state(), f)
         except Exception as e:
-            self.logger.write(f"Error saving registry pickle: {e}")
+            self.logger.log(f"saving registry pickle: {e}", 'e')
             
         self.logger.report_step(step, "Success")
 
     def filter_and_check(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]):
+        """
+        Writes checknums file and filters trees exceeding group cap.
+        [UPDATED] Uses multiprocessing to prepare string buffers.
+        """
+        step = "Filtering gene trees over group cap"
+        self.logger.report_step(step, "In progress...")
+        
+        check_path = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-checknums.txt"
+        
+        gt_failures = {} 
+        sorted_mul_ids = sorted(mul_trees.keys())
+        sorted_gene_ids = sorted(gene_trees.keys())
+
+        # Prepare Tasks
+        tasks = []
+        for m_idx in sorted_mul_ids:
+            if m_idx == 0: continue
+            
+            m_data = mul_trees[m_idx]
+            pickle_path = self.tcf.pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
+            
+            # Payload: (m_idx, m_data, pickle_path, gene_ids, cap, is_mul_input)
+            tasks.append((
+                m_idx, 
+                m_data, 
+                str(pickle_path), 
+                sorted_gene_ids, 
+                self.tcf.group_cap, 
+                self.tcf.is_mul_input
+            ))
+
+        n_proc = self.reconciler.num_processes
+        
+        # Results container: Map m_idx -> string buffer
+        results_map = {}
+
+        # Execution
+        if tasks:
+            if n_proc > 1:
+                with mp.Pool(processes=n_proc) as pool:
+                    for res in tqdm(pool.imap_unordered(_check_worker, tasks), total=len(tasks), desc="Checking", unit="mt", disable=self.logger.verbosity < 3):
+                        m_idx, buf, fails = res
+                        results_map[m_idx] = buf
+                        # Merge failures
+                        for g_idx, failures in fails.items():
+                            if g_idx not in gt_failures: gt_failures[g_idx] = []
+                            gt_failures[g_idx].extend(failures)
+            else:
+                for task in tqdm(tasks, desc="Checking", unit="mt", disable=self.logger.verbosity < 3):
+                    m_idx, buf, fails = _check_worker(task)
+                    results_map[m_idx] = buf
+                    for g_idx, failures in fails.items():
+                        if g_idx not in gt_failures: gt_failures[g_idx] = []
+                        gt_failures[g_idx].extend(failures)
+
+        # Write to file (Sequential, in order)
+        with open(check_path, 'w') as f:
+            f.write("mul.tree\tgene.tree\tgroups\tfixed\tcombinations\tover.cap.filtered\n")
+            for m_idx in sorted_mul_ids:
+                if m_idx in results_map:
+                    f.write(results_map[m_idx])
+
+        self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap")
+        
+        for g_idx in sorted(gt_failures.keys()):
+            if g_idx in gene_trees:
+                fail_count = len(gt_failures[g_idx])
+                self.logger.log(f"Gene tree on line {g_idx+1} is over the group cap in {fail_count} MTs and will be filtered.", 'w')
+                del gene_trees[g_idx]
+                
+    def filter_and_check2(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]):
         """
         Writes checknums file and filters trees exceeding group cap.
         Optimized regex formatting and pre-sorted iteration.
@@ -749,8 +1013,7 @@ class GeneTreeManager:
         for g_idx in sorted(gt_failures.keys()):
             if g_idx in gene_trees:
                 fail_count = len(gt_failures[g_idx])
-                self.logger.write(f"# WARNING: Gene tree on line {g_idx} is over the group cap in {fail_count} MTs and will be filtered.")
-                self.logger.warnings += 1
+                self.logger.log(f"Gene tree on line {g_idx} is over the group cap in {fail_count} MTs and will be filtered.", 'w')
                 del gene_trees[g_idx]
 
     def write_filtered_trees(self, gene_trees: Dict[int, SmrtTree]):

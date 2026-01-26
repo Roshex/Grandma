@@ -1,6 +1,7 @@
 import pickle
 import itertools
 import multiprocessing as mp
+from tqdm import tqdm
 from pathlib import Path
 from functools import partial
 from typing import List, Dict, Tuple, Any, Set, Union
@@ -38,11 +39,11 @@ def _worker_reconcile_single(
         if mul_idx != 0:
             p_path = Path(pickle_dir) / f"{run_prefix}_{mul_idx}_groups.pickle"
             if p_path.exists():
-                try:
+                #try:
                     with open(p_path, 'rb') as f:
                         cur_groups = pickle.load(f)
-                except Exception:
-                    return mul_idx, 9999999 
+                #except Exception:
+                #    return mul_idx, 9999999 
 
         for g_num, gt_flat in flat_gts.items():
 
@@ -493,10 +494,13 @@ class Reconciler:
         if n_proc > 1:
             with mp.Pool(processes=n_proc) as pool:
                 flat_tasks = [(k, v.mt.flat_tree) for k, v in tasks]
-                for idx, score in pool.imap_unordered(worker_func, flat_tasks):
+                #for idx, score in pool.imap_unordered(worker_func, flat_tasks):
+                iterator = pool.imap_unordered(worker_func, flat_tasks)
+                for idx, score in tqdm(iterator, total=len(tasks), desc="Scoring", unit="mt", disable=logger.verbosity < 3):
                     all_scores[idx] = score
         else:
-            for k, v in tasks:
+            #for k, v in tasks:
+            for k, v in tqdm(tasks, total=len(tasks), desc="Scoring", unit="mt", disable=logger.verbosity < 3):
                 item = (k, v.mt.flat_tree)
                 idx, score = worker_func(item)
                 all_scores[idx] = score

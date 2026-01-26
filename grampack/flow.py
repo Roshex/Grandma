@@ -11,7 +11,7 @@ from functools import partial
 from .config import GlobalContext
 from .models import Tree, TreeNode, SmrtTree, TaskResult, MulTree, HistoryType, ConcurrTask
 from .ops import CommonOps
-from .logger import GrandmaLogger
+from .logger import GranLogger
 
 class HCounterState:
     """Tracks hybridization events to detect nested patterns."""
@@ -116,7 +116,7 @@ class HCounterState:
         return list(groups.values())
 
 class FlowManager:
-    def __init__(self, ctx: GlobalContext, mode: str, logger: GrandmaLogger):
+    def __init__(self, ctx: GlobalContext, mode: str, logger: GranLogger):
         self.ctx = ctx
         self.mode = mode
         self.h_counter = HCounterState() if self.ctx.ignore_nesting or self.ctx.start_pt == 0 else HCounterState(self.ctx.history)
@@ -150,8 +150,7 @@ class FlowManager:
         cut_type, cut_val = self.ctx.cutoff
         curr_event = self.ctx.history[(i, j)]
 
-        if self.ctx.debug:
-            print(i, j, curr_event)
+        self.logger.log(f"Checking if passed for event ({i}, {j}): {curr_event}", 'd')
 
         # In split mode, always compare within current event
         if self.mode == 'split':
@@ -214,14 +213,13 @@ class FlowManager:
         input_score = res.input_score
         nonin_idx = res.mt_idx(nonin_rank)
         nonin_score = res.mt_score(nonin_rank)
-        if self.ctx.debug: self.logger.write(f"[DEBUG] Input map score: {input_score}, Best non-input map score: {nonin_score}")
+        self.logger.log(f"Best non-input index: {nonin_idx}, Best index: {best_idx}", 'd')
+        self.logger.log(f"Input map score: {input_score}, Best non-input map score: {nonin_score}", 'd')
+
         best_mt = res.mul_trees[best_idx]
         nonin_mt = res.mul_trees[nonin_idx]
-
-        if self.ctx.debug:
-            print(nonin_idx, best_idx, nonin_mt)
-            self._debug_tree("Best MulTree:", best_mt.mt.ete_tree)
-            self._debug_tree("Best Non-input MulTree:", nonin_mt.mt.ete_tree)
+        self._debug_tree("Best MulTree:", best_mt.mt.ete_tree)
+        self._debug_tree("Best Non-input MulTree:", nonin_mt.mt.ete_tree)
 
         self.ctx.history[(i, j)] = {
             'best_mt': best_mt.mt.ete_tree.write(format=8), # may be input tree
@@ -278,7 +276,7 @@ class FlowManager:
             grouped_history[i].append((j, entry))
 
         if not grouped_history:
-            self.logger.write("No history data available to plot.", level=1)
+            self.logger.log("No history data available to plot.", 'w')
             return
 
         sorted_iters = sorted(grouped_history.keys())
@@ -401,13 +399,12 @@ class FlowManager:
         plt.tight_layout()
         output_file = self.ctx.root_dir / 'metrics_plot.png'
         plt.savefig(output_file, dpi=600)
-        self.logger.write(f'Plot saved to {output_file}')
+        self.logger.log(f'Plot saved to {output_file}', 'i')
         plt.close()
 
-    def _debug_tree(self, title: str, ete_tree: Tree) -> None:
-        if self.ctx.debug:
-            print(f"\n[DEBUG] {title}")
-            print(ete_tree.get_ascii(show_internal=True, attributes=['name']))
+    def _debug_tree(self, title: str, ete_tree: Tree, key='d') -> None:
+        self.logger.log(f"{title}", key)
+        self.logger.log(ete_tree.get_ascii(show_internal=True, attributes=['name']), key)
 
     # --- Handlers for the Full mode ---
 
@@ -425,6 +422,18 @@ class FlowManager:
     def check_and_fix_nested(self, multree: MulTree, genetrees: List[SmrtTree], iter: int, engine_callback: callable) -> None:
         """Original nested fix logic maintained, but uses unified preparer."""
 
+        # Helper to find nodes even if they have been renamed (e.g. x.1 -> x.1.1)
+        def _find_node_fuzzy(tree_obj, name):
+            # 1. Try exact match
+            matches = tree_obj.search_nodes(name=name)
+            if matches: return matches[0]
+            # 2. Try prefix match (for evolved lineages)
+            # This is slower but necessary for nested chains
+            for l in tree_obj.iter_leaves():
+                if l.name.startswith(name + "."):
+                    return l
+            return None
+            
         if self.ctx.ignore_nesting:
             return
         
@@ -442,9 +451,8 @@ class FlowManager:
                 }
             })
 
-            if self.ctx.debug:
-                self.logger.write(f'\nH1: {h1_node.name} {h1_leaves} | H2: {h2_node.name} {h2_leaves}')
-                self.logger.write(f'Current h_counter: {self.h_counter.h_counter}')
+            self.logger.log(f'\nH1: {h1_node.name} {h1_leaves} | H2: {h2_node.name} {h2_leaves}', 'd')
+            self.logger.log(f'Current h_counter: {self.h_counter.h_counter}', 'd')
 
             h1_sis = h1_node.get_sisters()[0]
             h2_sis = h2_node.get_sisters()[0]
@@ -456,9 +464,8 @@ class FlowManager:
                 sis_leaves = h_sis_node.get_leaf_names()
                 h_group_key = self._find_subset_key(sis_leaves, self.h_counter.h_counter)
 
-                if self.ctx.debug:
-                    self.logger.write(f'\nChecking sister node: {h_sis_node.name} with leaves {sis_leaves}')
-                    self.logger.write(f'H Group Key found: {h_group_key}')
+                self.logger.log(f'\nChecking sister node: {h_sis_node.name} with leaves {sis_leaves}', 'd')
+                self.logger.log(f'H Group Key found: {h_group_key}', 'd')
 
                 if h_group_key is None:
                     continue
@@ -467,41 +474,52 @@ class FlowManager:
                     continue
 
                 for targets in self.h_counter.h_counter[h_group_key]:
-                    filter_base = {n.split('.', 1)[0] for n in sis_leaves}
-                    filtered_targets = [t for t in targets if t.split('.', 1)[0] in filter_base]
+                    filter_base = {self._get_base_name(n) for n in sis_leaves}
+                    filtered_targets = [t for t in targets if self._get_base_name(t) in filter_base]
 
                     if not filtered_targets or set(filtered_targets) == set(sis_leaves):
                         continue
 
-                    multree = curr_mt.mt.ete_tree
+                    mt_tree = curr_mt.mt.ete_tree
 
-                    target_lvs = [multree.search_nodes(name=t)[0] for t in filtered_targets]
-                    target_node = multree.get_common_ancestor(target_lvs) if len(target_lvs) > 1 else target_lvs[0]
+                    target_lvs = []
+                    for t in filtered_targets:
+                        found = _find_node_fuzzy(mt_tree, t)
+                        if found: target_lvs.append(found)
+                    
+                    if not target_lvs:
+                        continue # Skip if targets are truly lost
+
+                    #target_lvs = [multree.search_nodes(name=t)[0] for t in filtered_targets]
+                    target_node = mt_tree.get_common_ancestor(target_lvs) if len(target_lvs) > 1 else target_lvs[0]
 
                     if any(ft in h1_leaves or ft in h2_leaves for ft in filtered_targets):
                         continue
 
-                    if self.ctx.debug:
-                        self.logger.write(f"\nOriginal targets: {targets}")
-                        self.logger.write(f"Filtered targets: {filtered_targets}")
-                        self.logger.write(f"Target leaves: {target_lvs}")
+                    self.logger.log(f"\nOriginal targets: {targets}", 'd')
+                    self.logger.log(f"Filtered targets: {filtered_targets}", 'd')
+                    self.logger.log(f"Target leaves: {target_lvs}", 'd')
 
                     # Find the sister of the target nodes in the multree
-                    target_sis = target_node.get_sisters()[0]
+                    sisters = target_node.get_sisters()
+                    if not sisters:
+                        continue
+                    target_sis = sisters[0]
+                    
                     target_sis_lvs = target_sis.get_leaf_names()
                     # Check if base names match: target_sis_leaves and H1_leaves
-                    base_tsl = {t.split('.', 1)[0] for t in target_sis_lvs}
-                    base_h1l = {h.split('.', 1)[0] for h in h1_leaves}
+                    base_tsl = {self._get_base_name(t) for t in target_sis_lvs}
+                    base_h1l = {self._get_base_name(h) for h in h1_leaves}
                     if base_h1l == base_tsl:
                         continue
 
-                    self.logger.write(f"\n### Nested Hybridization Detected ###\n")
+                    self.logger.log(f"\n# --- Nested Hybridization Detected --- #\n", 'i')
 
                     event_id += 1
                     found_nested_event = True
                     fix_dir = self.ctx.root_dir / f'{iter}.{event_id}' / 'output'
 
-                    res = engine_callback(curr_mt.tree, curr_gts, 
+                    res = engine_callback(curr_mt.mt, curr_gts, 
                                         ",".join(h_main_node.get_leaf_names()), 
                                         ",".join(filtered_targets),
                                         fix_dir
@@ -512,6 +530,7 @@ class FlowManager:
                     )
 
                     # Update hybrid counter for the new nested event
+                    # Important: curr_mt should be the new MulTree object, so that h1_node is valid
                     self.h_counter.update({
                         len(self.h_counter.h_counter): {
                             "h1.node": curr_mt.h1_node.get_leaf_names(),
@@ -523,10 +542,14 @@ class FlowManager:
 
                 if found_nested_event: break
             if not found_nested_event: break
-        self.logger.write(f"Iteration {iter} found {event_id} event(s) during nested checks.", level=1)
+        self.logger.log(f"Iteration {iter} found {event_id} event(s) during nested checks.", 'i')
     
-    def _rename_best_mt(self, res: TaskResult, best_mt_idx: int) -> Tuple[SmrtTree, List[str], Dict[str, str]]:
-
+    def _rename_best_mt(self, res: TaskResult, best_mt_idx: int) -> Tuple[MulTree, List[str], Dict[str, str]]:
+        """
+        Renames the best MulTree's hybrid lineages for the next iteration.
+        Returns: (best_mt, disallowed_leaves, distance_map)
+        best_mt is modified in place!
+        """
         best_mt = res.mul_trees[best_mt_idx]
 
         h1_node = best_mt.h1_node
@@ -549,7 +572,7 @@ class FlowManager:
 
         self._debug_tree("Renamed MT for next iteration:", best_mt.mt.ete_tree)
         
-        return best_mt.mt, disallowed_lvs, distance_map
+        return best_mt, disallowed_lvs, distance_map
 
     def _partition_gt_leaves(self, res: TaskResult, best_mt_idx: int, disallowed_lvs: List[str], distance_map: Dict[str, str]) -> List[Tree]:
 
@@ -563,7 +586,6 @@ class FlowManager:
             gt_ete = gts[g_idx].ete_tree.copy() # Operations on copies
 
             if g_idx in debug_sample:
-                print(f"ReconResult Map: {map_obj}")
                 self._debug_tree(f"Original GT {g_idx}:", gt_ete)
 
             for l in gt_ete.iter_leaves():
@@ -581,9 +603,9 @@ class FlowManager:
             self, i: int, res: TaskResult,
             engine_callback: callable,
             iter_out: Path,
-            iter_logger: GrandmaLogger,
+            iter_logger: GranLogger,
             j: int = 0
-        ) -> Optional[Tuple[SmrtTree, Dict[int, SmrtTree]]]:
+        ) -> Optional[Tuple[MulTree, Dict[int, SmrtTree]]]:
         """
         Handles the end of a 'Full' mode iteration.
         Returns: (next_st, next_gts) or None if stopping.
@@ -601,12 +623,11 @@ class FlowManager:
         # Check if passed cutoff
         passed = self._check_if_passed(i, j)
         if not passed:
-            self.logger.write(f"Cutoff reached: no parsimonious events found at Iteration {i}.", level=1)
+            self.logger.log(f"Cutoff reached: no parsimonious events found at Iteration {i}.", 'i')
             return next_mt, None
         
         if j == 0:
-            self.logger.write(f"Reticulation found at Iteration {i} with score {res.mt_score()}.", level=1)
-
+            self.logger.log(f"Reticulation found at Iteration {i} with score {res.mt_score()}.", 'i')
         # Rename Trees for Next Iteration
         new_gts_list = self._partition_gt_leaves(res, nonin_idx, disallowed_lvs, distance_map)
 
@@ -621,13 +642,14 @@ class FlowManager:
             )
 
         # Convert list back to Dict for GrandmaTree consumption
-        next_st = SmrtTree(tree_obj=next_mt.ete_tree)
         next_gts = {idx: SmrtTree(tree_obj=gt) for idx, gt in enumerate(new_gts_list)}
+        # Refresh the SmrtTree wrapper of MulTree
+        next_mt.mt.refresh()
         
         # Write handoff files for resume support
-        CommonOps.write_handoff_files(iter_out.parent, next_mt.ete_tree, new_gts_list)
+        CommonOps.write_handoff_files(iter_out.parent, next_mt.mt.ete_tree, new_gts_list)
         
-        return next_st, next_gts
+        return next_mt, next_gts
 
     # --- Handlers for the Split mode ---
     
@@ -740,12 +762,11 @@ class FlowManager:
             if n_up:
                 n_up.delete() # delete() removes the internal node and connects children to parent
 
-        if self.ctx.debug:
-            self._debug_tree("Inner Species Tree (Hybrid Clade):", inner_st_obj)
-            self._debug_tree("Outer Species Tree (Backbone):", outer_st_obj)
-            print(f'len(inner_gts)={len(inner_gts)}, len(outer_gts)={len(outer_gts)}')
+        self._debug_tree("Inner Species Tree (Hybrid Clade):", inner_st_obj)
+        self._debug_tree("Outer Species Tree (Backbone):", outer_st_obj)
+        self.logger.log(f'len(inner_gts)={len(inner_gts)}, len(outer_gts)={len(outer_gts)}', 'd')
 
-        # --- 4. Queue Tasks with Binary IDs ---
+        # --- Queue Tasks with Binary IDs ---
         # Only queue tasks if species tree has enough leaves to be valid
         next_tasks = []
         if len(inner_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(inner_gts) > 0:
@@ -757,7 +778,7 @@ class FlowManager:
     def handle_split_result(
             self, bin_id: str, res: TaskResult,
             iter_out: Path,
-            iter_logger: GrandmaLogger
+            iter_logger: GranLogger
         ) -> List[ConcurrTask]:
         """
         Processes a split worker result.
@@ -773,35 +794,28 @@ class FlowManager:
 
         # 2. Validation & Cutoff
         if not self._check_if_passed(depth, idx):
-            self.logger.write(f"Cutoff reached: no parsimonious events found at Depth {depth}, Index {idx}.", level=1)
+            self.logger.log(f"Cutoff reached: no parsimonious events found at Depth {depth}, Index {idx}.", 'i')
             return []
 
-        self.logger.write(f"Reticulation found at Depth {depth}, Index {idx} with score {res.mt_score()}.", level=1)
+        self.logger.log(f"Reticulation found at Depth {depth}, Index {idx} with score {res.mt_score()}.", 'i')
         
         # 3. Extract Subproblems
-        #try:
-        next_tasks = self.extract_subproblems(res, depth, idx)
-        #except Exception as e:
-        #    logger.write(f"Error extracting subproblems at Depth {depth}, Index {idx}: {e}", level=1)
-            #print(res)
-        #    return []
-        
-        # 4. Update History
-        #self.update_history(depth, {idx: res})
+        try:
+            next_tasks = self.extract_subproblems(res, depth, idx)
+        except Exception as e:
+            self.logger.log(f"extracting subproblems at Depth {depth}, Index {idx}: {e}", 'e')
 
         # Write handoff files for resume support
         for task_st, task_gts, task_id in next_tasks:
             task_out = iter_out.parent / task_id
             task_out.mkdir(parents=True, exist_ok=True)
-            print(f"Written handoff files for task {task_id} at {task_out.relative_to(iter_out.parent.parent.parent)}, with {len(task_gts)} GTs.")
+            self.logger.log(f"Written handoff files for task {task_id} at {task_out.relative_to(iter_out.parent.parent.parent)}, with {len(task_gts)} GTs.", 's')
             CommonOps.write_handoff_files(task_out, task_st.ete_tree, [gt.ete_tree for gt in task_gts.values()])
 
         self.logger = backup_logger
         return next_tasks
 
-    # --- Post-processing for Split mode ---
-
-    def glue_split_results(self, output_dir: Path, original_st_path: Path, logger: GrandmaLogger) -> None:
+    def glue_split_results(self, output_dir: Path, original_st_path: Path, logger: GranLogger) -> None:
         """
         Recombines recursive sub-analyses into a single global hybridization record.
         Iterates reverse (deepest first), updating leaf names with .1/.2 suffixes.
@@ -812,7 +826,7 @@ class FlowManager:
         self.logger.report_step(step, "In progress...", start=True)
 
         if not self.ctx.history:
-            self.logger.write("No reticulations found. Nothing to glue.", level=1)
+            self.logger.log("No reticulations found. Nothing to glue.", 'i')
             return
 
         # 1. Load Base Species Tree
@@ -823,8 +837,7 @@ class FlowManager:
                 # Use GrandmaTree wrapper for robust newick parsing
                 base_st = SmrtTree(newick=st_text)
         except Exception as e:
-            self.logger.write(f"Error loading original ST for gluing: {e}", level=1)
-            return
+            self.logger.log(f"loading original ST for gluing: {e}", 'e')
 
         # 2. Sort Events: Reverse order (Deepest depth/index first)
         # self.history keys are (depth, idx) tuples.
@@ -873,14 +886,14 @@ class FlowManager:
                     h2_leaves_local.append(n)
             
             if not h2_leaves_local:
-                self.logger.write(f"Warning: Could not find H2 leaves in event {key} tree structure.", level=1)
+                self.logger.log(f"Could not find H2 leaves in event {key} tree structure.", 'w')
                 continue
             
             # Get Sister of H2 in local tree
             local_h2_node = local_mt.get_common_ancestor(h2_leaves_local) if len(h2_leaves_local) > 1 else h2_leaves_local[0]
             sisters = local_h2_node.get_sisters()
             if not sisters:
-                self.logger.write(f"Warning: H2 node in event {key} has no sister (Root?).", level=1)
+                self.logger.log(f"H2 node in event {key} has no sister (Root?).", 'w')
                 continue
             
             # Extract base names of the sister clade
@@ -891,7 +904,7 @@ class FlowManager:
             target_sister_global = find_clade_root(current_tree, local_sister_leaves)
 
             if not h1_node_global or not target_sister_global:
-                self.logger.write(f"Warning: Could not map event {key} to global tree. Skipping.", level=1)
+                self.logger.log(f"Could not map event {key} to global tree. Skipping.", 'w')
                 continue
 
             # C. Grafting Operation
@@ -949,7 +962,7 @@ class FlowManager:
         self.logger.report_step(step, "Success: Merged trees written.")
         
         # replace .1 with + and .2 with *, and log to logger
-        self.logger.write(f"Merged inferred tree: {sl_str.replace('.1', '+').replace('.2', '*')}")
+        self.logger.log(f"Merged inferred tree: {sl_str.replace('.1', '+').replace('.2', '*')}", 'i')
 
     def fast_forward_split(self, current_tasks: List[ConcurrTask]) -> List[ConcurrTask]:
         """
@@ -957,8 +970,8 @@ class FlowManager:
         Uses BFS to traverse solved nodes and identify the frontier.
         """
 
-        print("Fast-forwarding Split tasks based on history...")
-        print(f"Current tasks: {current_tasks}, output_dir: {self.ctx.root_dir}")
+        self.logger.log("Fast-forwarding Split tasks based on history...", 'i')
+        self.logger.log(f"Current tasks: {current_tasks}, output_dir: {self.ctx.root_dir}", 'd')
 
         queue = [(current_tasks[0][2], None)] # Start with Root ID (e.g. "0")
         real_tasks = []
@@ -975,7 +988,7 @@ class FlowManager:
                 c1 = f"{depth+1}.{idx*2}"
                 c2 = f"{depth+1}.{idx*2+1}"
 
-                print(f"Task {nid} done. Checking children: {c1}, {c2} in {self.ctx.root_dir / nid}" )
+                self.logger.log(f"Task {nid} done. Checking children: {c1}, {c2} in {self.ctx.root_dir / nid}", 'd')
                 
                 # If child dir exists, add to traversal queue
                 if (self.ctx.root_dir / nid / c1 / "multree.tre").exists():
@@ -986,24 +999,24 @@ class FlowManager:
                 # Task NOT in history -> It is a frontier task to run.
                 # Load inputs from disk
                 p_nid = q[1]
-                print(f"Queueing frontier task: {nid} (child of {p_nid})")
+                self.logger.log(f"Queueing frontier task: {nid} (child of {p_nid})", 'd')
 
                 st_path = self.ctx.root_dir / p_nid / nid / "multree.tre"
                 gt_path = self.ctx.root_dir / p_nid / nid / "genetrees.txt"
                 
-                print(f"Looking for ST at {st_path}, GTs at {gt_path}")
+                self.logger.log(f"Looking for ST at {st_path}, GTs at {gt_path}", 'd')
 
                 if st_path.exists() and gt_path.exists():
                     real_tasks.append((st_path, gt_path, nid))
-                    self.logger.write(f"Resuming sub-problem: {nid}", level=2)
+                    self.logger.log(f"Resuming sub-problem: {nid}", 's')
                 else:
                     # Fallback: if root is missing inputs but passed in current_tasks
                     if nid == str(current_tasks[0][2]):
-                        print(f"Using provided inputs for root task {nid}, {current_tasks}")
+                        self.logger.log(f"Using provided inputs for root task {nid}, {current_tasks}", 's')
                         real_tasks.extend(current_tasks)
                     else:
-                        self.logger.write(f"Missing inputs for resume task {nid}. Skipping.", level=1)
+                        self.logger.log(f"Missing inputs for resume task {nid}. Skipping.", 'w')
 
-        print(f"Fast-forwarded tasks: {real_tasks}")
+        self.logger.log(f"Fast-forwarded tasks: {real_tasks}", 'd')
 
         return real_tasks
