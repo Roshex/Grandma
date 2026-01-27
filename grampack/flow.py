@@ -779,7 +779,7 @@ class FlowManager:
             self, bin_id: str, res: TaskResult,
             iter_out: Path,
             iter_logger: GranLogger
-        ) -> List[ConcurrTask]:
+        ) -> Optional[List[ConcurrTask]]:
         """
         Processes a split worker result.
         Returns: List of new sub-tasks or empty list.
@@ -795,7 +795,7 @@ class FlowManager:
         # 2. Validation & Cutoff
         if not self._check_if_passed(depth, idx):
             self.logger.log(f"Cutoff reached: no parsimonious events found at Depth {depth}, Index {idx}.", 'i')
-            return []
+            return None # Event not taken!
 
         self.logger.log(f"Reticulation found at Depth {depth}, Index {idx} with score {res.mt_score()}.", 'i')
         

@@ -496,11 +496,11 @@ class Reconciler:
                 flat_tasks = [(k, v.mt.flat_tree) for k, v in tasks]
                 #for idx, score in pool.imap_unordered(worker_func, flat_tasks):
                 iterator = pool.imap_unordered(worker_func, flat_tasks)
-                for idx, score in tqdm(iterator, total=len(tasks), desc="Scoring", unit="mt", disable=logger.verbosity < 3):
+                for idx, score in tqdm(iterator, total=len(tasks), desc="Scoring   ", unit="mt", disable=logger.verbosity < 3):
                     all_scores[idx] = score
         else:
             #for k, v in tasks:
-            for k, v in tqdm(tasks, total=len(tasks), desc="Scoring", unit="mt", disable=logger.verbosity < 3):
+            for k, v in tqdm(tasks, total=len(tasks), desc="Scoring   ", unit="mt", disable=logger.verbosity < 3):
                 item = (k, v.mt.flat_tree)
                 idx, score = worker_func(item)
                 all_scores[idx] = score

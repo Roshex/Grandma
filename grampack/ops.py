@@ -892,7 +892,7 @@ class GeneTreeManager:
         if tasks:
             if n_proc > 1:
                 with mp.Pool(processes=n_proc) as pool:
-                    for res in tqdm(pool.imap_unordered(_check_worker, tasks), total=len(tasks), desc="Checking", unit="mt", disable=self.logger.verbosity < 3):
+                    for res in tqdm(pool.imap_unordered(_check_worker, tasks), total=len(tasks), desc="Checking  ", unit="mt", disable=self.logger.verbosity < 3):
                         m_idx, buf, fails = res
                         results_map[m_idx] = buf
                         # Merge failures
@@ -900,7 +900,7 @@ class GeneTreeManager:
                             if g_idx not in gt_failures: gt_failures[g_idx] = []
                             gt_failures[g_idx].extend(failures)
             else:
-                for task in tqdm(tasks, desc="Checking", unit="mt", disable=self.logger.verbosity < 3):
+                for task in tqdm(tasks, desc="Checking  ", unit="mt", disable=self.logger.verbosity < 3):
                     m_idx, buf, fails = _check_worker(task)
                     results_map[m_idx] = buf
                     for g_idx, failures in fails.items():

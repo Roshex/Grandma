@@ -5,6 +5,7 @@ import random
 import multiprocessing as mp
 from functools import partial
 from pathlib import Path
+from tqdm import tqdm
 from typing import Optional, Tuple, Dict, Any, List, Union
 
 from .config import InitParser, GlobalContext, TaskConfig, GranWriter
@@ -17,6 +18,25 @@ from .reconcile import Reconciler
 
 import psutil
 HAS_PSUTIL = psutil is not None
+
+import multiprocessing.pool
+
+# --- Helper Classes for Nested Parallelism ---
+class NoDaemonProcess(multiprocessing.Process):
+    """A Process that can spawn children."""
+    def _get_daemon(self):
+        return False
+    def _set_daemon(self, value):
+        pass
+    daemon = property(_get_daemon, _set_daemon)
+
+class NoDaemonPool(multiprocessing.pool.Pool):
+    """A Pool that creates NoDaemonProcesses, allowing nested pools."""
+    def Process(self, *args, **kwds):
+        proc = super(NoDaemonPool, self).Process(*args, **kwds)
+        proc.__class__ = NoDaemonProcess
+        return proc
+
 
 # --- Top-level Helper Functions --- #
 # --- Standalone workers function supporting parallel processing --- #
@@ -267,7 +287,7 @@ class Engine:
         try:
             while True:
                 if i >= max_iter:
-                    self.flow_logger.log(f"Finished maximum iterations ({max_iter}). Terminating.", 'i')
+                    self.flow_logger.log(f"Reached maximum valid events set by user ({max_iter}). Terminating.", 'i')
                     break
 
                 self.flow_logger.log(f'\n# ----- Iteration {i} {iter_msg} -----\n#', 'i')
@@ -335,6 +355,14 @@ class Engine:
         Each depth of the recursion tree is dispatched to the process pool.
         Tracking should be Process-Safe and Unified.
         Matches the recursive sub-problem architecture: folder 'Depth.Index' (as tracked in 'history').
+        Logic:
+        1. Few Tasks (< num_procs): Run tasks in parallel, give each task MULTIPLE cores (Low-level).
+        2. Many Tasks (> num_procs): Run many tasks in parallel, give each task ONE core (High-level).
+        Even though both small and large tasks get about the same resources, in practice, for some
+        reason this is faster than:
+        1. running each sequentially with all cores, or
+        2. scheduling batches based on task weights (e.g., number of species leaves).
+        Possibly due to overhead of scheduling and load balancing.
         """
         self.flow_logger.log("Starting Parallelized Split Mode (Binary Recursive Search)", 'i')
         
@@ -344,17 +372,17 @@ class Engine:
         current_tasks = [root_task]
         max_iter = self.ctx.max_iter
         
-        n_proc = self.ctx.num_processes
-        self.ctx = self.ctx.update(num_processes=1)  # Workers run single-threaded
+        total_procs = self.ctx.num_processes
         
         # Fast-Forward (Resume) Logic
         # If we have history, we might have completed the root or others.
         # We need to reconstruct the frontier.
+        events_found = 0
         if self.ctx.history:
             self.flow_logger.log(f"History found ({len(self.ctx.history)} entries). Checking for resume...", 'i')
             current_tasks = self.flow_mgr.fast_forward_split(current_tasks)
+            events_found = 0 # to be implemented !!!
 
-        pool = mp.Pool(processes=n_proc)
         depth = 0
         
         # Adjust depth display if resuming deep
@@ -363,22 +391,62 @@ class Engine:
 
         while current_tasks:
 
-            if depth >= max_iter:
-                self.flow_logger.log(f"Reached maximum depth ({max_iter}). Terminating.", 'i')
+            if events_found >= max_iter:
+                self.flow_logger.log(f"Reached maximum valid events set by user ({events_found} actual >= {max_iter}). Terminating.", 'i')
+                break
+
+            num_tasks = len(current_tasks)
+            if num_tasks == 0:
                 break
 
             #self.flow_logger.write(f"Dispatching {len(current_tasks)} sub-problems at Depth {depth}...", level=1)
             #step = f"Processing Depth {depth}"
             #self.flow_logger.report_step(step, "", start=True)
-            self.flow_logger.report_step(f"Depth {depth}", f"Dispatching {len(current_tasks)} tasks", start=True)
+            self.flow_logger.report_step(f"Depth {depth}", f"Dispatching {num_tasks} tasks", start=True)
 
+            # --- DYNAMIC CALCULATION ---
+            total_procs = self.ctx.num_processes
+            # Don't exceed available cores for outer pool
+            outer_pool_size = min(num_tasks, total_procs)
+            # How many cores does each task get? (Distribute remainders)
+            # e.g., 8 cores, 2 tasks -> inner = 4. 
+            # e.g., 8 cores, 20 tasks -> inner = 1.
+            inner_pool_size = max(1, total_procs // outer_pool_size)
+            reminder = total_procs % outer_pool_size
+
+            reminder_str = f" (+1 for {reminder} tasks)" if reminder > 0 else ""
+            self.flow_logger.log(f"Resource Strategy: {outer_pool_size} Parallel Tasks x {inner_pool_size}{reminder_str} Cores-per-Task", 'i')
+
+            # Configure the TaskConfig for the workers
+            # Each worker sees 'num_processes' = inner_pool_size
+            ctx_standard = self.ctx.update(num_processes=inner_pool_size)
+            ctx_remainder = self.ctx.update(num_processes=inner_pool_size + 1)
+
+            # Prepare Batch
+            batch_args = []
+            for i, payload in enumerate(current_tasks):
+                # Distribute remainder cores to the first 'reminder' tasks
+                if i < reminder:
+                    ctx_to_use = ctx_remainder
+                else:
+                    ctx_to_use = ctx_standard
+                batch_args.append((
+                    payload,  
+                    ctx_to_use,
+                    perm_tcf, 
+                    self.ctx.verbosity
+                ))
+
+            # EXECUTE BATCH
             # Dispatch workers (Workers do not have access to flow_mgr)
-            worker_func = partial(task_worker, context=self.ctx, config=perm_tcf)
-            # Map returns list of: (id, res, updates, logger)
-            batch_results = pool.map(worker_func, current_tasks)
+            # Use NoDaemonPool to allow the workers to spawn their own internal pools
+            # if inner_pool_size > 1.
+            with NoDaemonPool(processes=outer_pool_size) as pool:
+                # starmap blocks until all tasks in this batch are done
+                batch_results = pool.starmap(task_worker, batch_args)
 
-            self.flow_logger.report_step(f"Depth {depth}", f"Success: Extracting new sub-problems.")
-            
+            self.flow_logger.report_step(f"Depth {depth}", f"Success: Analyzed {num_tasks} nodes.")
+
             # Optimizing the Config (The "Split" Trick)
             # If this is the first run, the workers just parsed the ploidies/h-nodes.
             # We grab the updates from the *first valid result* and update perm_tcf.
@@ -398,18 +466,29 @@ class Engine:
                 # Note: We reconstruct path here to avoid passing it back from workers
                 iter_logger = GranLogger(iter_log, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug,
                                          parent_logger=self.flow_logger, clear_log=False)
-                next_tasks.extend(
-                    self.flow_mgr.handle_split_result(
+                extracts = self.flow_mgr.handle_split_result(
                         task_id, res,
                         iter_out = self.ctx.root_dir / task_id / "output",
                         iter_logger = iter_logger
-                    )
                 )
+
+                if extracts is None:
+                    continue # No events found, no new tasks
+                else:
+                    next_tasks.extend(extracts)
+                    # Even if list is empty, we found a parsimonious event
+                    events_found += 1
+
+            # Sort new tasks by num of species tree leaves [largest first - more cores to bigger problems]
+            # Done after the loop guarantees a SmrtTree object for sorting!
+            next_tasks.sort(key=lambda x: len(x[0].ete_tree.get_leaves()), reverse=True)
+            # Debug: print task IDs and sizes
+            self.flow_logger.log(f"Generated {len(next_tasks)} tasks for Depth {depth + 1}.", 'd')
+            for t in next_tasks:
+                self.flow_logger.log(f"  Task ID: {t[2]}, Number of Species Leaves: {len(t[0].ete_tree.get_leaves())}", 'd')
 
             current_tasks = next_tasks
             depth += 1
-
-        pool.close(); pool.join()
 
         self.flow_mgr.glue_split_results(self.ctx.root_dir, self.tcf.st, self.flow_logger)
 

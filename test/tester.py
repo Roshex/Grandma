@@ -43,7 +43,7 @@ if __name__ == "__main__":
         o_new = path_manual / 'o_new'
 
         #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}/ {other_args} --debug --plot -v 3", "new") # --debug --plot
-        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug --plot -v 3 -p 4 -i 2", "new") #--plot --start 1
+        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug --plot -v 3 -p 5 -i 2", "new") #--plot --start 1
         #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_deep/ {other_args} -m full --debug --plot -v 3", "new")
 
         #time_tool(f"python {old_tool} -g {g} -s {s} -o {o_old}_v0 --overwrite {other_args} --maps -v 0", "old")
@@ -101,6 +101,140 @@ if __name__ == "__main__":
         gt_file = out_dir / str(i-1) / 'genetrees.txt'
 
 
+
+    @staticmethod
+    def _schedule_batches(tasks: list, total_cores: int) -> List[List[Tuple[Any, int]]]:
+        """
+        Implements the "Normalized Smallest-First" heuristic.
+        Returns a list of batches. 
+        Each batch is a list of tuples: (TaskPayload, NumCores).
+        """
+        if not tasks: return []
+
+        # 1. Calculate Weights
+        def get_weight(t):
+            if hasattr(t[0], 'ete_tree'): return len(t[0].ete_tree.get_leaves())
+            return 99999 # Root/Path tasks act as massive weights
+        
+        # Store tuples of (OriginalTask, Weight)
+        weighted_tasks = [(t, get_weight(t)) for t in tasks]
+        
+        # 2. Sort Smallest to Largest (Crucial for this heuristic)
+        weighted_tasks.sort(key=lambda x: x[1])
+        
+        weights = [x[1] for x in weighted_tasks]
+        min_w = weights[0] if weights else 1
+        if min_w == 0: min_w = 1 # Safety
+
+        # 3. Normalize
+        norm_weights = [w / min_w for w in weights]
+
+        batches = []
+        current_batch_tasks = []    # List of (Task, Weight)
+        current_norm_sum = 0
+
+        # 4. Grouping (Bin Packing based on Normalized Weights)
+        for i, norm_w in enumerate(norm_weights):
+            
+            # If adding this task exceeds core count...
+            # (And the batch isn't empty - if it is empty, we must add the huge task anyway)
+            if (current_norm_sum + norm_w > total_cores) and current_batch_tasks:
+                # Close current batch
+                batches.append(current_batch_tasks)
+                # Start new
+                current_batch_tasks = []
+                current_norm_sum = 0
+            
+            current_batch_tasks.append(weighted_tasks[i])
+            current_norm_sum += norm_w
+
+        if current_batch_tasks:
+            batches.append(current_batch_tasks)
+
+        # 5. Allocate Cores within Batches
+        final_schedule = []
+
+        for batch in batches:
+            # batch is list of (Task, Weight)
+            batch_orig_weights = [x[1] for x in batch]
+            batch_total_w = sum(batch_orig_weights)
+            
+            # Calculate raw shares
+            if batch_total_w == 0:
+                # All 0 weights? Even split.
+                raw_shares = [total_cores / len(batch)] * len(batch)
+            else:
+                raw_shares = [(w / batch_total_w) * total_cores for w in batch_orig_weights]
+            
+            # Rounding logic: max(1, round)
+            core_counts = [max(1, int(round(s))) for s in raw_shares]
+            
+            # Fix Rounding Errors (Sum must equal Total Cores)
+            current_sum = sum(core_counts)
+            diff = total_cores - current_sum
+            
+            if diff != 0:
+                # Apply difference to the LARGEST task in the batch
+                # (The big task absorbs the floating point variance)
+                max_idx = batch_orig_weights.index(max(batch_orig_weights))
+                
+                # Ensure we don't reduce a task to < 1 core
+                if diff < 0 and core_counts[max_idx] + diff < 1:
+                    # Edge case: fallback to simply adding/subtracting from end
+                    for i in range(abs(diff)):
+                        idx = i % len(batch)
+                        if diff > 0: core_counts[idx] += 1
+                        else: core_counts[idx] = max(1, core_counts[idx] - 1)
+                else:
+                    core_counts[max_idx] += diff
+
+            # Pack into result structure
+            batch_result = []
+            for i, (task, _) in enumerate(batch):
+                batch_result.append((task, core_counts[i]))
+            
+            final_schedule.append(batch_result)
+
+        return final_schedule
+
+            """# --- SETUP PHASE ---
+            # Sort Tasks: Heaviest First
+            def get_complexity(t):
+                if hasattr(t[0], 'ete_tree'): return len(t[0].ete_tree.get_leaves())
+                return 99999
+            
+            current_tasks.sort(key=get_complexity, reverse=True)
+            self.flow_logger.report_step(f"Depth {depth}", f"Processing {len(current_tasks)} tasks", start=True)
+
+            # --- PHASE 1: EXECUTION (The Queue Loop) ---
+
+            # --- 1. CALL THE HEURISTIC ---
+            # Returns: [[(TaskA, 3), (TaskB, 5)], [(TaskC, 8)]]
+            batches = self._schedule_batches(current_tasks, total_procs)
+
+            # --- 2. EXECUTE BATCHES ---
+            depth_raw_results = []
+            
+            for b_idx, batch in enumerate(batches):
+                
+                # Logging
+                cores_map = [x[1] for x in batch]
+                self.flow_logger.log(f"  Batch {b_idx+1}/{len(batches)}: Running {len(batch)} tasks. Cores: {cores_map}", 'i')
+
+                # Prepare Arguments
+                batch_args = []
+                for payload, p_count in batch:
+                    # Update Configs per Task
+                    w_ctx = self.ctx.update(num_processes=p_count)
+                    batch_args.append((payload, w_ctx, perm_tcf, self.ctx.verbosity))
+
+                # EXECUTE BATCH
+                # Dispatch workers (Workers do not have access to flow_mgr)
+                # Use NoDaemonPool to allow the workers to spawn their own internal pools
+                # if inner_pool_size > 1.
+                with NoDaemonPool(processes=len(batch)) as pool:
+                    # starmap blocks until all tasks in this batch are done
+                    batch_results = pool.starmap(task_worker, batch_args)"""
 
 
     '''
