@@ -26,7 +26,7 @@ class GranLogger:
                  parent_logger: 'GranLogger' = None, clear_log: bool = True):
         self.log_file = log_file
         self.verbosity = verbosity    # Controls screen output (0-4)
-        self.debug_mode = debug       # Controls if 'd' messages go to file
+        self.debug = debug       # Controls if 'd' messages go to file
         self.no_log = no_log          # Controls if ANY messages go to file
         self.parent_logger = parent_logger
         self.start_time = time.time()

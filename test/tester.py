@@ -42,8 +42,8 @@ if __name__ == "__main__":
         o_old = path_manual / 'o_old/'
         o_new = path_manual / 'o_new'
 
-        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}/ {other_args} --debug --plot -v 3 -p 4", "new") # --debug --plot
-        #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug --plot -v 3", "new") #--plot --start 1
+        #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}/ {other_args} --debug --plot -v 3", "new") # --debug --plot
+        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug --plot -v 3 -p 4 -i 2", "new") #--plot --start 1
         #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_deep/ {other_args} -m full --debug --plot -v 3", "new")
 
         #time_tool(f"python {old_tool} -g {g} -s {s} -o {o_old}_v0 --overwrite {other_args} --maps -v 0", "old")

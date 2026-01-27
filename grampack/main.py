@@ -344,6 +344,9 @@ class Engine:
         current_tasks = [root_task]
         max_iter = self.ctx.max_iter
         
+        n_proc = self.ctx.num_processes
+        self.ctx = self.ctx.update(num_processes=1)  # Workers run single-threaded
+        
         # Fast-Forward (Resume) Logic
         # If we have history, we might have completed the root or others.
         # We need to reconstruct the frontier.
@@ -351,7 +354,7 @@ class Engine:
             self.flow_logger.log(f"History found ({len(self.ctx.history)} entries). Checking for resume...", 'i')
             current_tasks = self.flow_mgr.fast_forward_split(current_tasks)
 
-        pool = mp.Pool(processes=self.ctx.num_processes)
+        pool = mp.Pool(processes=n_proc)
         depth = 0
         
         # Adjust depth display if resuming deep
