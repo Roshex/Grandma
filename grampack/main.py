@@ -1,11 +1,22 @@
 import os
+
+# --- CLUSTER ENVIRONMENT SAFETY ---
+# For imports of C-level libraries such as numpy to run in single-threaded mode,
+# allowing Grandma's Process Pool to manage the parallelism without contention.
+# May not be the best idea to set this globally, but TBD.
+# Must appear before any imports of such libraries.
+"""
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+"""
+
 import re
 import sys
 import random
-import multiprocessing as mp
-from functools import partial
 from pathlib import Path
-from tqdm import tqdm
 from typing import Optional, Tuple, Dict, Any, List, Union
 
 from .config import InitParser, GlobalContext, TaskConfig, GranWriter
@@ -20,6 +31,8 @@ import psutil
 HAS_PSUTIL = psutil is not None
 
 import multiprocessing.pool
+
+# --- Top-level Helper Functions --- #
 
 # --- Helper Classes for Nested Parallelism ---
 class NoDaemonProcess(multiprocessing.Process):
@@ -37,8 +50,6 @@ class NoDaemonPool(multiprocessing.pool.Pool):
         proc.__class__ = NoDaemonProcess
         return proc
 
-
-# --- Top-level Helper Functions --- #
 # --- Standalone workers function supporting parallel processing --- #
 
 def task_worker(payload: Tuple[Any, Any, str], context: GlobalContext, config: TaskConfig, verbosity=0, parent_logger=None):

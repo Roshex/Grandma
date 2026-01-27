@@ -3,10 +3,13 @@ Replaces params.py and global_vars.py. Holds constants and configuration datacla
 Handles the input parsing logic from opt_parse.py and spec_tree.py
 '''
 
+import re
+import os
 import ast
 import json
 import shutil
 import argparse
+import multiprocessing
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Union, List
 from dataclasses import dataclass, field, replace, fields
@@ -19,13 +22,6 @@ import datetime
 # Replicating the dynamic default logic from the original opt_parse.py
 def get_default_outdir() -> str:
     return "grandma_out_" + datetime.datetime.now().strftime("%m-%d-%Y.%I-%M-%S")
-
-'''
-missing:
-
-better mem and cpu/processing options?
-
-'''
 
 # --- Package Metadata (Literal) ---
 @dataclass(frozen=True, slots=True)
@@ -55,6 +51,7 @@ class GlobalContext:
     """
     # System Resources
     num_processes: int = 1
+    max_memory: Optional[int] = None # in bytes, None for unlimited
     verbosity: int = 3
     seed: int = 42
     
@@ -404,14 +401,12 @@ class InitParser:
         self.logger = None
 
     def _add_arguments(self):
-        # --- Required Inputs ---
-        g_required = self.parser.add_argument_group("Required Inputs")
-        g_required.add_argument("-s", dest="spec_input", required=True, type=str,
-            help="A file or string containing a newick formatted species tree on which to search "
-                 "for polyploid events. May be a singly-labeled or multi-labeled tree.")
-
         # --- Base Options ---
         g_general = self.parser.add_argument_group("General Options")
+        g_general.add_argument("-s", dest="spec_input", default=None, type=str,
+            help="A file or string containing a newick formatted species tree on which to search "
+                 "for polyploid events. May be a singly-labeled or multi-labeled tree. Required argument, "
+                 "unless resuming a previous run or step (such as --plot).")
         g_general.add_argument("-g", dest="genes_input", default=None, type=str,
             help="A file or string containing one or more newick formatted gene trees to reconcile. Known gene "
                  "names if present should be in the format 'geneID_speciesID', where IDs are separated by the 1st "
@@ -421,10 +416,14 @@ class InitParser:
         g_general.add_argument("-f", "--prefix", default="grandma", type=str,
             help="A string prepended to all output files. Default = 'grandma'.")
         g_general.add_argument("-p", "--procs", type=int, default=1,
-            help="Number of processes to use for parallelizable tasks. Default = 1.")
+            help="Number of processes to use for parallelizable tasks. Default = 1. Non-positive to autodetect and " 
+                 "use all available cores.")
         g_general.add_argument("-v", "--verbosity", type=int, default=2, choices=range(5),
             help="Level of verbosity printed to the screen. 0 = none; 1 = run info; 2 = standard; "
                  "3 = debug; 4 = verbose debugging. Default = 2.")
+        g_general.add_argument("--mem", type=str, default="auto",
+            help="Max RAM usage (e.g., '4G', '500M', '80%'). Limits parallel workers if exceeded. Default = 'auto'. "
+                 "Not implemented yet.")
 
         # --- Algorithmic Options ---
         g_algo = self.parser.add_argument_group("Algorithmic Options")
@@ -435,41 +434,41 @@ class InitParser:
         g_algo.add_argument("-h2", "--h2", type=str, help="As -h1, but for parental node 2 (H2).")
         g_algo.add_argument("-x", "--ploidy", type=str, default=None,
             help="Ploidy file formatted as a Polyphest Multiset file. If provided, H1 and H2 nodes will be enforced by "
-            "ploidy levels. Default: None.")
+                 "ploidy levels. Default: None.")
         g_algo.add_argument("-c", "--cap", type=int, default=8,
             help="The maximum number of groups a gene tree is allowed to have. A gene tree with more than --cap "
                  "number of groups for a given MUL-tree, will be skipped. Default = 8.")
         g_algo.add_argument("-n", "--max_select", type=int, default=1,
             help="Maximum MUL-trees to select per run for parallel inference heuristics. Default: 1, i.e., only the best "
-            "scoring MT is considered per iteration.")
+                 "scoring MT is considered per iteration.")
         g_algo.add_argument("--min_st_lvs", type=int, default=1,
             help="Minimum species tree leaves for a species tree to be considered valid. Specifically relevant for the "
-            "split mode. Default: 1.")
+                 "split mode. Default: 1.")
         g_algo.add_argument("--min_gt_lvs", type=int, default=2,
             help="Minimum gene trees leaves per tree for a gene tree to be considered valid. Specifically relevant for "
-            "the split mode. Default: 2.")
+                 "the split mode. Default: 2.")
 
         # --- Flow Control Options ---
         g_flow = self.parser.add_argument_group("Flow Control Options")
         g_flow.add_argument("-m", "--mode", type=str, default="single",
             choices=["single", "split", "full", "label-sp", "count-mts", "build-mts", "check-nums", "no-recon", "no-st", "st-only"], 
             help="Execution mode. Options: single => simple run [default] | split => parallelized binary-recursive | "
-            "full => fully sequencial with nestedness inference | label-sp => only label input species tree internal "
-            "nodes | count-mts => count possible MUL-trees only | build-mts => build MUL-trees only | check-nums => "
-            "count groups only | no-recon => build MTs & count groups | no-st => skip reconciliation to input | st-only "
-            "=> reconciliation to input only.")
+                 "full => fully sequencial with nestedness inference | label-sp => only label input species tree internal "
+                 "nodes | count-mts => count possible MUL-trees only | build-mts => build MUL-trees only | check-nums => "
+                 "count groups only | no-recon => build MTs & count groups | no-st => skip reconciliation to input | st-only "
+                 "=> reconciliation to input only.")
         g_flow.add_argument('-i', '--iter', type=int, default=0,
-            help="Maximun number of iterations or depth for iterative modes; <int>, non-positive to be unlimited. Default = 0.")
+            help="Maximun number of iterations or (~depth) event num for iterative modes; <int>, non-positive to be unlimited. Default = 0.")
         g_flow.add_argument('-r', '--repair', action='store_true',
             help="If set, attempt to repair input files by forcing bifurcating trees, rooting, valid tip names, and more.")
         g_flow.add_argument('--start', type=str, default='auto',
             help="Start point when resuming a previous execution; positive <int>, or 'auto' [default] for auto-detection.")
         g_flow.add_argument('--cutoff', type=str, default='auto',
             help="Stopping condition when comparing MP score; 'auto' [default] for abs:0+lookback, 'abs:<int>' for "
-            "absolute, or 'rel:<float>' for relative.")
+                 "absolute, or 'rel:<float>' for relative.")
         g_flow.add_argument('--ignore-nesting', action='store_true',
             help="If set, do not automatically fix nested hybridization events; let GRANDMA iterate normally without "
-            "corrections. Ignored in all modes except 'full'.")
+                 "corrections. Ignored in all modes except 'full'.")
         g_flow.add_argument("--orthologies", action="store_true",
             help="If set, will output an additional file containing the pairwise orthology "
                  "relationships for each gene tree to the lowest scoring MUL-tree.")
@@ -559,6 +558,37 @@ class InitParser:
             
         return m
 
+    @staticmethod
+    def _parse_mem(mem_str: str) -> Optional[int]:
+        """
+        Parses strings like '4G', '500M', '80%' into bytes.
+        Returns None if input is invalid or 'auto'.
+        """
+        if not mem_str or mem_str.lower() == "auto":
+            return None
+            
+        mem_str = mem_str.upper().strip()
+        
+        # Handle Percentage (e.g., "80%")
+        if "%" in mem_str:
+            try:
+                import psutil
+                pct = float(mem_str.replace("%", "")) / 100.0
+                total = psutil.virtual_memory().total
+                return int(total * pct)
+            except ImportError:
+                return None
+
+        # Handle Units
+        units = {'G': 1024**3, 'M': 1024**2, 'K': 1024, 'B': 1}
+        match = re.match(r"^(\d+(?:\.\d+)?)([GMKB])?$", mem_str)
+        if match:
+            val = float(match.group(1))
+            unit = match.group(2) or 'B'
+            return int(val * units[unit])
+            
+        return None
+
     def parse(self, args_=None) -> Tuple[GlobalContext, TaskConfig]:
         """
         Parses arguments and returns strictly typed configuration objects.
@@ -601,9 +631,55 @@ class InitParser:
         # Prepare history/folders
         i, history, history_file = start_up_prep(start, out_dir, self.logger, mode)
 
+        if args.spec_input is None:
+            # Try loading from folder of i
+            prev_st = out_dir / str(i-1) / "spectree.tre"
+            if args.plot:
+                self.logger.log("Plotting mode detected. Program will not run any analysis.", 'i')
+                pass
+                # To be implemented: Load history and plot only
+            elif prev_st.exists():
+                args.spec_input = str(prev_st)
+                self.logger.log(f"Resuming trees input from previous run at {prev_st.parent}", 'i')
+                if args.genes_input is None:
+                    try:
+                        prev_gt = out_dir / str(i-1) / "genetrees.txt"
+                        if prev_gt.exists():
+                            args.genes_input = str(prev_gt)
+                    except Exception:
+                        pass
+            else:
+                self.logger.log("Species tree input (-s) is required for this mode.", 'e')
+
+        # 1. Determine CPU Count
+        if args.procs > 0:
+            # User specified value takes precedence
+            n_procs = args.procs
+        else:
+            # Check Cluster Environment Variables
+            if 'SLURM_CPUS_PER_TASK' in os.environ:
+                # Slurm
+                n_procs = int(os.environ['SLURM_CPUS_PER_TASK'])
+            elif 'PBS_NP' in os.environ:
+                # PBS / Torque
+                n_procs = int(os.environ['PBS_NP'])
+            elif 'LSB_DJOB_NUMPROC' in os.environ:
+                # LSF
+                n_procs = int(os.environ['LSB_DJOB_NUMPROC'])
+            elif 'NSLOTS' in os.environ:
+                # GridEngine
+                n_procs = int(os.environ['NSLOTS'])
+            else:
+                # Local Machine fallback
+                try:
+                    n_procs = multiprocessing.cpu_count()
+                except NotImplementedError:
+                    n_procs = 1
+
         # --- Build Global Context ---
         ctx = GlobalContext(
-            num_processes=  args.procs,
+            num_processes=  n_procs,
+            max_memory=     self._parse_mem(args.mem),
             verbosity=      args.verbosity,
             seed=           args.seed,
             plot=           args.plot,
