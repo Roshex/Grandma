@@ -480,6 +480,14 @@ class Reconciler:
 
         for idx, mdata in mul_trees.items():
             mdata.mt.make_flat(registry)
+
+        # Debug some of the flat trees
+        logger.log(f"Flat species tree nodes: {mul_trees[0].mt.flat_tree.node_id_to_name_id}", 'd')
+        logger.log(f"Flat gene tree[0] nodes: {gene_trees_flat[0].node_id_to_name_id}", 'd')
+        logger.log(f"Flat first mt nodes: {mul_trees[1].mt.flat_tree.node_id_to_name_id}", 'd')
+        # print registry contents
+        for i in range((registry.size())):
+            logger.log(f"Registry ID {i}: {registry._int_to_str[i]}", 'd')
             
         all_scores = {}
         tasks = list(mul_trees.items())

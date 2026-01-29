@@ -22,8 +22,8 @@ if __name__ == "__main__":
     datasets = [
 #        ("ex_no_w", "manual_gene_trees_no_w.txt", "manual_species_tree_no_w.tre"),
 #        ("ex_w", "manual_gene_trees_w.txt", "manual_species_tree_w.tre"),
-#        ("ex_w_snested", "manual_gene_trees_w_sn.txt", "manual_species_tree_w_sn.tre"),
-        ("ex_k_back", "backbone.txt", "astral.tre"),
+        ("ex_w_snested", "manual_gene_trees_w_sn.txt", "manual_species_tree_w_sn.tre"),
+#        ("ex_k_back", "backbone.txt", "astral.tre"),
     ]
 
     for ds_name, g_file, s_file in datasets:
@@ -42,8 +42,8 @@ if __name__ == "__main__":
         o_old = path_manual / 'o_old/'
         o_new = path_manual / 'o_new'
 
-        #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}/ {other_args} --debug --plot -v 3", "new") # --debug --plot
-        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug --plot -v 3 -p 0", "new") #--plot --start 1 -i 2
+        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}/ {other_args} --debug --plot -v 3 -p 4", "new") # --debug --plot
+        #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug --plot -v 3", "new") #--plot --start 1 -i 2
         #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_deep/ {other_args} -m full --debug --plot -v 3", "new")
 
         #time_tool(f"python {old_tool} -g {g} -s {s} -o {o_old}_v0 --overwrite {other_args} --maps -v 0", "old")

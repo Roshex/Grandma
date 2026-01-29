@@ -65,7 +65,7 @@ class GlobalContext:
     orth_opt: bool = False
     max_iter: Union[int, float] = 0
     cutoff: Tuple[str, Optional[Union[int, float]]] = ("auto", None)
-    ignore_nesting: bool = False # for full mode
+    ignore_nesting: bool = False # for full mode # --nestedness (i)gnore / (r)ectify / (m)odel [tbd: when generating mts! no correction needed]
     min_st_lvs: int = 1 # for split mode
     min_gt_lvs: int = 2 # for split mode
     
