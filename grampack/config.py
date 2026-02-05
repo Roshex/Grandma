@@ -32,7 +32,7 @@ class GranMetadata:
     github: str = "TBD"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "2.7.5 (Modern)"
+    version: str = "2.8.0 (Modern)"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -68,7 +68,7 @@ class GlobalContext:
     ignore_nesting: bool = False # for full mode # --nestedness (i)gnore / (r)ectify / (m)odel [tbd: when generating mts! no correction needed]
     min_st_lvs: int = 1 # for split mode
     min_gt_lvs: int = 2 # for split mode
-    
+      
     # Paths that define the "Session"
     root_dir: Path = field(default_factory=lambda: Path(get_default_outdir()))
     log_file: Optional[Path] = None

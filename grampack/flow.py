@@ -129,15 +129,18 @@ class FlowManager:
         if self.ctx.debug:
             if self.ctx.seed:
                 def _random_spacing(iterable, n):
-                    return sorted(random.sample(range(len(iterable)), min(n, len(iterable))))
+                    """Returns n random values from iterable using fixed seed."""
+                    idxs = sorted(random.sample(range(len(iterable)), min(n, len(iterable))))
+                    return [iterable[i] for i in idxs]
                 return partial(_random_spacing, n=n)
             else:
                 def _equal_spacing(iterable, n):
+                    """Returns n evenly spaced values from iterable."""
                     length = len(iterable)
                     if n >= length:
                         return list(range(length))
                     step = length / n
-                    return [int(i * step) for i in range(n)]
+                    return [iterable[int(i * step)] for i in range(n)]
                 return partial(_equal_spacing, n=n)
         def _noop(iterable):
             return []
@@ -202,7 +205,28 @@ class FlowManager:
         nonin_rank = self._get_nonin_rank(res)
         return res.mt_idx(nonin_rank)
 
-    def _update_history(self, i: int, j: int, res: TaskResult, hold: bool = False) -> None:
+    @staticmethod
+    def _get_sis_nodes(node1: TreeNode, node2: TreeNode) -> Set[TreeNode]:
+        """Returns the sister node of the given node, or None if not found."""
+        if node1.up and node2.up and node1.up.name == node2.up.name:
+            # autopolyploid case
+            node1, node2 = node1.up, node2.up
+        res = []
+        for node in [node1, node2]:
+            parent = node.up
+            if parent is None:
+                res.append(None)
+            else:
+                children = parent.get_children()
+                if len(children) != 2:
+                    raise ValueError("Tree structure invalid for sister retrieval.")
+                sister = children[0] if children[1] == node else children[1]
+                res.append(sister)
+        if len(res) != 2:
+            raise ValueError("Sister node not found.")
+        return set(res)
+
+    def _update_history(self, i: int, j: int, res: TaskResult, hold: bool = False) -> bool:
         """
         Logs the input and best, or, if input is best, input and second-best
         MulTree data for history tracking.
@@ -221,6 +245,16 @@ class FlowManager:
         self._debug_tree("Best MulTree:", best_mt.mt.ete_tree)
         self._debug_tree("Best Non-input MulTree:", nonin_mt.mt.ete_tree)
 
+        sis_nodes = self._get_sis_nodes(nonin_mt.h1_node, nonin_mt.h2_node)
+        # Embed an attr H in each sis_node
+        for n in sis_nodes:
+            if n is None: continue
+            if not hasattr(n, 'H'):
+                n.add_feature('H', [])
+            n.H.append(str((i, j))) # Track which events this node was involved in for nested detection / gluing logic
+
+        track_dict = {n.name: n.H for n in nonin_mt.mt.ete_tree.traverse() if hasattr(n, 'H')}
+
         self.ctx.history[(i, j)] = {
             'best_mt': best_mt.mt.ete_tree.write(format=8), # may be input tree
             'nonin_mt': nonin_mt.mt.ete_tree.write(format=8),
@@ -229,10 +263,17 @@ class FlowManager:
             'input_score': input_score,
             'nonin_score': nonin_score,
             'num_gts': len(res.gene_trees),
+            'H_locs': [n.name if n else '<root>' for n in sis_nodes],
+            'trackers': track_dict
         }
+        passed = self._check_if_passed(i, j)
+        self.ctx.history[(i, j)]['passed'] = passed
+
         if not hold: # For full mode, until nested fixes are done (to not pollute history with partial events)
             with open(self.ctx.history_file, 'w') as f:
                 json.dump({str(k): v for k, v in self.ctx.history.items()}, f, indent=4)
+
+        return passed
 
     # --- Output methods ---
 
@@ -617,11 +658,8 @@ class FlowManager:
         nonin_idx = self._get_nonin_idx(res)
         next_mt, disallowed_lvs, distance_map = self._rename_best_mt(res, nonin_idx)
 
-        # Update history
-        self._update_history(i, j, res)
-
-        # Check if passed cutoff
-        passed = self._check_if_passed(i, j)
+        # Update history & check if passed cutoff
+        passed = self._update_history(i, j, res)
         if not passed:
             self.logger.log(f"Cutoff reached: no parsimonious events found at Iteration {i}.", 'i')
             return next_mt, None
@@ -673,12 +711,21 @@ class FlowManager:
         h_clade_names = [l.name for l in h1_node.get_leaves()]
         h_clade_names.extend([l.name for l in h2_node.get_leaves()])
 
+        # Bug fix:
+        # check if all leaves in best_mt are in h_clade_names
+        # if so, after splitting, all remaining leaves in outer will be old internal nodes:
+        # the detection was autopolyploidy -> next detection is guaranteed to be the same -> infinite loop
+        mt_lvs_set = set(l.name for l in mt_wrapper.ete_tree.get_leaves())
+        if mt_lvs_set.issubset(set(h_clade_names)):
+            self.logger.log("All MT leaves belong to duplicated clades.", 'd')
+            self.logger.log(f"Terminal autopolyploidy detected at depth {depth}, index {idx}. Stopping recursive branch.", 'i')
+            return []
+
         outer_gts = {}
         inner_gts = {}
         innie_counter = 0
 
-        debug_sample = self.sample(gts.keys())
-
+        debug_sample = self.sample(list(gts.keys()))
         for g_idx, gt_wrapper in gts.items():
             maps = min_maps.get(g_idx)
             if not maps: continue
@@ -737,7 +784,8 @@ class FlowManager:
                     stack.extend(node.children)
 
             for ph_node in final_pure_lineages:
-                extracted_gt = ph_node.copy()
+                # No need to copy() - pure nodes' children aren't added to stack, so no unsafe nested detach()s
+                extracted_gt = ph_node.detach()#.copy()
                 inner_gts[innie_counter] = SmrtTree(tree_obj=extracted_gt)
                 
                 if g_idx in debug_sample:
@@ -748,19 +796,41 @@ class FlowManager:
         # --- Species Tree Surgery ---
 
         # Simply copy the subtree rooted at H1 for the Inner ST
-        inner_st_obj = h1_node.copy()
+        # detach() clears the root (t.up == None)
+        inner_st_obj = h1_node.copy().detach()
 
         # For the Outer ST, we need to remove both H1 and H2
         outer_st_obj = mt_wrapper.ete_tree.copy()
         # Re-locate nodes in the COPY
         h1_in_outer = outer_st_obj.search_nodes(name=h1_node.name)[0]
         h2_in_outer = outer_st_obj.search_nodes(name=h2_node.name)[0]
+        self.logger.log(f"Removing hybrid clade ({h1_in_outer.name} and {h2_in_outer.name}) from Outer ST.", 'd')
         # Safely remove H nodes from Outer ST: detach leaf, then delete the resulting knuckle node
         for n in [h1_in_outer, h2_in_outer]:
             n_up = n.up # Save parent before detaching
+            trackers = getattr(n_up, 'H', []) # Preserve any existing trackers
             n.detach()
-            if n_up:
-                n_up.delete() # delete() removes the internal node and connects children to parent
+            if n_up.up is None:
+                children = n_up.get_children()
+                if len(children) != 1:
+                    raise ValueError("Unexpected structure when removing hybrid clade from Outer ST.")
+                # Special case: if parent is root, just promote the child
+                child = n_up.get_children()[0]
+                outer_st_obj = child.detach()#.copy()
+                # Re-assign any trackers to the new root
+                if trackers:
+                    if not hasattr(outer_st_obj, 'H'):
+                        outer_st_obj.add_feature('H', [])
+                    outer_st_obj.H.extend(trackers)
+            # delete() removes the internal node and connects children to parent
+            else:
+                n_up_up = n_up.up
+                n_up.delete()
+                # Re-assign any trackers to the grandparent
+                if trackers:
+                    if not hasattr(n_up_up, 'H'):
+                        n_up_up.add_feature('H', [])
+                    n_up_up.H.extend(trackers)
 
         self._debug_tree("Inner Species Tree (Hybrid Clade):", inner_st_obj)
         self._debug_tree("Outer Species Tree (Backbone):", outer_st_obj)
@@ -769,10 +839,10 @@ class FlowManager:
         # --- Queue Tasks with Binary IDs ---
         # Only queue tasks if species tree has enough leaves to be valid
         next_tasks = []
-        if len(inner_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(inner_gts) > 0:
-            next_tasks.append((SmrtTree(tree_obj=inner_st_obj), inner_gts, f"{depth + 1}.{idx * 2}"))
         if len(outer_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(outer_gts) > 0:
-            next_tasks.append((SmrtTree(tree_obj=outer_st_obj), outer_gts, f"{depth + 1}.{idx * 2 + 1}"))
+            next_tasks.append((SmrtTree(tree_obj=outer_st_obj), outer_gts, f"{depth + 1}.{idx * 2}"))
+        if len(inner_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(inner_gts) > 0:
+            next_tasks.append((SmrtTree(tree_obj=inner_st_obj), inner_gts, f"{depth + 1}.{idx * 2 + 1}"))
         return next_tasks
 
     def handle_split_result(
@@ -790,10 +860,9 @@ class FlowManager:
         # 1. Determine Depth and Index from Binary ID
         depth, idx = (int(x) for x in bin_id.split('.')) if '.' in bin_id else (0, 0)
 
-        self._update_history(depth, idx, res)
-
-        # 2. Validation & Cutoff
-        if not self._check_if_passed(depth, idx):
+        # Update history & check if passed cutoff
+        passed = self._update_history(depth, idx, res)
+        if not passed:
             self.logger.log(f"Cutoff reached: no parsimonious events found at Depth {depth}, Index {idx}.", 'i')
             return None # Event not taken!
 
@@ -817,152 +886,201 @@ class FlowManager:
 
     def glue_split_results(self, output_dir: Path, original_st_path: Path, logger: GranLogger) -> None:
         """
-        Recombines recursive sub-analyses into a single global hybridization record.
-        Iterates reverse (deepest first), updating leaf names with .1/.2 suffixes.
-        Produces both a suffix-separated single-label tree and a clean MUL-tree.
+        Recombines results by recursively diving to the innermost subproblems.
         """
         self.logger = logger
-        step = "Recombining Split Results"
+        step = "Recombining Split Results (Recursive)"
         self.logger.report_step(step, "In progress...", start=True)
 
-        if not self.ctx.history:
-            self.logger.log("No reticulations found. Nothing to glue.", 'i')
-            return
+        # Start the recursive chain from the root task (0,0)
+        final_tree, _ = self._recursive_glue("0.0")
+        # Fallback: original ST
+        if final_tree is None:
+            self.logger.log("No valid recombination found. Using original species tree.", 'i')
+            final_tree = Tree(CommonOps._fix_semicolon(original_st_path.read_text()), format=1)
 
-        # 1. Load Base Species Tree
-        try:
-            with open(original_st_path, 'r') as f:
-                st_text = f.read().strip()
-                if not st_text.endswith(';'): st_text += ';'
-                # Use GrandmaTree wrapper for robust newick parsing
-                base_st = SmrtTree(newick=st_text)
-        except Exception as e:
-            self.logger.log(f"loading original ST for gluing: {e}", 'e')
-
-        # 2. Sort Events: Reverse order (Deepest depth/index first)
-        # self.history keys are (depth, idx) tuples.
-        sorted_keys = sorted(self.ctx.history.keys(), key=lambda x: (x[0], x[1]), reverse=True)
-        
-        # Working on a copy of the ete3 tree
-        current_tree = base_st.ete_tree.copy()
-        
-        # Helper: Find node in current_tree matching a list of base names
-        # Handles cases where leaves have accumulated suffixes (e.g., matching 'x' to 'x.1')
-        def find_clade_root(tree, base_names):
-            base_set = set(base_names)
-            matches = []
-            for l in tree.get_leaves():
-                # Strip suffixes to find base name: "x.1.2" -> "x"
-                # Assumes species names do not contain dots
-                # Strip only suffixes like .1, .2, .1.2
-                lname_base = re.sub(r'(\.[0-9]+)+$', '', l.name)
-                if lname_base in base_set:
-                    matches.append(l)
-            
-            if not matches: return None
-            if len(matches) == 1: return matches[0]
-            try:
-                return tree.get_common_ancestor(matches)
-            except ValueError:
-                return None # Should not happen if matches exist
-
-        # 3. Apply Events
-        for key in sorted_keys:
-            event = self.ctx.history[key]
-            
-            # A. Extract Topology Info from Event
-            h1_names = event['h1_node'] # Base names defining the lineage
-            
-            # We need to find the Sister of H2 to know WHERE to graft.
-            # We parse the local event tree string to find this relationship.
-            local_mt = Tree(event['best_mt'], format=1) 
-            
-            # Find H2 leaves in local tree (they usually have '*' or are the second occurence)
-            # In split mode history, h2.node names usually come with '*' suffix from the run
-            h2_leaves_local = []
-            for n in local_mt.get_leaves():
-                # Match against recorded h2 names
-                if n.name in event['h2_node']:
-                    h2_leaves_local.append(n)
-            
-            if not h2_leaves_local:
-                self.logger.log(f"Could not find H2 leaves in event {key} tree structure.", 'w')
-                continue
-            
-            # Get Sister of H2 in local tree
-            local_h2_node = local_mt.get_common_ancestor(h2_leaves_local) if len(h2_leaves_local) > 1 else h2_leaves_local[0]
-            sisters = local_h2_node.get_sisters()
-            if not sisters:
-                self.logger.log(f"H2 node in event {key} has no sister (Root?).", 'w')
-                continue
-            
-            # Extract base names of the sister clade
-            local_sister_leaves = [re.sub(r'(\.[0-9]+)+$', '', n.name.replace('*','')) for n in sisters[0].get_leaves()]
-
-            # B. Locate Nodes in Global Tree
-            h1_node_global = find_clade_root(current_tree, h1_names)
-            target_sister_global = find_clade_root(current_tree, local_sister_leaves)
-
-            if not h1_node_global or not target_sister_global:
-                self.logger.log(f"Could not map event {key} to global tree. Skipping.", 'w')
-                continue
-
-            # C. Grafting Operation
-            # 1. Clone H1 (This becomes H2)
-            h2_copy = h1_node_global.copy()
-            
-            # 2. Create new container at target position
-            target_parent = target_sister_global.up
-            new_internal = TreeNode()
-            
-            if target_parent:
-                target_sister_global.detach()
-                target_parent.add_child(new_internal)
-            else:
-                # Target is root; new node becomes new root
-                target_sister_global.detach()
-                new_internal.add_child(target_sister_global)
-                current_tree = new_internal # Update root reference
-
-            # 3. Attach Sister and New H2 to new internal node
-            # (Sister is already attached if we added new_internal to parent? No, we detached sister)
-            if target_sister_global not in new_internal.children:
-                new_internal.add_child(target_sister_global)
-            new_internal.add_child(h2_copy)
-            
-            # D. Apply Suffixes
-            # Original H1 lineage gets .1
-            for l in h1_node_global.get_leaves():
-                l.name += ".1"
-            
-            # New H2 lineage gets .2
-            for l in h2_copy.get_leaves():
-                l.name += ".2"
-                
-        # 4. Output Files
+        # Output the results
         out_st = output_dir / "merged_single_label_form.tre"
         out_mul = output_dir / "merged_multree.tre"
         
-        sl_str = current_tree.write(format=9)
+        for l in final_tree.get_leaves():
+            if l.name.endswith('>'):
+                l.name = None
 
-        # Write SL-Form (with suffixes)
+        # Write Suffix form (*) with internal node names
         with open(out_st, 'w') as f:
-            f.write(sl_str)
+            f.write(final_tree.write(format=8))
 
-        # Write MUL-Form (Clean names)
-        # Clone to avoid modifying the tree we just wrote
-        mul_tree = current_tree.copy()
+        # Write MUL form (Clean species names)
+        mul_tree = final_tree.copy()
         for l in mul_tree.get_leaves():
-            # Remove all suffixes starting with dot followed by digits
-            l.name = re.sub(r'(\.[0-9]+)+$', '', l.name)
-            
+            # l.name = re.sub(r'(\.[0-9]+)+$', '', l.name)
+            l.name = l.name.replace('*', '')
         with open(out_mul, 'w') as f:
             f.write(mul_tree.write(format=9))
-            
-        self.logger.report_step(step, "Success: Merged trees written.")
+
+        self.logger.log(f"Final Merged Tree: {final_tree.write(format=9)}", 'i')
         
-        # replace .1 with + and .2 with *, and log to logger
-        self.logger.log(f"Merged inferred tree: {sl_str.replace('.1', '+').replace('.2', '*')}", 'i')
+        self.logger.report_step(step, "Success")
+
+    def _recursive_glue(self, task_id: str) -> Tuple[Optional[TreeNode], dict]:
+        """
+        Recombines split results using history 'trackers' to identify graft locations.
+        """
+        # Convert "0.0" task_id to the (depth, idx) tuple used in history keys
+        depth, idx = (int(x) for x in task_id.split('.'))
+        key = (depth, idx)
+        
+        # Base Case: If this task was never run or didn't pass, 
+        # we return None or the input tree.
+        if key not in self.ctx.history:
+            self.logger.log(f"Task {task_id} not found in history.", 'd')
+            return None, {}
+
+        event = self.ctx.history[key]
+        self.logger.log(f"--- Processing Task {task_id} ---", 'd')
+
+        # --- STEP 1: Dive to children (Post-order traversal) ---
+        # Outer child: (depth+1, idx*2)
+        # Inner child: (depth+1, idx*2 + 1)
+        outer_id = f"{depth + 1}.{idx * 2}"
+        inner_id = f"{depth + 1}.{idx * 2 + 1}"
+
+        # Check Pass/Fail
+        if not event['passed']:
+            # Event rejected. If we have an outer_tree (backbone), return it.
+            # Otherwise return the Input/Best MT of this node.
+            return None, {}
+
+        # Base Fallback
+        # If Outer/Inner recursions yielded nothing (leaves of recursion), 
+        # we check if we should return the current best_mt.
+        # This is the "Base State" for this node in the recursion tree.
+        current_base = Tree(event['best_mt'], format=1)
+
+        # Check Redundant Autopolyploidy
+        # If this event's tree is fully contained in the PARENT event's tree, it's redundant.
+        '''if depth > 0:
+            h1_names = event['h1_node']
+            h2_names = event['h2_node']
+            # Skip autopolyploidy events, where H1 + H2 == all leaves
+            all_leaves = set(current_base.get_leaf_names())
+            if set(h1_names).union(set(h2_names)) == all_leaves:
+                parent_key = (depth - 1, idx // 2)
+                # this check is not enough, because sometimes we DO want to keep autopolyploidy events (if not excessive)
+                # we can check if the new mt is a subtree of its parental (by key) best_mt
+                if parent_key in self.ctx.history:
+                    parent_best_mt = Tree(self.ctx.history[parent_key]['best_mt'], format=1)
+                    self._debug_tree(f"Checking autopolyploidy at {key} against parent {parent_key}", parent_best_mt)
+                    self._debug_tree(f"Non-input MT at {key}:", current_base)
+                    # by lca
+                    try:
+                        equivelent_subtree = parent_best_mt.get_common_ancestor([parent_best_mt.search_nodes(name=lv)[0] for lv in all_leaves])
+                        if all_leaves == set(equivelent_subtree.get_leaf_names()):
+                            self.logger.log(f"Skipping terminal autopolyploidy event at {key}.", 'd')
+                            return None, {}
+                    except Exception as e:
+                        pass
+                        # Not equivelent, keep the event'''
+
+        outer_tree, outer_trackers = self._recursive_glue(outer_id)
+        inner_tree, inner_trackers = self._recursive_glue(inner_id)
+
+        self.logger.log(f"Returned from Outer {outer_id} with trackers: {outer_trackers}", 'd')
+        self.logger.log(f"Returned from Inner {inner_id} with trackers: {inner_trackers}", 'd')
+
+        # Merge tracker dicts into outer_trackers
+        for k, v in inner_trackers.items():
+            if k in outer_trackers:
+                outer_trackers[k].extend(v)
+            else:
+                outer_trackers[k] = v
+
+        if not inner_tree:
+            self.logger.log(f"No Inner results for task {task_id}.", 'd')
+            # Get the subtree from the best_mt
+            h1_node = event['h1_node']
+            sub_tree = current_base.get_common_ancestor(h1_node) if len(h1_node) > 1 else current_base.search_nodes(name=h1_node[0])[0]
+            inner_tree = sub_tree.copy()
+        self._debug_tree(f"Inner Result Tree for Task {task_id}:", inner_tree)
+
+        if not outer_tree:
+            self.logger.log(f"No Outer results for task {task_id}.", 'd')
+        else:
+            self._debug_tree(f"Outer Result Tree for Task {task_id}:", outer_tree)
+
+        if not outer_tree:
+            return current_base, outer_trackers
+
+        outer_key = (depth + 1, idx * 2)
+        self.logger.log(f"Glue {task_id}: Searching for graft locations in Outer {outer_id} using trackers.", 'd')
+        if not outer_trackers:
+            outer_trackers = self.ctx.history[outer_key]['trackers']
+        # Add inner trackers to outer trackers
+        inner_key = (depth + 1, idx * 2 + 1)
+        if inner_key in self.ctx.history:
+            for k, v in self.ctx.history[inner_key]['trackers'].items():
+                if k in outer_trackers:
+                    outer_trackers[k].extend(v)
+                else:
+                    outer_trackers[k] = v
+        target_str = str(key) # e.g., "(1, 0)"
+        self.logger.log(f"Glue {task_id}: Target string for trackers: {target_str}", 'd')
+        
+        # Keys in trackers are Node Names in the Outer Tree
+        graft_loc_names = [name for name, events in outer_trackers.items() if target_str in events]
+        self.logger.log(f"Glue {task_id}: Potential graft locations: {graft_loc_names}", 'd')
+        
+        # Resolve Targets & Merge Sisters (Autopolyploidy Fix)
+        targets = []
+        for name in graft_loc_names:
+            matches = outer_tree.search_nodes(name=name)
+            if matches: targets.extend(matches)
+        
+        if not targets:
+            self.logger.log(f"Glue {task_id}: Graft locations {graft_loc_names} not found in Outer tree topology.", 'w')
+            return outer_tree, outer_trackers
+
+        # Logic: If matched locations are sisters, merge to parent.
+        # Repeat until stable (in case of multi-level redundancy, though 1 level usually suffices).
+        # We use a set to track finalized targets
+        final_targets = set(targets)
+        
+        # Group by cleaned name (without '*')
+        by_clean = defaultdict(list)
+        for t in final_targets:
+            clean_name = t.name.replace('*', '')
+            by_clean[clean_name].append(t)
+        
+        for clean_name, targets in by_clean.items():
+            if len(targets) > 1:
+                self.logger.log(f"Checking targets with cleaned name {clean_name}: {targets[0].up.name}, {targets[1].up.name}.", 'd')
+                if targets[0].up.name == targets[1].up.name:
+                    parent = targets[0].up
+                    children = parent.get_children()
+                    if clean_name not in children[0].name or clean_name not in children[1].name:
+                        continue
+                    final_targets.difference_update(targets)
+                    p_ = outer_tree.search_nodes(name=parent.name)
+                    for p in p_:
+                        final_targets.add(p)
+                    self.logger.log(f"Glue {task_id}: Replacing sister targets with parent {parent.name}.", 'd')
+
+        # Perform grafting of a COPY of inner_tree to each target
+        for target in final_targets:
+            graft = inner_tree.copy()
+
+            # If root node of the payload has no name, name it
+            if not graft.name:
+                graft.name = f"Graft_{task_id}"
+
+            # Use SmrtTree's grafting logic to add as sister to the target node
+            new_name = f"H_Node_{task_id}" if target.up else f"Root_{task_id}"
+            outer_tree = SmrtTree.graft_subtree(outer_tree, target, graft, name=new_name)
+
+        self._debug_tree(f"Post-Graft Tree for Task {task_id}:", outer_tree)
+
+        return outer_tree, outer_trackers
 
     def fast_forward_split(self, current_tasks: List[ConcurrTask]) -> List[ConcurrTask]:
         """

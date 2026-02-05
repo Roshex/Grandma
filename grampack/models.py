@@ -336,6 +336,25 @@ class SmrtTree:
     def get_node(self, name: str) -> Optional[TreeNode]:
         return self.node_map.get(name)
 
+    @staticmethod
+    def graft_subtree(tree: TreeNode, target: TreeNode, graft: TreeNode, name: str = None) -> TreeNode:
+        """
+        Grafts `graft` on the branch leading to `p_node`.
+        Modifies the tree in place, but return is needed because it might create a new root
+        """
+        p_parent = target.up
+        if p_parent is None:
+            new_root = TreeNode(name=name)
+            new_root.add_child(target.detach())
+            new_root.add_child(graft)
+            tree = new_root
+        else:
+            new_internal = TreeNode(name=name)
+            p_parent.add_child(new_internal)
+            new_internal.add_child(target.detach())
+            new_internal.add_child(graft)
+        return tree
+
     def to_mul_tree(self, h_node_label: str, p_node_label: str) -> Optional[Tuple['SmrtTree', TreeNode, TreeNode]]:
         # [Existing to_mul_tree code remains identical]
         # ... copy, graft logic ...
@@ -354,20 +373,8 @@ class SmrtTree:
         h2_subtree = h1_node.copy()
         for leaf in h2_subtree.iter_leaves():
             leaf.name = f"{leaf.name}*"
-            
-        p_parent = p_node.up
-        
-        if p_parent is None:
-            new_root = TreeNode()
-            new_root.add_child(p_node.detach())
-            new_root.add_child(h2_subtree)
-            new_tree_obj = new_root
-        else:
-            new_internal = TreeNode()
-            p_parent.add_child(new_internal)
-            p_node.detach()
-            new_internal.add_child(p_node)
-            new_internal.add_child(h2_subtree)
+
+        new_tree_obj = SmrtTree.graft_subtree(new_tree_obj, p_node, h2_subtree)
 
         for n in new_tree_obj.traverse():
             if n.name and n.name.startswith("<") and n.name.endswith(">"):
