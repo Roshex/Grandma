@@ -249,14 +249,13 @@ class FlowManager:
         self._debug_tree("Best Non-input MulTree:", nonin_mt.mt.ete_tree, other_attr=['H', 'pure'])
 
         sis_nodes = self._get_sis_nodes(nonin_mt.h1_node, nonin_mt.h2_node)
+        
         # Embed an attr H in each sis_node
         for n in sis_nodes:
             if n is None: continue
             if not hasattr(n, 'H'):
                 n.add_feature('H', [])
             n.H.append(str((i, j))) # Track which events this node was involved in for nested detection / gluing logic
-
-        track_dict = {n.name: n.H for n in nonin_mt.mt.ete_tree.traverse() if hasattr(n, 'H')}
 
         self.ctx.history[(i, j)] = {
             'best_mt': best_mt.mt.to_str(internals=True),
@@ -266,11 +265,15 @@ class FlowManager:
             'input_score': input_score,
             'nonin_score': nonin_score,
             'num_gts': len(res.gene_trees),
-            'H_locs': [n.name if n else '<auto>' for n in sis_nodes],
-            'trackers': track_dict
+            'H_locs': [n.name if n else '<auto>' for n in sis_nodes]
         }
         passed = self._check_if_passed(i, j)
         self.ctx.history[(i, j)]['passed'] = passed
+
+        if self.logger.debug:
+            # No longer needed to parse iterations, but is very useful for debugging
+            track_dict = {n.name: n.H for n in nonin_mt.mt.ete_tree.traverse() if hasattr(n, 'H')}
+            self.ctx.history[(i, j)]['trackers'] = track_dict
 
         if not hold: # For full mode, until nested fixes are done (to not pollute history with partial events)
             with open(self.ctx.history_file, 'w') as f:
