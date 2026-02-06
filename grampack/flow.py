@@ -249,7 +249,7 @@ class FlowManager:
         self._debug_tree("Best Non-input MulTree:", nonin_mt.mt.ete_tree, other_attr=['H', 'pure'])
 
         sis_nodes = self._get_sis_nodes(nonin_mt.h1_node, nonin_mt.h2_node)
-        
+
         # Embed an attr H in each sis_node
         for n in sis_nodes:
             if n is None: continue
@@ -267,13 +267,13 @@ class FlowManager:
             'num_gts': len(res.gene_trees),
             'H_locs': [n.name if n else '<auto>' for n in sis_nodes]
         }
-        passed = self._check_if_passed(i, j)
-        self.ctx.history[(i, j)]['passed'] = passed
-
         if self.logger.debug:
             # No longer needed to parse iterations, but is very useful for debugging
             track_dict = {n.name: n.H for n in nonin_mt.mt.ete_tree.traverse() if hasattr(n, 'H')}
             self.ctx.history[(i, j)]['trackers'] = track_dict
+
+        passed = self._check_if_passed(i, j)
+        self.ctx.history[(i, j)]['passed'] = passed
 
         if not hold: # For full mode, until nested fixes are done (to not pollute history with partial events)
             with open(self.ctx.history_file, 'w') as f:
@@ -283,7 +283,7 @@ class FlowManager:
 
     # --- Handlers for the Full mode ---
 
-    def _find_subset_key(self, lst, counter_dict):
+    '''def _find_subset_key(self, lst, counter_dict):
         lst_set = set(lst)
         for k, v in counter_dict.items():
             for l in v:
@@ -418,61 +418,248 @@ class FlowManager:
                 if found_nested_event: break
             if not found_nested_event: break
         self.logger.log(f"Iteration {iter} found {event_id} event(s) during nested checks.", 'i')
-    
-    def _rename_best_mt(self, res: TaskResult, best_mt_idx: int) -> Tuple[MulTree, List[str], Dict[str, str]]:
+    '''
+
+    def _rename_best_mt(self, res: TaskResult, best_mt_idx: int, suffix: str) -> Tuple[MulTree, Set[str]]:
         """
         Renames the best MulTree's hybrid lineages for the next iteration.
-        Returns: (best_mt, disallowed_leaves, distance_map)
+        Format: |{i}.{j~copy_idx} (e.g., Species|1.0, <Internal>|1.1)
         best_mt is modified in place!
+        
+        Returns: 
+            best_mt: The modified MulTree (in place).
+            marked_names: Set of original node names for syncing GTs.
         """
         best_mt = res.mul_trees[best_mt_idx]
-
-        h1_node = best_mt.h1_node
-        h2_node = best_mt.h2_node
-        h1_leaves = h1_node.get_leaves()
-        h2_leaves = h2_node.get_leaves()
-        disallowed_lvs = [l.name for l in h1_leaves]
-
-        self._debug_tree(f"Renaming Context: {h1_node.name} (H1) | {h2_node.name} (H2)", best_mt.mt.ete_tree)
+        mt_wrapper = best_mt.mt
         
-        distance_map = {}
+        h1_node = best_mt.h1_node # Source
+        h2_node = best_mt.h2_node # Copy (Duplicated lineage)
+
+        self._debug_tree(f"Renaming Context: {h1_node.name} (H1) | {h2_node.name} (H2)", mt_wrapper.ete_tree)
+
+        # Build Renaming Map (Traverse to find descendants)
+        # We need to map EVERY node in these clades to a suffix.
+        # We use a dict to store the decision before applying it, 
+        # because applying it changes names and might break traversal if not careful.
+        
+        marked_nodes = set() # To track which nodes have been marked for renaming
+        # Add current
+        marked_nodes.add(h2_node)
+        # Add descendants
+        for desc in h2_node.iter_descendants():
+            marked_nodes.add(desc)
+
+        marked_names = set()
+
+        # Apply Renaming
+        # We must iterate carefully. The node_to_copy keys are tree nodes.
+        # We process them. Note: h1_node and h2_node might share a parent if the tree is small,
+        # but their subtrees should be disjoint in a valid MUL-tree.
+        
+        for node in marked_nodes:
+            old_name = node.name
+            
+            # Store for GTs (Map original name)
+            # Gene trees map to the name 'as is' in the recon result.
+            marked_names.add(old_name)
+            
+            # Remove any existing '*'
+            new_name = old_name.replace('*', '')
+
+            # Generate New Name
+            # Leaves: "Species" -> "Species|1.0"
+            # Internals: "<1>" -> "<1>|1.0"
+            new_name = f"{new_name}|{suffix}"
+
+            # Apply Rename using Wrapper (handles node_map updates)
+            mt_wrapper.rename_node(old_name, new_name)
+            
+        # Rename the <P2> tags for the next iteration logic
+        # P nodes of different iterations shouldn't have the same pure name! (hence no '|')
+        marked_names.add('<P2>')
+        mt_wrapper.rename_node('<P2>', f'<P:{suffix}>')
+
+        '''distance_map = {}
         for n in best_mt.mt.ete_tree.traverse():
             d1 = n.get_distance(h1_node, topology_only=True)
             d2 = n.get_distance(h2_node, topology_only=True)
-            distance_map[n.name] = ".1" if d1 < d2 else ".2"
-
-        # Rename MT nodes for next step logic
-        for l in h1_leaves: l.name += ".1"
-        for l in h2_leaves: l.name = l.name.replace("*", "") + ".2"
-
-        self._debug_tree("Renamed MT for next iteration:", best_mt.mt.ete_tree)
+            distance_map[n.name] = ".1" if d1 < d2 else ".2"'''
         
-        return best_mt, disallowed_lvs, distance_map
+        self._debug_tree("Renamed MT:", mt_wrapper.ete_tree, other_attr=['H', 'pure'])
+        return best_mt, marked_names
 
-    def _partition_gt_leaves(self, res: TaskResult, best_mt_idx: int, disallowed_lvs: List[str], distance_map: Dict[str, str]) -> List[Tree]:
-
+    def _partition_gt_leaves(self, res: TaskResult, best_mt_idx: int, marked_names: Set[str], suffix: str) -> List[Tree]:
+        """
+        Renames Gene Trees to match the Species Tree renaming logic.
+        Uses the mapping generated by _rename_best_mt.
+        """
         new_gts_list = []
         gts = res.gene_trees
         min_maps = res.kept_mul_maps[best_mt_idx]
         
-        debug_sample = self.sample(min_maps.keys())
+        debug_sample = self.sample(list(min_maps.keys()))
 
         for g_idx, map_obj in min_maps.items():
-            gt_ete = gts[g_idx].ete_tree.copy() # Operations on copies
+            gt_ete = gts[g_idx].ete_tree.copy() # Work on copy
 
             if g_idx in debug_sample:
                 self._debug_tree(f"Original GT {g_idx}:", gt_ete)
 
+            # Iterate GT leaves
             for l in gt_ete.iter_leaves():
-                if l.name.split('_')[1] in disallowed_lvs:
-                    # For now, default for the first map when there are multiple options
-                    l.name += distance_map[map_obj.cor[l.name][0]]
+                # Find where this GT leaf mapped in the MT
+                # map_obj.cor[gt_leaf_name] returns List[mt_node_names]
+                # We take the first mapping (usually only one for optimal recon)
+                mt_name_pre_rename = map_obj.cor[l.name][0]
+                if mt_name_pre_rename in marked_names:
+                    l.name = f"{l.name}|{suffix}"
+                    # l.pure stays the same!
+                    # No need to modify internal nodes - Reconcile only works on lvs
+
             new_gts_list.append(gt_ete)
 
             if g_idx in debug_sample:
-                self._debug_tree(f"Renamed GT {g_idx}:", gt_ete)
+                self._debug_tree(f"Renamed GT {g_idx}:", gt_ete, other_attr=['H', 'pure'])
         
         return new_gts_list
+
+    def find_missing_targets(self, multree: MulTree) -> Set[str]:
+        if self.ctx.ignore_nesting: return set()
+
+        h1_node = multree.h1_node
+        matches = multree.mt.match(h1_node.pure)
+
+        self.logger.log(f"Nested Fix: Found {[l.name for l in matches]} matches for H1 node in the MT.", 'd')
+        all_h2_locs_names = set()
+        already_populated = set()
+            
+        for h_node in matches:
+
+            # Get sister of the h node
+            h_sis = h_node.get_sisters()[0]
+            h_sis_name = h_sis.name
+
+            pure_sis, _ = h_sis_name.split('|') if '|' in h_sis_name else (h_sis_name, '')
+
+            if pure_sis != h_sis.pure:
+                self.logger.log(f"Nested Fix: Expected pure name '{pure_sis}' to match node's pure attribute '{h_sis.pure}'.", 'e')
+
+            h2_locs = multree.mt.match(pure_sis)
+            h2_locs_names = set(n.name for n in h2_locs)
+
+            self.logger.log(f"Nested Fix: For sister '{h_sis.name}', found H2 locations {h2_locs_names} after filtering.", 'd')
+            all_h2_locs_names.update(h2_locs_names)
+            
+            already_populated.add(h_sis_name)
+
+        # Targets must appear once, and exclude already populated ones
+        # It is not safe to remove within the loop - the next match might find another copy of the same lineage.
+        # We must track separately and remove at the end.
+        return all_h2_locs_names - already_populated
+
+    def _check_internality(self, t: Tree, node: TreeNode) -> bool:
+        """
+        Loads all the events from history that contain this node in their H1.
+        Out of these events, finds the smallest one (most recent) and checks if the node is the root of the H1 subtree in that event.
+        [A single species lineage is root by default]
+        """
+        containing_events = []
+        # FIX 1: We must include the node itself in the check set.
+        # If 'node' IS the H1 root, it must match 'h_node'. 
+        # iter_ancestors() only gives strict parents.
+        lineage_names = {p.name for p in node.iter_ancestors()}
+        lineage_names.add(node.name)
+
+        for event_data in self.ctx.history.values():
+            locs = event_data.get('H_locs', [])
+            for loc in locs:
+                # FIX 2: Safety check. History might contain old names not in 't'
+                loc_node = t.get_node(loc)
+                if not loc_node: 
+                    continue
+                
+                sisters = loc_node.get_sisters()
+                if not sisters: 
+                    continue
+
+                h_node = sisters[0] # The H1 root is the sister of the graft location
+                
+                # Check if this H1 root is the node itself or one of its ancestors
+                if h_node and h_node.name in lineage_names:
+                    # Found a containing event
+                    containing_events.append((h_node, len(h_node.get_leaves())))
+                    # Optimization: No need to check other locs for the same event
+                    break 
+
+        if not containing_events:
+            return False
+
+        # FIX 3: Logic Confirmation
+        # We find the "smallest" H1 (fewest leaves). In nested scenarios, 
+        # the smaller H1 is the more recent nested event inside a larger older H1.
+        smallest_event_root, _ = min(containing_events, key=lambda x: x[1])
+        
+        # Return True only if this node IS the root of that most recent event
+        return smallest_event_root.name == node.name
+
+    def fix_nested(self, targets: Set[str], multree: MulTree, genetrees: List[SmrtTree], iter: int,
+                   engine_callback: callable, internal_only: bool = False) -> None:
+        """
+        Detects nested hybridization by finding 'orphaned' copies of the H-lineage
+        directly in the tree structure using the .match() capability.
+        """        
+        curr_mt = multree
+        curr_gts = genetrees 
+        
+        # Start looking for Copy 2 (but index starts at 0)
+        next_copy_idx = 1
+
+        # Sort targets to ensure deterministic order (important for testing/debugging)
+        targets = sorted(targets)
+        
+        for target in targets:
+            h2_loc = curr_mt.mt.get_node(target)
+            if h2_loc is None:
+                self.logger.log(f"Nested Fix: Target node '{target}' not found in current MT. Skipping.", 'w')
+                continue
+
+            # If internal_only is True, skip if the target is the most external node in the event that produced it...
+            if internal_only and self._check_internality(curr_mt.mt, h2_loc):
+                self.logger.log(f"Nested Fix: Target node '{h2_loc.name}' is root in the smallest event containing it. Skipping due to internal_only=True.", 'd')
+                continue
+
+            # Trigger Nested Fix
+            self.logger.log(f"Nested Fix: Nested Event Detected! Locating missing copy at the branch leading to {h2_loc.name}", 'i')
+
+            h1_leaves = curr_mt.h1_node.get_leaves()
+            
+            fix_dir = self.ctx.root_dir / f'{iter}.{next_copy_idx}' / 'output'
+            
+            # Run Task to infer reconciliation for this missing copy
+            # We treat the 'Missing Candidate' as the H2 (Target) 
+            # and the current H1 as the source.
+            gt_dict = {i: SmrtTree(tree_obj=gt) for i, gt in enumerate(curr_gts)}
+
+            step = f"Nested Fix Iteration {iter}.{next_copy_idx}"
+            self.logger.report_step(step, "In progress...")
+
+            res, _ = engine_callback(
+                curr_mt.mt, gt_dict,
+                ",".join([l.name for l in h1_leaves]), # H1 is the reference
+                ",".join([l.name for l in h2_loc.get_leaves()]), # H2 is the new found copy
+                fix_dir
+            )
+
+            self.logger.report_step(step, "Success")
+
+            curr_mt, curr_gts = self.handle_iteration_result(
+                iter, res, engine_callback, fix_dir, self.logger, j=next_copy_idx
+            )
+
+            next_copy_idx += 1
+
+        self.logger.log(f"Nested check complete. Found {next_copy_idx-1} extra copies.", 'i')
 
     def handle_iteration_result(
             self, i: int, res: TaskResult,
@@ -488,31 +675,35 @@ class FlowManager:
         # Set logger for this iteration - not applicable for the split mode
         self.logger = iter_logger
 
+        suffix = f"{i}.{j}"
+
         # Rename best non-input MT
         nonin_idx = self._get_nonin_idx(res)
-        next_mt, disallowed_lvs, distance_map = self._rename_best_mt(res, nonin_idx)
+        next_mt, marked_names = self._rename_best_mt(res, nonin_idx, suffix)
 
         # Update history & check if passed cutoff
         passed = self._update_history(i, j, res)
         if not passed:
             self.logger.log(f"Cutoff reached: no parsimonious events found at Iteration {i}.", 'i')
             return next_mt, None
-        
+
         if j == 0:
             self.logger.log(f"Reticulation found at Iteration {i} with score {res.mt_score()}.", 'i')
         # Rename Trees for Next Iteration
-        new_gts_list = self._partition_gt_leaves(res, nonin_idx, disallowed_lvs, distance_map)
+        new_gts_list = self._partition_gt_leaves(res, nonin_idx, marked_names, suffix)
 
         if j == 0:
             # Check for Nested Hybridization
             # This encapsulates the while-loop for recursive sub-fixes
-            self.check_and_fix_nested(
+            targets = self.find_missing_targets(next_mt)
+            self.fix_nested(
+                targets         = targets,
                 multree         = res.mul_trees[nonin_idx],
                 genetrees       = new_gts_list,
                 iter            = i,
-                engine_callback = lambda st, gts, h1, h2, out: engine_callback(st, gts, h1, h2, out),
+                engine_callback = engine_callback,
             )
-
+            
         # Convert list back to Dict for GrandmaTree consumption
         next_gts = {idx: SmrtTree(tree_obj=gt) for idx, gt in enumerate(new_gts_list)}
         # Refresh the SmrtTree wrapper of MulTree
@@ -522,7 +713,7 @@ class FlowManager:
         CommonOps.write_handoff_files(iter_out.parent, next_mt.mt.ete_tree, new_gts_list)
         
         return next_mt, next_gts
-
+    
     # --- Handlers for the Split mode ---
     
     def extract_subproblems(self, res: TaskResult, depth: int, idx: int) -> None:

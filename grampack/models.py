@@ -461,10 +461,12 @@ class SmrtTree:
             raise ValueError(f"Tagged rename requires a non-alphanumeric tag at the end of the new name. Got '{tag}' in '{new_name}'.")
 
         node.name = new_name[:-1]+tag+'>' if new_name.endswith(">") else new_name+tag
+
         if not hasattr(node, 'pure'):
-            node.add_feature('pure', new_name)
+            node.add_feature('pure', new_name.split('|')[0])
         else:
-            node.pure = new_name
+            node.pure = new_name.split('|')[0]
+
         # Update node_map
         del self.node_map[old_name]
         self.node_map[new_name] = node

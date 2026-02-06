@@ -571,20 +571,22 @@ class Reconciler:
         if self.tcf.to_map < 0:
             n_lowest = len(mul_trees)
         else:
-            n_lowest = max(self.tcf.to_map, self.tcf.max_select)
+            n_lowest = max(self.tcf.to_map, self.tcf.max_select + 1) # full mode may require 2 maps at least
         detailed_res = self.get_lowest_maps(sorted_scores, n_lowest, mul_trees, gene_trees, registry, pickle_dir, run_prefix, logger)
         
         writer.write_results(sorted_scores, detailed_res, mul_trees, gene_trees)
 
         # Get the first k,v pair from detailed_res
         detailed_res_limited = {}
+        is_input_in = 0
         for mul_idx in detailed_res:
             # Instead of keeping ReconResult, keep Maps[0] (Dict[int, Dict[int, Map]] vs Dict[int, Dict[int, ReconResult]] in StepResult)
             maps_dict = {g_idx: res.maps[0] for g_idx, res in detailed_res[mul_idx].items()}
             detailed_res_limited[mul_idx] = maps_dict
             # Check if idx 0 (input tree) is a key in the dict yet
-            is_input_in = 0 in detailed_res_limited
-            if len(detailed_res_limited) >= self.tcf.max_select + int(is_input_in):
+            if mul_idx == 0:
+                is_input_in = 1
+            if len(detailed_res_limited) >= self.tcf.max_select + is_input_in:
                 # If input tree is included, allow one extra
                 # otherwise, we might not get enough inferred MTs
                 break
