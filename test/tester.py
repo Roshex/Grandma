@@ -23,7 +23,7 @@ if __name__ == "__main__":
 #        ("ex_no_w", "manual_gene_trees_no_w.txt", "manual_species_tree_no_w.tre"),
         ("ex_w", "manual_gene_trees_w.txt", "manual_species_tree_w.tre"),
 #        ("ex_w_snested", "manual_gene_trees_w_sn.txt", "manual_species_tree_w_sn.tre"),
-#        ("ex_k_back", "backbone.txt", "astral.tre"),
+        ("ex_k_back", "backbone.txt", "astral.tre"),
 #        ("ex_bend", "grampa_trees.tre", "species.tre"),
         ("ex_diaz", "grampa_trees.tre", "species.tre"),
     ]

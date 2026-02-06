@@ -626,7 +626,7 @@ class MulTreeManager:
             mt_data = mul_trees[idx]
             
             # Format tree string (add + to hybrid clade)
-            tree_str = mt_data.mt.to_string(internal_labels=True)
+            tree_str = mt_data.mt.to_str(internals=True)
             for spec in mt_data.h_clade:
                 # Regex: spec not followed by *
                 import re
@@ -677,7 +677,7 @@ def _check_worker(payload):
     pattern_str = r'\b(' + '|'.join(map(re.escape, m_data.h_clade)) + r')(?!\*)'
     regex = re.compile(pattern_str)
     
-    mt_str = m_data.mt.to_string(internal_labels=True)
+    mt_str = m_data.mt.to_str(internals=True)
     if mt_str.endswith(';'): mt_str = mt_str[:-1]
     
     mt_str = regex.sub(r'\1+', mt_str)
@@ -941,7 +941,7 @@ class GeneTreeManager:
         mt_regex_cache = {}
 
         def format_mt_optimized(mt, h_clade, m_idx):
-            s = mt.to_string(internal_labels=True)
+            s = mt.to_str(internal_labels=True)
             if s.endswith(';'): s = s[:-1]
             
             # Use cached compiled regex for this MUL-tree
@@ -1026,7 +1026,7 @@ class GeneTreeManager:
         with open(p, 'w') as f:
             for idx in sorted(gene_trees.keys()):
                 # GRAMPA writes the original newick string
-                f.write(gene_trees[idx].to_string(internal_labels=False) + "\n")
+                f.write(gene_trees[idx].to_str(internals=False) + "\n")
                 count += 1
                 
         self.logger.report_step(step, f"Success: {count} gene trees written")

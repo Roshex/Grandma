@@ -32,7 +32,7 @@ class GranMetadata:
     github: str = "TBD"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "2.8.0 (Modern)"
+    version: str = "2.8.5 (Modern)"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -783,7 +783,7 @@ class GranWriter:
             f.write("mul.tree\th1.node\th2.node\tscore\tlabeled.tree\n")
             for idx, score in sorted_scores:
                 mul_data = mul_trees[idx]
-                tree_str = mul_data.mt.to_string(internal_labels=True) 
+                tree_str = mul_data.mt.to_str(internals=True) 
                 for spec in mul_data.h_clade:
                     tree_str = re.sub(f"{spec}(?!\*)", f"{spec}+", tree_str)
                     tree_str = tree_str.replace("+*", "*")

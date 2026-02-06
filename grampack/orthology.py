@@ -13,7 +13,7 @@ class OrthologyLabeler:
         with open(orth_file_path, "w") as f_orth, open(label_file_path, "w") as f_lbl:
             
             # Header
-            f_orth.write(min_tree.to_string(internal_labels=False))
+            f_orth.write(min_tree.to_str(internals=False))
             f_orth.write("\n------------------\n")
             
             for gene_num, gene_data in gene_trees.items():

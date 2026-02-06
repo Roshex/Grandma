@@ -161,7 +161,7 @@ class Task:
 
         # DEBUG - print the string representation of all gene trees and the species tree and the first MUL tree
         """for mul_idx, md in self.mul_trees.items():
-            print(f"MUL Tree {mul_idx}: {md.mt.to_string(internal_labels=True)}, \
+            print(f"MUL Tree {mul_idx}: {md.mt.to_str(internals=True)}, \
                   H1: {md.h1_node}, H2: {md.h2_node}, Hybrid Clade: {md.h_clade}")
         for gene_num, gt_obj in self.gene_trees.items():
             ginfo = {}
@@ -169,8 +169,8 @@ class Task:
                 # in a list, store: branch length, parent name, "tip"/"internal"/"root", support
                 n_type = "tip" if n.is_leaf() else ("root" if n.is_root() else "internal")
                 ginfo[n.name] = [n.dist, n.up.name if n.up else None, n_type, n.support]
-            print(f"Gene Tree {gene_num}: {gt_obj.to_string(internal_labels=True)}, Node Info: {ginfo}")
-        print(f"Species Tree: {self.spec_tree.to_string(internal_labels=True)})"""
+            print(f"Gene Tree {gene_num}: {gt_obj.to_str(internals=True)}, Node Info: {ginfo}")
+        print(f"Species Tree: {self.spec_tree.to_str(internals=True)})"""
 
         # Re-init component with current task
         self.reconciler = Reconciler(tcf, self.ctx.num_processes)
@@ -215,7 +215,7 @@ class Task:
                                 min_data.h_clade, tcf.output_dir, tcf.run_prefix)
 
         # 8. Final Report
-        min_tree_str = min_data.mt.to_string(internal_labels=True)
+        min_tree_str = min_data.mt.to_str(internals=True)
         h_clade = min_data.h_clade
         for spec in h_clade:
             min_tree_str = re.sub(f"{spec}(?!\*)", f"{spec}+", min_tree_str)

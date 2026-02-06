@@ -96,30 +96,35 @@ class TreeLinearizer:
     def linearize(smrt_tree: 'SmrtTree', registry: NameRegistry) -> FlatTree:
         ete_tree = smrt_tree.ete_tree
         
-        # 1. Assign Integer IDs to all nodes (Preorder to keep IDs usually topological)
-        node_to_id = {node: i for i, node in enumerate(ete_tree.traverse("preorder"))}
-        num_nodes = len(node_to_id)
+        # Capture nodes in list. Index is the ID.
+        # This avoids the O(N log N) sort of the dictionary keys later.
+        nodes_in_order = list(ete_tree.traverse("preorder"))
+        num_nodes = len(nodes_in_order)
         
-        # Arrays
+        # Map object -> ID for parent lookups
+        node_to_id = {node: i for i, node in enumerate(nodes_in_order)}
+        
+        # Pre-allocate arrays (O(1) append vs O(N) resize overhead)
         parents = array.array('i', [-1] * num_nodes)
-        children_flat = array.array('i')
         children_start = array.array('i', [0] * (num_nodes + 1))
         node_to_name_id = array.array('i', [-1] * num_nodes)
         
-        # Fill Topology
-        cursor = 0
-        sorted_nodes = sorted(node_to_id.keys(), key=lambda n: node_to_id[n])
+        # We still need dynamic append for flat children as we don't know total count of edges upfront 
+        # (though for trees, edges = N-1, so we technically could pre-allocate, but append is fine here)
+        children_flat = array.array('i')
         
         name_id_to_node_id = {}
         node_id_to_name_id = {}
 
-        for node in sorted_nodes:
-            nid = node_to_id[node]
+        cursor = 0
+        
+        # Iterate the list directly
+        for nid, node in enumerate(nodes_in_order):
             
-            # Needs to be the unique raw name (with * for MUL trees) 
+            # --- Name Logic ---
             raw_name = str(node.name) if node.name else ""
-            
             name_idx = -1
+            
             if node.is_leaf():
                 # Extract species name. 
                 # For GT: "Gene_Species" -> "Species"
@@ -141,6 +146,7 @@ class TreeLinearizer:
 
             node_to_name_id[nid] = name_idx
 
+            # --- Topology Logic ---
             # Parent
             if node.up:
                 parents[nid] = node_to_id[node.up]
@@ -148,62 +154,89 @@ class TreeLinearizer:
             # Children
             children_start[nid] = cursor
             for child in node.children:
-                cid = node_to_id[child]
-                children_flat.append(cid)
+                # Direct dict lookup is fast
+                children_flat.append(node_to_id[child])
                 cursor += 1
         
         children_start[num_nodes] = cursor
 
-        # 2. Postorder Traversal (Int IDs)
+        # 2. Postorder Traversal
+        # Map the objects to IDs directly
         postorder = array.array('i', [node_to_id[n] for n in ete_tree.traverse("postorder")])
 
-        # 3. Euler Tour & RMQ Construction
+        # 3. Euler Tour & RMQ (Stack-Based DFS)
+        return TreeLinearizer._build_flat_tree(
+            num_nodes, node_to_id[ete_tree.get_tree_root()],
+            parents, children_start, children_flat, postorder,
+            node_to_name_id, name_id_to_node_id, node_id_to_name_id
+        )
+
+    @staticmethod
+    def _build_flat_tree(num_nodes, root_id, parents, children_start, children_flat, postorder,
+                         node_to_name_id, name_id_to_node_id, node_id_to_name_id):
+        """
+        Pure integer array processing. Separated from ETE3 logic.
+        """
         euler_nodes = array.array('i')
         euler_depths = array.array('i')
         first_visit = array.array('i', [-1] * num_nodes)
         
-        def dfs(u, d):
-            first_visit[u] = len(euler_nodes)
-            euler_nodes.append(u)
-            euler_depths.append(d)
-            
-            # Iterate children using CSR
-            start = children_start[u]
-            end = children_start[u+1]
-            for i in range(start, end):
-                v = children_flat[i]
-                dfs(v, d + 1)
-                euler_nodes.append(u)
-                euler_depths.append(d)
-
-        root = ete_tree.get_tree_root()
-        dfs(node_to_id[root], 0)
+        # Optimized Stack: (node_id, depth, child_ptr_start, child_ptr_end)
+        # Storing 'end' in the stack avoids array lookups inside the loop
+        stack = [[root_id, 0, children_start[root_id], children_start[root_id+1]]]
         
-        # Build Sparse Table
+        # Pre-visit root
+        first_visit[root_id] = 0
+        euler_nodes.append(root_id)
+        euler_depths.append(0)
+        
+        while stack:
+            # Peek at top (don't unpack yet to keep reference mutable if needed, though lists are ref)
+            frame = stack[-1]
+            u, d, ptr, end = frame
+            
+            if ptr < end:
+                # Visit next child
+                v = children_flat[ptr]
+                frame[2] += 1 # Advance pointer in current frame
+                
+                # Push child
+                stack.append([v, d + 1, children_start[v], children_start[v+1]])
+                
+                # Pre-visit child
+                first_visit[v] = len(euler_nodes)
+                euler_nodes.append(v)
+                euler_depths.append(d + 1)
+            else:
+                # Backtrack
+                stack.pop()
+                if stack:
+                    parent = stack[-1]
+                    euler_nodes.append(parent[0])
+                    euler_depths.append(parent[1])
+
+        # Sparse Table Logic
         L = len(euler_nodes)
+        rmq = []
         if L > 0:
             k_max = int(math.log2(L)) + 1
             rmq = [array.array('i', [0] * L) for _ in range(k_max)]
             
-            # Initialize M[0]
-            for i in range(L):
-                rmq[0][i] = i
+            for i in range(L): rmq[0][i] = i
             
-            # Compute remaining
             for j in range(1, k_max):
+                half = 1 << (j-1)
                 for i in range(L - (1 << j) + 1):
                     idx1 = rmq[j-1][i]
-                    idx2 = rmq[j-1][i + (1 << (j-1))]
+                    idx2 = rmq[j-1][i + half]
                     if euler_depths[idx1] < euler_depths[idx2]:
                         rmq[j][i] = idx1
                     else:
                         rmq[j][i] = idx2
-        else:
-            rmq = []
 
         return FlatTree(
             num_nodes=num_nodes,
-            root_id=node_to_id[root],
+            root_id=root_id,
             parents=parents,
             children_start=children_start,
             children_flat=children_flat,
@@ -217,11 +250,11 @@ class TreeLinearizer:
             node_id_to_name_id=node_id_to_name_id,
             rmq_table=rmq
         )
-    
+
 class SmrtTree:
     """Wrapper around ETE3 Tree to provide GRAMPA-specific functionality."""
 
-    __slots__ = ['ete_tree', 'node_map', 'lca_cache', 'flat_tree']
+    __slots__ = ['ete_tree', 'node_map', 'match_map', 'lca_cache', 'flat_tree']
 
     def __init__(self, newick: str = None, tree_obj: Tree = None):
         if tree_obj:
@@ -232,13 +265,14 @@ class SmrtTree:
             self.ete_tree = Tree(newick, format=0) 
             
         self.node_map: Dict[str, TreeNode] = {}
+        self.match_map: Dict[str, List[TreeNode]] = {}
         self.lca_cache: Dict[Tuple[int, ...], TreeNode] = {}
         self.flat_tree: Optional[FlatTree] = None
         
         self._index_nodes()
         #self._cache_depths()
 
-    def _index_nodes(self):
+    """def _index_nodes(self):
         self.node_map = {} 
         i = 1
         for node in self.ete_tree.traverse("postorder"):
@@ -249,7 +283,44 @@ class SmrtTree:
             else:
                 node.name = str(node.name).strip()
             
+            self.node_map[node.name] = node"""
+
+    def _index_nodes(self):
+        """
+        All nodes must have unique names after this, and pure attribute set (none-unique).
+        Leaves mustn't be in <> format, as these are reserved for internal nodes.
+        There should really be no use for the safe counter initialization (except on init), but it's here just in case!
+        """
+        self.node_map = {} 
+        
+        # Safe Counter Initialization:
+        # scan existing names to find the max index used so far
+        # cache nodes to avoid multiple traversals
+        to_name = []
+        max_idx = 0
+        for node in self.ete_tree.traverse("postorder"):
+            if node.is_leaf():
+                node.name = str(node.name).strip()
+            elif node.name:
+                if node.name.startswith("<") and node.name.endswith(">"):
+                    try:
+                        val = int(node.name[1:-1])
+                        if val > max_idx: max_idx = val
+                    except ValueError:
+                        pass
+            else:
+                to_name.append(node)
             self.node_map[node.name] = node
+        i = max_idx + 1
+
+        for node in to_name:
+            node.name = f"<{i}>"
+            i += 1
+            self.node_map[node.name] = node
+
+        for node in self.ete_tree.traverse("postorder"):
+            if not hasattr(node, 'pure'):
+                node.add_feature('pure', node.name.replace("*", ""))
 
     def _index_nodes_2(self, repair: bool = False, suffixed: bool = False):
         """
@@ -318,6 +389,7 @@ class SmrtTree:
 
     def refresh(self):
         self._index_nodes()
+        self.match_map = {}
         self.flat_tree = None # Invalidate flat tree on structural change
 
     def make_flat(self, registry: NameRegistry):
@@ -335,6 +407,17 @@ class SmrtTree:
 
     def get_node(self, name: str) -> Optional[TreeNode]:
         return self.node_map.get(name)
+    
+    def match(self, name: str) -> List[TreeNode]:
+        """
+        Assumes nodes have a 'pure' attribute with the cleaned name (e.g. "Species" without "*").
+        Returns all nodes matching the cleaned name, which is necessary for MUL trees.
+        """
+        if not self.match_map:
+            self.match_map = {}
+            for node in self.ete_tree.traverse():
+                self.match_map.setdefault(node.pure, []).append(node)
+        return self.match_map[name]
 
     @staticmethod
     def graft_subtree(tree: TreeNode, target: TreeNode, graft: TreeNode, name: str = None) -> TreeNode:
@@ -348,12 +431,60 @@ class SmrtTree:
             new_root.add_child(target.detach())
             new_root.add_child(graft)
             tree = new_root
+            if name:
+                new_root.add_feature("pure", name.replace("*", ""))
         else:
             new_internal = TreeNode(name=name)
             p_parent.add_child(new_internal)
             new_internal.add_child(target.detach())
             new_internal.add_child(graft)
+            if name:
+                new_internal.add_feature("pure", name.replace("*", ""))
         return tree
+    
+    def rename_node(self, old_name: str, new_name: str, tagged=False) -> None:
+        """
+        New name should be in pure form,
+        Old name is the current unique name in the tree, and should be tagged if tagged=True.
+        If old_name not found, does nothing.
+        """
+        node = self.get_node(old_name)
+        if not node:
+            return
+        
+        tag = ""
+        if tagged:
+            tag = new_name[-1]
+            if tag == '>':
+                tag = new_name[-2:-1]
+        if tag.isalnum():
+            raise ValueError(f"Tagged rename requires a non-alphanumeric tag at the end of the new name. Got '{tag}' in '{new_name}'.")
+
+        node.name = new_name[:-1]+tag+'>' if new_name.endswith(">") else new_name+tag
+        if not hasattr(node, 'pure'):
+            node.add_feature('pure', new_name)
+        else:
+            node.pure = new_name
+        # Update node_map
+        del self.node_map[old_name]
+        self.node_map[new_name] = node
+        # Clear caches
+        self.match_map = {}
+        self.flat_tree = None
+    
+    @staticmethod
+    def copy_lineage(subtree: TreeNode, tag: str = '') -> TreeNode:
+        subtree = subtree.copy()
+        # Pure name should be already set due to copy!
+        for n in subtree.traverse():
+            # n.add_feature('pure', n.name)
+            if n.is_leaf():
+                n.name = f"{n.name}{tag}"
+            elif n.name and n.name.startswith("<") and n.name.endswith(">"):
+                # Wipe internal node names which will be made unique during indexing
+                #n.name = None
+                n.name = n.name.replace(">", f"{tag}>")
+        return subtree
 
     def to_mul_tree(self, h_node_label: str, p_node_label: str) -> Optional[Tuple['SmrtTree', TreeNode, TreeNode]]:
         # [Existing to_mul_tree code remains identical]
@@ -370,22 +501,16 @@ class SmrtTree:
 
         if p_node in h1_node.iter_descendants(): return None, None, None
 
-        h2_subtree = h1_node.copy()
-        for leaf in h2_subtree.iter_leaves():
-            leaf.name = f"{leaf.name}*"
+        h2_subtree = SmrtTree.copy_lineage(h1_node, '*')
 
-        new_tree_obj = SmrtTree.graft_subtree(new_tree_obj, p_node, h2_subtree)
+        new_tree_obj = SmrtTree.graft_subtree(new_tree_obj, p_node, h2_subtree, '<P2>')
 
-        for n in new_tree_obj.traverse():
-            if n.name and n.name.startswith("<") and n.name.endswith(">"):
-                n.name = None
-        
         new_smrt = SmrtTree(tree_obj=new_tree_obj)
         return new_smrt, h1_node, h2_subtree # Note: returns objects in the new tree context
 
-    def to_string(self, internal_labels=True) -> str:
-        root_name = str(self.ete_tree.name) if internal_labels else ""
-        return self.ete_tree.write(format=8 if internal_labels else 9)[:-1]+root_name+";"
+    def to_str(self, internals=True) -> str:
+        root_name = str(self.ete_tree.name) if internals else ""
+        return self.ete_tree.write(format=8 if internals else 9)[:-1]+root_name+";"
     
     def __getstate__(self):
         return self.ete_tree
@@ -393,13 +518,6 @@ class SmrtTree:
     def __setstate__(self, state):
         self.ete_tree = state
         self.refresh()
-
-    # Legacy
-
-    def report_labels(self):
-        """Prints the species tree with internal nodes labeled."""
-        print("\n# The input species tree with internal nodes labeled:")
-        print(self.to_string(internal_labels=True) + "\n")
 
 @dataclass(slots=True, frozen=True)
 class Map:
