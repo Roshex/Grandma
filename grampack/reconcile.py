@@ -4,9 +4,10 @@ import multiprocessing as mp
 from tqdm import tqdm
 from pathlib import Path
 from functools import partial
-from typing import List, Dict, Tuple, Any, Set, Union
+from typing import List, Dict, Tuple, Any, Set, Union, Optional
 
 from .config import TaskConfig
+from .logger import GranLogger
 from .models import SmrtTree, MulTree, GroupData, Map, ReconResult, TaskResult, FlatTree, NameRegistry
 
 GroupsPickle = Dict[int, GroupData]
@@ -16,55 +17,74 @@ GroupsPickle = Dict[int, GroupData]
 def _worker_reconcile_single(
     mul_item: Tuple[int, Any], 
     flat_gts: Dict[int, FlatTree],
+    dup_cost: int,
+    loss_cost: int,
     registry: NameRegistry, 
     pickle_dir: str, 
-    run_prefix: str 
-) -> Tuple[int, int]:
+    run_prefix: str, 
+    retmap: bool = False,
+    optim: bool = False
+) -> Tuple[int, int, Optional[Dict[int, ReconResult]]]:
     
     mul_idx, flat_mul = mul_item
     total_score = 0
+    gt_results = {} if retmap else None
         
     # Case A: Species Tree 
     if mul_idx == 0:
         for g_num, gt_flat in flat_gts.items():
-
-            score = Reconciler.recon_lca_optimized(gt_flat, flat_mul)
-            total_score += score
+            res = Reconciler.recon_lca_optimized(gt_flat, flat_mul, dup_cost, loss_cost, registry=registry if retmap else None, retmap=retmap)
+            if retmap:
+                total_score += res.score
+                gt_results[g_num] = res
+            else:
+                total_score += res
             
     # Case B: MUL-Tree
     else:
-        
-        # Load Groups
         cur_groups = {}
         if mul_idx != 0:
             p_path = Path(pickle_dir) / f"{run_prefix}_{mul_idx}_groups.pickle"
             if p_path.exists():
-                #try:
-                    with open(p_path, 'rb') as f:
-                        cur_groups = pickle.load(f)
-                #except Exception:
-                #    return mul_idx, 9999999 
+                with open(p_path, 'rb') as f:
+                    cur_groups = pickle.load(f)
+
+        target_map = Reconciler.build_target_map(flat_mul, registry)
 
         for g_num, gt_flat in flat_gts.items():
-
             if g_num not in cur_groups: continue
             
             group_data = cur_groups[g_num]
-            score = Reconciler.reconcile_permutation(flat_mul, gt_flat, registry, group_data)
-            total_score += score
+            res = Reconciler.reconcile_permutation(gt_flat, flat_mul, dup_cost, loss_cost, registry, group_data, target_map, retmap=retmap, optim=optim)
+            
+            if retmap:
+                total_score += res.score
+                gt_results[g_num] = res
+            else:
+                total_score += res
 
-    return mul_idx, total_score
+    return mul_idx, total_score, gt_results
 
 class Reconciler:
-    def __init__(self, config: TaskConfig, num_processes: int = 1):
+    def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1, optim: bool = False):
         self.tcf = config
         self.num_processes = num_processes
-
+        self.optim = optim
+        self.logger = logger
+    
+    @staticmethod
+    def reconcile_permutation(gt_flat, mul_flat, dup_cost, loss_cost, registry, group_data, target_map, retmap=False, optim=False):
+        if optim:
+            res = Reconciler.reconcile_permutation_optim(gt_flat, mul_flat, dup_cost, loss_cost, registry, group_data, target_map, retmap=retmap)
+        else:
+            res = Reconciler.reconcile_permutation_old(gt_flat, mul_flat, dup_cost, loss_cost, registry, group_data, target_map, retmap=retmap)
+        return res
     # --------------------------------------------------------------------------
     # GROUP COLLAPSING LOGIC (Object-based, run once per iter)
     # --------------------------------------------------------------------------
 
-    def _get_sister_clade_labels(self, node_obj) -> List[str]:
+    @staticmethod
+    def _get_sister_clade_labels(node_obj) -> List[str]:
         if not node_obj or not node_obj.up: return []
         sisters = [ch for ch in node_obj.up.children if ch != node_obj]
         labels = []
@@ -73,7 +93,8 @@ class Reconciler:
             labels.extend([l.name.split("_")[-1] for l in sis.iter_leaves()])
         return labels
 
-    def _find_node_by_clade(self, tree: SmrtTree, target_leaves: Set[str]) -> Any:
+    @staticmethod
+    def _find_node_by_clade(tree: SmrtTree, target_leaves: Set[str]) -> Any:
         # OPTIMIZATION: Use Dictionary Lookup O(1) instead of search_nodes O(N)
         leaf_nodes = []
         for t in target_leaves:
@@ -87,32 +108,42 @@ class Reconciler:
         if lca_leaves == target_leaves: return lca
         return None
 
-    def get_sister_clades(self, mul_data: MulTree) -> Tuple[Set[str], Set[str]]:
+    @staticmethod
+    def get_sister_clades(mul_data: MulTree) -> Tuple[Set[str], List[Set[str]]]:
         """
-        Calculates sister clades ONCE per MUL-tree.
+        Returns:
+          1. h1_sisters: Set of names indicating H1 (Base) placement.
+          2. hx_sisters_list: List[Set[str]] where index 0 -> H2, 1 -> H3.
         """
         if mul_data.h1_node is None:
-            return set(), set()
+            return set(), []
             
         h1_target = set(mul_data.h_clade)
-        h2_target = {f"{x}*" for x in mul_data.h_clade}
-        
-        n1_obj = self._find_node_by_clade(mul_data.mt, h1_target)
-        n2_obj = self._find_node_by_clade(mul_data.mt, h2_target)
-        
-        h1_sisters = self._get_sister_clade_labels(n1_obj) if n1_obj else []
-        h2_sisters = self._get_sister_clade_labels(n2_obj) if n2_obj else []
+        n1_obj = Reconciler._find_node_by_clade(mul_data.mt, h1_target)
+        h1_sisters = set(Reconciler._get_sister_clade_labels(n1_obj) if n1_obj else [])
 
-        if n2_obj and not set(h1_sisters).isdisjoint({l.name for l in n2_obj.iter_leaves()}): h1_sisters = []
-        if n1_obj and not set(h2_sisters).isdisjoint({l.name for l in n1_obj.iter_leaves()}): h2_sisters = []
-
-        h1_clean = {x.replace("*", "") for x in h1_sisters}
-        h2_clean = {x.replace("*", "") for x in h2_sisters}
+        hx_sisters_list = []
+        targets = mul_data.hx_nodes if mul_data.hx_nodes else ([mul_data.h2_node] if mul_data.h2_node else [])
         
-        return h1_clean, h2_clean
+        for hx_node in targets:
+            if hx_node:
+                sisters = Reconciler._get_sister_clade_labels(hx_node)
+                if not set(h1_sisters).isdisjoint({l.name for l in hx_node.iter_leaves()}): 
+                    h1_sisters = set()
+                if n1_obj and not set(sisters).isdisjoint({l.name for l in n1_obj.iter_leaves()}): 
+                    sisters = []
+                # Append Set of clean names directly to the list
+                hx_sisters_list.append({s.replace("*", "") for s in sisters})
+            else:
+                hx_sisters_list.append(set())
 
-    def compute_groups(self, gene_tree: SmrtTree, mul_data: MulTree, registry: NameRegistry,
-                       h1_sisters: Set[str] = None, h2_sisters: Set[str] = None) -> GroupData:
+        h1_sisters = {x.replace("*", "") for x in h1_sisters}
+
+        return h1_sisters, hx_sisters_list
+
+    @staticmethod
+    def compute_groups(gene_tree: SmrtTree, mul_data: MulTree, registry: NameRegistry,
+                       h1_sisters: Set[str] = None, hx_sisters_list: List[Set[str]] = None) -> GroupData:
         """
         Registry-Optimized O(N) implementation.
         Uses integer IDs for Set operations (Union/IsSubset) to achieve significant speedup.
@@ -210,25 +241,29 @@ class Reconciler:
         final_ambiguous = [] # List of List[int]
         final_fixed = []     # List of (List[int], str)
 
-        # Sister checking (Logic using string sets for safety/easier debugging)
+        # Sister checking
         if mul_data.h1_node and (h1_sisters is None):
-            h1_sisters, h2_sisters = self.get_sister_clades(mul_data)
+            h1_sisters, hx_sisters_list = Reconciler.get_sister_clades(mul_data)
 
         def to_ids(names):
             return [registry.get_id(n) for n in names]
 
         def check_fix(unit_nodes, anc_leaves):
-            # unit_nodes is list of strings
-            
-            group_sis_specs = [n.split("_")[-1] for n in anc_leaves]
+            # Convert to Set for fast subset math
+            group_sis_specs = {n.split("_")[-1] for n in anc_leaves}
             
             if group_sis_specs:
-                if h1_sisters and all(s in h1_sisters for s in group_sis_specs):
-                    final_fixed.append((to_ids(unit_nodes), ''))
+                if h1_sisters and group_sis_specs.issubset(h1_sisters):
+                    # Index 0 corresponds to the Base/H1 target
+                    final_fixed.append((to_ids(unit_nodes), 0))
                     return
-                elif h2_sisters and all(s in h2_sisters for s in group_sis_specs):
-                    final_fixed.append((to_ids(unit_nodes), '*'))
-                    return
+                
+                if hx_sisters_list:
+                    for t_idx, sis_set in enumerate(hx_sisters_list):
+                        if sis_set and group_sis_specs.issubset(sis_set):
+                            # Index t_idx + 1 corresponds to H2 (1), H3 (2), etc.
+                            final_fixed.append((to_ids(unit_nodes), t_idx + 1))
+                            return
             
             final_ambiguous.append(to_ids(unit_nodes))
 
@@ -239,17 +274,45 @@ class Reconciler:
             check_fix([s_name], anc_leaves)
 
         return GroupData(final_ambiguous, final_fixed)
-    
+
     # --------------------------------------------------------------------------
     # RECONCILIATION LOGIC (Unified Flat)
     # --------------------------------------------------------------------------
 
     @staticmethod
-    def translate_groups_to_ids(
-        group_data: GroupData, 
-        gt_flat: FlatTree, 
-        registry: NameRegistry
-    ) -> Tuple[List[List[int]], List[Tuple[List[int], str]]]:
+    def build_target_map(mul_flat: FlatTree, registry: NameRegistry) -> Dict[int, List[int]]:
+        """
+        Calculates the target map ONCE per MUL-tree to avoid redundant string parsing.
+        Maps base Species IDs to a list of available MUL-tree node indices.
+        """
+        target_map = {} 
+        for i in range(mul_flat.num_nodes):
+            if mul_flat.children_start[i] == mul_flat.children_start[i+1]: 
+                name_id = mul_flat.node_to_name_id[i]
+                if name_id == -1: continue
+                
+                sp_name = registry.get_name(name_id)
+                base_name = sp_name.replace("*", "")
+                base_id = registry.get_id(base_name)
+                
+                if base_id not in target_map: target_map[base_id] = []
+                
+                tag_count = sp_name.count("*")
+                while len(target_map[base_id]) <= tag_count:
+                    target_map[base_id].append(-1)
+                target_map[base_id][tag_count] = i
+        
+        # Fill holes with default (Ancestral/0) if specific copies missing
+        for bid, targets in target_map.items():
+            if not targets: continue
+            valid_target = next((t for t in targets if t != -1), -1)
+            for k in range(len(targets)):
+                if targets[k] == -1: targets[k] = valid_target
+                
+        return target_map
+
+    @staticmethod
+    def translate_groups_to_ids(gt_flat: FlatTree, group_data: GroupData) -> Tuple[List[List[int]], List[Tuple[List[int], str]]]:
         """
         Modified to accept GroupData that already contains IDs.
         Filters for nodes present in the flattened tree.
@@ -275,6 +338,7 @@ class Reconciler:
 
     @staticmethod
     def recon_lca_optimized(gt: FlatTree, st: FlatTree,
+                            dup_cost: int, loss_cost: int,
                             registry: NameRegistry = None, 
                             precalc_map: Dict[int, int] = None, 
                             retmap=False) -> Union[int, ReconResult]:
@@ -325,7 +389,7 @@ class Reconciler:
             is_dup = 0
             if m_lca == m1 or m_lca == m2:
                 is_dup = 1
-                score += 1
+                score += dup_cost
                 if retmap: node_dups[u] = 1
             elif retmap:
                 node_dups[u] = 0
@@ -337,8 +401,8 @@ class Reconciler:
             loss1 = (d_c1 - d_lca - 1) + is_dup 
             loss2 = (d_c2 - d_lca - 1) + is_dup
             
-            if loss1 > 0: score += loss1
-            if loss2 > 0: score += loss2
+            if loss1 > 0: score += (loss_cost * loss1)
+            if loss2 > 0: score += (loss_cost * loss2)
             
             if retmap:
                 node_losses[c1] = loss1 if loss1 > 0 else 0
@@ -354,7 +418,7 @@ class Reconciler:
             map_root = lca_maps[root_id]
             root_depth = st.depths[st.first_visit[map_root]]
             if root_depth > 0:
-                score += root_depth
+                score += (loss_cost * root_depth)
                 if retmap: node_losses[root_id] += root_depth
 
         # --- Generate Map Object ---
@@ -396,69 +460,305 @@ class Reconciler:
             
         return score
 
+    # --- Dirty Node Optimization ---
+    
     @staticmethod
-    def reconcile_permutation(mul_flat: FlatTree, gt_flat: FlatTree, registry: NameRegistry,
-                            group_data: GroupData, retmap: bool = False) -> Union[int, ReconResult]:
+    def identify_dirty_nodes(gt_flat: FlatTree, dirty_leaves: List[int]) -> Tuple[List[int], List[bool]]:
+        """
+        Identifies all ancestors of dirty leaves.
+        Returns: 
+          - dirty_postorder: List of node IDs in post-order that are dirty.
+          - dirty_mask: Boolean array of size N.
+        """
+        is_dirty = [False] * gt_flat.num_nodes
         
-        # 0. Translate Groups (String -> Int)
-        ambig_groups, fixed_groups = Reconciler.translate_groups_to_ids(group_data, gt_flat, registry)
-
-        # 1. Pre-calculate Targets (Same as before)
-        target_map = {} 
-        for i in range(mul_flat.num_nodes):
-            if mul_flat.children_start[i] == mul_flat.children_start[i+1]: 
-                name_id = mul_flat.node_to_name_id[i]
-                if name_id == -1: continue
-                sp_name = registry.get_name(name_id)
-                base_name = sp_name.replace("*", "")
-                base_id = registry.get_id(base_name)
-                if base_id not in target_map: target_map[base_id] = [-1, -1]
-                if "*" in sp_name: target_map[base_id][1] = i
-                else: target_map[base_id][0] = i
+        # Mark leaves
+        stack = list(dirty_leaves)
+        for u in stack:
+            if not is_dirty[u]:
+                is_dirty[u] = True
+                p = gt_flat.parents[u]
+                if p != -1:
+                    stack.append(p)
+                    
+        # Filter existing postorder to maintain valid DP order
+        dirty_postorder = [u for u in gt_flat.postorder if is_dirty[u]]
         
-        for bid, targets in target_map.items():
-            if targets[0] == -1: targets[0] = targets[1]
-            if targets[1] == -1: targets[1] = targets[0]
+        return dirty_postorder, is_dirty
 
-        # 2. Build Instructions
+    @staticmethod
+    def calculate_static_score(gt_flat: FlatTree, st_flat: FlatTree, dup_cost: int, loss_cost: int,
+                               lca_maps: Dict[int, int], dirty_mask: List[bool]) -> int:
+        """
+        Calculates the score contribution of all CLEAN nodes.
+        Runs a standard scoring pass but ignores Dirty nodes.
+        """
+        score = 0
+        # Iterate postorder
+        for u in gt_flat.postorder:
+            if dirty_mask[u]: continue # Skip dirty
+            
+            # Logic same as recon_lca_optimized
+            start = gt_flat.children_start[u]
+            end = gt_flat.children_start[u+1]
+            
+            if start == end: continue # Leaf
+            
+            c1 = gt_flat.children_flat[start]
+            c2 = gt_flat.children_flat[start+1]
+            m1 = lca_maps[c1]
+            m2 = lca_maps[c2]
+            
+            # Note: Clean nodes have Clean children (by definition of ancestors).
+            # So m1/m2 are static.
+            
+            m_lca = st_flat.get_lca(m1, m2)
+            # IMPORTANT: We assume lca_maps[u] is already set correctly from a base run?
+            # Or we compute it? 
+            # Ideally we compute it here to ensure consistency.
+            lca_maps[u] = m_lca # Update map even if clean
+            
+            is_dup = 0
+            if m_lca == m1 or m_lca == m2:
+                is_dup = 1
+                score += dup_cost
+            
+            d_lca = st_flat.depths[st_flat.first_visit[m_lca]]
+            d_c1 = st_flat.depths[st_flat.first_visit[m1]]
+            d_c2 = st_flat.depths[st_flat.first_visit[m2]]
+            
+            loss1 = (d_c1 - d_lca - 1) + is_dup 
+            loss2 = (d_c2 - d_lca - 1) + is_dup
+            
+            if loss1 > 0: score += (loss_cost * loss1)
+            if loss2 > 0: score += (loss_cost * loss2)
+
+        # Root penalty (if root is clean)
+        root_id = gt_flat.postorder[-1]
+        if not dirty_mask[root_id] and root_id in lca_maps:
+            map_root = lca_maps[root_id]
+            root_depth = st_flat.depths[st_flat.first_visit[map_root]]
+            if root_depth > 0: score += (loss_cost * root_depth)
+             
+        return score
+
+    @staticmethod
+    def recon_dirty_optimized(gt_flat: FlatTree, st_flat: FlatTree, dup_cost: int, loss_cost: int,
+                              dirty_postorder: List[int], dirty_mask: List[bool],
+                              base_score: int, lca_maps: Dict[int, int]) -> int:
+        """
+        Updates maps and score ONLY for dirty nodes.
+        """
+        current_score = base_score
+        
+        for u in dirty_postorder:
+            start = gt_flat.children_start[u]
+            end = gt_flat.children_start[u+1]
+            
+            if start == end: continue # Leaf (already mapped before calling)
+            
+            c1 = gt_flat.children_flat[start]
+            c2 = gt_flat.children_flat[start+1]
+            
+            m1 = lca_maps[c1]
+            m2 = lca_maps[c2]
+            
+            m_lca = st_flat.get_lca(m1, m2)
+            lca_maps[u] = m_lca
+            
+            is_dup = 0
+            if m_lca == m1 or m_lca == m2:
+                is_dup = 1
+                current_score += dup_cost
+            
+            d_lca = st_flat.depths[st_flat.first_visit[m_lca]]
+            d_c1 = st_flat.depths[st_flat.first_visit[m1]]
+            d_c2 = st_flat.depths[st_flat.first_visit[m2]]
+            
+            loss1 = (d_c1 - d_lca - 1) + is_dup 
+            loss2 = (d_c2 - d_lca - 1) + is_dup
+            
+            if loss1 > 0: current_score += (loss_cost * loss1)
+            if loss2 > 0: current_score += (loss_cost * loss2)
+            
+        # Root penalty (if root is dirty)
+        root_id = gt_flat.postorder[-1]
+        if dirty_mask[root_id]:
+             map_root = lca_maps[root_id]
+             root_depth = st_flat.depths[st_flat.first_visit[map_root]]
+             if root_depth > 0: current_score += (loss_cost * root_depth)
+             
+        return current_score
+
+    @staticmethod
+    def reconcile_permutation_optim(gt_flat: FlatTree, mul_flat: FlatTree, dup_cost: int, loss_cost: int,
+                            registry: NameRegistry, group_data: GroupData, target_map: Dict[int, List[int]],
+                            retmap: bool = False) -> Union[int, ReconResult]:
+        
+        # Translate Groups
+        ambig_groups, fixed_groups = Reconciler.translate_groups_to_ids(gt_flat, group_data)
+
+        # Build Instructions & Identify Dirty Leaves
         instructions = {}
-        for idx, grp_ids in enumerate(ambig_groups):
-            for nid in grp_ids: instructions[nid] = (0, idx)
-        for grp_ids, suffix in fixed_groups:
-            t_idx = 1 if suffix == "*" else 0
-            for nid in grp_ids: instructions[nid] = (1, t_idx)
+        dirty_leaves = []
+        ambig_ranges = []
 
-        # 3. Base Map
+        for idx, grp_ids in enumerate(ambig_groups):
+            # Dynamic Range: limits combinations to the exact number of available copies
+            sample_node = grp_ids[0]
+            gt_name_id = gt_flat.node_to_name_id[sample_node]
+            gt_name = registry.get_name(gt_name_id)
+            sp_name = gt_name.split("_")[-1]
+            sp_base_id = registry.get_id(sp_name)
+            
+            available_targets = target_map.get(sp_base_id, [0])
+            ambig_ranges.append(range(len(available_targets)))
+
+            for nid in grp_ids: 
+                instructions[nid] = (0, idx)
+                dirty_leaves.append(nid)
+
+        for grp_ids, t_idx in fixed_groups:
+            for nid in grp_ids: 
+                instructions[nid] = (1, t_idx)
+
+        # --- OPTIMIZATION SETUP ---
+        dirty_postorder, dirty_mask = Reconciler.identify_dirty_nodes(gt_flat, dirty_leaves)
+
+        # Base Map (Initialize ALL leaves)
         base_leaf_targets = {}
+        lca_maps = {}
+        
         for i in range(gt_flat.num_nodes):
             if gt_flat.children_start[i] == gt_flat.children_start[i+1]:
                 sp_name_id = gt_flat.node_to_name_id[i]
-                if sp_name_id in target_map:
-                    base_leaf_targets[i] = target_map[sp_name_id]
+                sp_base_name = registry.get_name(sp_name_id).split("_")[-1]
+                sp_base_id = registry.get_id(sp_base_name)
+                
+                targets = target_map.get(sp_base_id, [0])
+                base_leaf_targets[i] = targets
+                
+                # Apply initialization fix for "Clean" nodes
+                # Check instructions to correctly initialize Fixed vs Ambig vs Singleton
+                if i in instructions:
+                    type_code, val = instructions[i]
+                    if type_code == 1: # Fixed Group
+                        # Initialize Fixed nodes to their actual target (e.g. H2)
+                        # because they are "Clean" and won't be updated by the loop.
+                        choice = val if val < len(targets) else 0
+                        lca_maps[i] = targets[choice]
+                    else:
+                        # Ambig Group: Default to 0 for initial static calc
+                        lca_maps[i] = targets[0]
+                else:
+                    # Singleton/Non-group: Default to 0
+                    lca_maps[i] = targets[0]
 
-        # 4. Permutation Loop
+        # Calculate Static Score (Cost of clean nodes)
+        # We must run a full recon once to populate internal lca_maps for clean nodes!
+        # Reusing standard recon logic for setup
+        Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, precalc_map=lca_maps)
+        # Populate lca_maps for all nodes
+        static_score = Reconciler.calculate_static_score(gt_flat, mul_flat, dup_cost, loss_cost, lca_maps, dirty_mask)
+        
+        # --- Permutation Loop ---
         best_score = 999999
         all_maps = []
 
-        for combo in itertools.product([0, 1], repeat=len(ambig_groups)):
-            current_map = {}
-            for u, targets in base_leaf_targets.items():
+        # Use itertools.product unpacked dynamically
+        for combo in itertools.product(*ambig_ranges):
+            
+            # Update ONLY Ambig Leaves
+            for u in dirty_leaves:
                 if u in instructions:
                     type_code, val = instructions[u]
                     choice = combo[val] if type_code == 0 else val
-                    current_map[u] = targets[choice]
-                else:
-                    current_map[u] = targets[0]
-            
+                    
+                    targets = base_leaf_targets[u]
+                    if choice >= len(targets): choice = 0 # Out-of-bounds safety
+                    
+                    lca_maps[u] = targets[choice]
+
             if retmap:
-                res = Reconciler.recon_lca_optimized(gt_flat, mul_flat, registry, current_map, True)
+                # Full recalculation for safety on return map (speed less critical here, happens once)
+                res = Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, registry, lca_maps, True)
                 if res.score < best_score:
                     best_score = res.score
                     all_maps = res.maps
                 elif res.score == best_score:
                     all_maps.extend(res.maps)
             else:
-                score = Reconciler.recon_lca_optimized(gt_flat, mul_flat, precalc_map=current_map, retmap=False)
+                # Optimized Scoring
+                score = Reconciler.recon_dirty_optimized(gt_flat, mul_flat, dup_cost, loss_cost, dirty_postorder, dirty_mask, static_score, lca_maps)
+                if score < best_score:
+                    best_score = score
+        
+        if retmap:
+            return ReconResult(best_score, all_maps)
+        return best_score
+    
+    @staticmethod
+    def reconcile_permutation_old(gt_flat: FlatTree, mul_flat: FlatTree, dup_cost: int, loss_cost: int,
+                            registry: NameRegistry, group_data: GroupData, target_map: Dict[int, List[int]],
+                            retmap: bool = False) -> Union[int, ReconResult]:
+        
+        # Translate Groups
+        ambig_groups, fixed_groups = Reconciler.translate_groups_to_ids(gt_flat, group_data)
+
+        # Build Instructions
+        instructions = {}
+        ambig_ranges = [] 
+        for idx, grp_ids in enumerate(ambig_groups):
+            sample_node = grp_ids[0]
+            gt_name_id = gt_flat.node_to_name_id[sample_node]
+            gt_name = registry.get_name(gt_name_id)
+            sp_name = gt_name.split("_")[-1]
+            sp_base_id = registry.get_id(sp_name)
+            
+            available_targets = target_map.get(sp_base_id, [0])
+            ambig_ranges.append(range(len(available_targets)))
+
+            for nid in grp_ids: instructions[nid] = (0, idx)
+
+        for grp_ids, t_idx in fixed_groups:
+            for nid in grp_ids: 
+                instructions[nid] = (1, t_idx)
+
+        # Base Map
+        base_leaf_targets = {}
+        for i in range(gt_flat.num_nodes):
+            if gt_flat.children_start[i] == gt_flat.children_start[i+1]:
+                sp_name_id = gt_flat.node_to_name_id[i]
+                sp_base_name = registry.get_name(sp_name_id).split("_")[-1]
+                sp_base_id = registry.get_id(sp_base_name)
+                
+                targets = target_map.get(sp_base_id, [0])
+                base_leaf_targets[i] = targets
+
+        # --- Permutation Loop ---
+        best_score = 999999
+        all_maps = []
+
+        for combo in itertools.product(*ambig_ranges):
+            current_map = {}
+            for u, targets in base_leaf_targets.items():
+                if u in instructions:
+                    type_code, val = instructions[u]
+                    choice = combo[val] if type_code == 0 else val
+                    if choice >= len(targets): choice = 0 
+                    current_map[u] = targets[choice]
+                else:
+                    current_map[u] = targets[0]
+            
+            if retmap:
+                res = Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, registry, current_map, True)
+                if res.score < best_score:
+                    best_score = res.score
+                    all_maps = res.maps
+                elif res.score == best_score:
+                    all_maps.extend(res.maps)
+            else:
+                score = Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, precalc_map=current_map, retmap=False)
                 if score < best_score:
                     best_score = score
         
@@ -466,11 +766,11 @@ class Reconciler:
             return ReconResult(best_score, all_maps)
         return best_score
 
-    def recon_all(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry, 
-                  pickle_dir: str, run_prefix: str, n_proc: int, logger: Any) -> List[Tuple[int, int]]:
+    def recon_all(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree],
+                  registry: NameRegistry, retmap: bool = False) -> Tuple[List[Tuple[int, int]], Dict[int, Dict[int, ReconResult]]]:
         
         step = "Reconciliation"
-        logger.report_step(step, "In progress...")
+        self.logger.report_step(step, "In progress...")
         
         # Flatten Everything
         gene_trees_flat = {}
@@ -480,51 +780,54 @@ class Reconciler:
 
         for idx, mdata in mul_trees.items():
             mdata.mt.make_flat(registry)
-
-        # Debug some of the flat trees
-        '''logger.log(f"Flat species tree nodes: {mul_trees[0].mt.flat_tree.node_id_to_name_id}", 'd')
-        logger.log(f"Flat gene tree[0] nodes: {gene_trees_flat[0].node_id_to_name_id}", 'd') # bug if 0 was filtered
-        logger.log(f"Flat first mt nodes: {mul_trees[1].mt.flat_tree.node_id_to_name_id}", 'd')
-        # print registry contents
-        for i in range((registry.size())):
-            logger.log(f"Registry ID {i}: {registry._int_to_str[i]}", 'd')'''
             
         all_scores = {}
+        detailed_res = {}
         tasks = list(mul_trees.items())
         gene_trees_flat_dict = {k: v.flat_tree for k, v in gene_trees.items()}
+        dup_cost, loss_cost = self.tcf.weights
         
         worker_func = partial(_worker_reconcile_single, 
                               flat_gts=gene_trees_flat_dict,
+                              dup_cost=dup_cost,
+                              loss_cost=loss_cost,
                               registry=registry, 
-                              pickle_dir=str(pickle_dir), 
-                              run_prefix=run_prefix)
+                              pickle_dir=str(self.tcf.pickle_dir), 
+                              run_prefix=self.tcf.run_prefix,
+                              retmap=retmap, 
+                              optim=self.optim
+                            )
         
-        if n_proc > 1:
-            with mp.Pool(processes=n_proc) as pool:
+        if self.num_processes > 1:
+            with mp.Pool(processes=self.num_processes) as pool:
                 flat_tasks = [(k, v.mt.flat_tree) for k, v in tasks]
                 #for idx, score in pool.imap_unordered(worker_func, flat_tasks):
                 iterator = pool.imap_unordered(worker_func, flat_tasks)
-                for idx, score in tqdm(iterator, total=len(tasks), desc="Scoring   ", unit="mt", disable=logger.verbosity < 3):
+                for idx, score, gt_res in tqdm(iterator, total=len(tasks), desc="Scoring   ", unit="st", disable=self.logger.verbosity < 3):
                     all_scores[idx] = score
+                    if retmap:
+                        detailed_res[idx] = gt_res
         else:
             #for k, v in tasks:
-            for k, v in tqdm(tasks, total=len(tasks), desc="Scoring   ", unit="mt", disable=logger.verbosity < 3):
+            for k, v in tqdm(tasks, total=len(tasks), desc="Scoring   ", unit="st", disable=self.logger.verbosity < 3):
                 item = (k, v.mt.flat_tree)
-                idx, score = worker_func(item)
+                idx, score, gt_res = worker_func(item)
                 all_scores[idx] = score
+                if retmap:
+                    detailed_res[idx] = gt_res
 
-        logger.report_step(step, "Success")
-        return sorted(all_scores.items(), key=lambda x: x[1])
+        self.logger.report_step(step, "Success")
+        return sorted(all_scores.items(), key=lambda x: x[1]), detailed_res
     
-    # Updated signature to accept registry
     def get_lowest_maps(self, sorted_scores: List[Tuple[int, int]], n_lowest: int, 
-                        mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry,
-                        pickle_dir: str, run_prefix: str, logger: Any) -> Dict[int, Dict[int, ReconResult]]:
+                        mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree],
+                        registry: NameRegistry) -> Dict[int, Dict[int, ReconResult]]:
         
         step = "Getting maps for lowest scoring MTs"
-        logger.report_step(step, "In progress...")
+        self.logger.report_step(step, "In progress...")
         detailed_res = {} 
         limit = min(len(sorted_scores), n_lowest)
+        dup_cost, loss_cost = self.tcf.weights
         
         # Ensure flat structures exist (should be cached from recon_all)
         gt_flat_dict = {k: v.flat_tree for k, v in gene_trees.items()}
@@ -536,64 +839,74 @@ class Reconciler:
             # Load Groups
             cur_groups = {}
             if idx != 0:
-                p_path = Path(pickle_dir) / f"{run_prefix}_{idx}_groups.pickle"
+                p_path = self.tcf.pickle_dir / f"{self.tcf.run_prefix}_{idx}_groups.pickle"
                 if p_path.exists():
                     with open(p_path, 'rb') as f:
                         cur_groups = pickle.load(f)
+                target_map = Reconciler.build_target_map(mul_flat, registry)
             
             gt_results = {}
             for g_num, gt_flat in gt_flat_dict.items():
                 if idx == 0:
                     # ST case
-                    res = Reconciler.recon_lca_optimized(gt_flat, mul_flat, registry, retmap=True)
+                    res = Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, registry, retmap=True)
                 else:
                     # MUL case
                     group_data = cur_groups.get(g_num, GroupData([], []))
-                    res = Reconciler.reconcile_permutation(mul_flat, gt_flat, registry, group_data, retmap=True)
+                    res = Reconciler.reconcile_permutation(gt_flat, mul_flat, dup_cost, loss_cost, registry, group_data, target_map, retmap=True, optim=self.optim)
                 
                 gt_results[g_num] = res
             
             detailed_res[idx] = gt_results
             
-        logger.report_step(step, "Success")
+        self.logger.report_step(step, "Success")
         return detailed_res
         
-    def run(self, mul_trees: dict, gene_trees: dict, registry: NameRegistry, logger: Any, writer: Any) -> TaskResult:
+    def run(self, mul_trees: dict, gene_trees: dict, registry: NameRegistry, writer: Any) -> TaskResult:
 
-        pickle_dir, run_prefix, = self.tcf.pickle_dir, self.tcf.run_prefix
-        n_proc = self.num_processes
-        
         if registry is None: registry = NameRegistry()
 
-        sorted_scores = self.recon_all(mul_trees, gene_trees, registry, pickle_dir, run_prefix, n_proc, logger)
+        num_mts = len(mul_trees)
+        limit = self.tcf.to_map if self.tcf.to_map >= 0 else num_mts
+        # Full mode may require 2 maps at least
+        # Can't select more than available MTs
+        corrected_max_select = min(self.tcf.max_select+1, num_mts)
+        limit = max(limit, corrected_max_select)
+
+        if self.optim:
+            self.logger.log("Using optimized reconciliation method.", 'i')
         
-        # If negative, output all maps
-        if self.tcf.to_map < 0:
-            n_lowest = len(mul_trees)
+        # High Map Demand Threshold: 10%
+        high_demand = (limit > num_mts * 0.1)
+
+        if high_demand:
+            self.logger.log("High map demand detected. Generating maps directly during scoring.", 'i')
+            sorted_scores, detailed_res = self.recon_all(mul_trees, gene_trees, registry, retmap=True)
+            
+            # Trim the detailed_res down to `limit` to save memory and I/O writing overhead
+            # while sorting to keep it consistent with the output format of get_lowest_maps.
+            detailed_res = {k: detailed_res[k] for k, _ in sorted_scores[:limit] if k in detailed_res}
+
         else:
-            n_lowest = max(self.tcf.to_map, self.tcf.max_select + 1) # full mode may require 2 maps at least
-        detailed_res = self.get_lowest_maps(sorted_scores, n_lowest, mul_trees, gene_trees, registry, pickle_dir, run_prefix, logger)
-        
+            sorted_scores, _ = self.recon_all(mul_trees, gene_trees, registry, retmap=False)
+            detailed_res = self.get_lowest_maps(sorted_scores, limit, mul_trees, gene_trees, registry)
+
         writer.write_results(sorted_scores, detailed_res, mul_trees, gene_trees)
 
         # Get the first k,v pair from detailed_res
-        detailed_res_limited = {}
+        # This dict will be "sorted"
+        detailed_kept = {}
         is_input_in = 0
         for mul_idx in detailed_res:
             # Instead of keeping ReconResult, keep Maps[0] (Dict[int, Dict[int, Map]] vs Dict[int, Dict[int, ReconResult]] in StepResult)
             maps_dict = {g_idx: res.maps[0] for g_idx, res in detailed_res[mul_idx].items()}
-            detailed_res_limited[mul_idx] = maps_dict
+            detailed_kept[mul_idx] = maps_dict
             # Check if idx 0 (input tree) is a key in the dict yet
             if mul_idx == 0:
                 is_input_in = 1
-            if len(detailed_res_limited) >= self.tcf.max_select + is_input_in:
+            if len(detailed_kept) >= self.tcf.max_select + is_input_in:
                 # If input tree is included, allow one extra
                 # otherwise, we might not get enough inferred MTs
                 break
 
-        return TaskResult(
-            sorted_scores=sorted_scores,
-            mul_trees=mul_trees,
-            kept_mul_maps=detailed_res_limited, # this dict is sorted
-            gene_trees=gene_trees
-        )
+        return TaskResult(sorted_scores, mul_trees, detailed_kept, gene_trees)

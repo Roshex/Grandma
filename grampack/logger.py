@@ -226,7 +226,7 @@ class GranLogger:
         self.log(f"Welcome to GRANDMA -- {meta.version} .", key)
         self.log(f"Version {meta.version} released on {meta.release}", key)
         self.log(f"GRANDMA was developed by {meta.authors}", key)
-        self.log(f"\t\tbased on GRAMPA [Gene tree reconciliations with MUL-trees] by {meta.source_authors}", key)
+        self.log(f"\t\tinspired by GRAMPA [Gene tree reconciliations with MUL-trees] by {meta.source_authors}", key)
         self.log(f"Citation:      {meta.doi}", key)
         self.log(f"Website:       {meta.http}", key)
         self.log(f"Report issues: {meta.github}", key)

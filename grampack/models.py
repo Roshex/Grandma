@@ -302,14 +302,15 @@ class SmrtTree:
             if node.is_leaf():
                 node.name = str(node.name).strip()
             elif node.name:
-                if node.name.startswith("<") and node.name.endswith(">"):
+                if node.name.startswith("<"):
                     try:
-                        val = int(node.name[1:-1])
+                        val = int(node.name[1:].split(">")[0])
                         if val > max_idx: max_idx = val
                     except ValueError:
                         pass
             else:
                 to_name.append(node)
+                continue
             self.node_map[node.name] = node
         i = max_idx + 1
 
@@ -510,6 +511,56 @@ class SmrtTree:
         new_smrt = SmrtTree(tree_obj=new_tree_obj)
         return new_smrt, h1_node, h2_subtree # Note: returns objects in the new tree context
 
+
+
+    def to_mul_tree_multi(self, h1_name: str, hx_names: List[str]) -> Optional[Tuple['SmrtTree', TreeNode, List[TreeNode]]]:
+        """
+        Grafts multiple H-lineages (H2, H3...) onto the H1 branch.
+        Used for 'Model' mode to capture all nested copies at once.
+        """
+        new_tree_obj = self.ete_tree.copy()
+        
+        # 1. Find H1 (The Stock)
+        h1_matches = new_tree_obj.search_nodes(name=h1_name)
+        if not h1_matches: return None, None, []
+        h1_node = h1_matches[0]
+
+        # 2. Process Hx targets (The Scions)
+        hx_nodes_final = []
+        
+        # We use a tag generator: *, **, ***, ...
+        tags = ["*" * i for i in range(1, len(hx_names) + 1)]
+
+        for i, (h_name, tag) in enumerate(zip(hx_names, tags), start=2):
+            # We must search by name in the *current* state of new_tree_obj
+            # (Note: grafting changes the tree structure, but names persist)
+            p_matches = new_tree_obj.search_nodes(name=h_name)
+            if not p_matches: continue
+            p_node = p_matches[0]
+
+            # Nesting check: Cannot graft a parent into a child
+            if p_node in h1_node.iter_descendants(): continue
+
+            # Create the copy
+            # Note: We copy from H1 (the source of the introgression)
+            h_copy = SmrtTree.copy_lineage(h1_node, tag)
+
+            # Graft
+            # We use a unique internal name for the graft point to avoid confusion
+            graft_name = f"<P{i}>"
+            new_tree_obj = SmrtTree.graft_subtree(new_tree_obj, p_node, h_copy, graft_name)
+            
+            hx_nodes_final.append(h_copy)
+
+        new_smrt = SmrtTree(tree_obj=new_tree_obj)
+        
+        # We must re-find H1 because the root might have changed during grafting
+        h1_final = new_smrt.get_node(h1_node.name)
+        
+        return new_smrt, h1_final, hx_nodes_final
+
+
+
     def to_str(self, internals=True) -> str:
         root_name = str(self.ete_tree.name) if internals else ""
         return self.ete_tree.write(format=8 if internals else 9)[:-1]+root_name+";"
@@ -557,7 +608,8 @@ class ReconResult:
 class GroupData:
     # Changed from List[str] to List[int] (IDs from NameRegistry)
     ambiguous_groups: List[List[int]]
-    fixed_groups: List[Tuple[List[int], str]]
+    #fixed_groups: List[Tuple[List[int], str]]
+    fixed_groups: List[Tuple[List[int], int]] # Changed from str to int
 
 @dataclass(slots=True, frozen=True)
 class MulTree:
@@ -566,7 +618,12 @@ class MulTree:
     # Storing OBJECTS optimizes the Reconciler (no lookups)
     # These are safe to pickle TO workers, but shouldn't be used to map back TO main.
     h1_node: Optional[TreeNode] = None 
-    h2_node: Optional[TreeNode] = None
+    # Replaced single h2_node with hx_nodes list
+    hx_nodes: List[TreeNode] = field(default_factory=list)
+    # For mode compatibility, h2_node can return the first element or None
+    @property
+    def h2_node(self) -> Optional[TreeNode]:
+        return self.hx_nodes[0] if self.hx_nodes else None
 
 @dataclass(slots=True, frozen=True)
 class TaskResult:

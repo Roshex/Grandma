@@ -54,7 +54,7 @@ class NoDaemonPool(multiprocessing.pool.Pool):
 
 def task_worker(payload: Tuple[Any, Any, str], context: GlobalContext, config: TaskConfig, verbosity=0, parent_logger=None):
     """
-    Unified worker for both Iterative (Full) and Recursive (Split) modes.
+    Unified worker for both Sequential (Full) and Binary (Split) modes.
     Returns: (task_id, result, updates, log_file)
     """
         
@@ -153,7 +153,7 @@ class Task:
             return None, {}
 
         # 2. Build MUL-Trees
-        self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build()
+        self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(self.ctx.optim, self.ctx.nestedness)
         #if tcf.mode == "build-mts": return None, {}
 
         # 3. Load Gene Trees
@@ -173,7 +173,7 @@ class Task:
         print(f"Species Tree: {self.spec_tree.to_str(internals=True)})"""
 
         # Re-init component with current task
-        self.reconciler = Reconciler(tcf, self.ctx.num_processes)
+        self.reconciler = Reconciler(tcf, self.logger, self.ctx.num_processes, self.ctx.optim)
         self.gene_mgr = GeneTreeManager(tcf, self.reconciler, self.logger)
 
         # 4. Collapse & Filter Groups
@@ -189,7 +189,7 @@ class Task:
         """
 
         # 5. Reconciliation and MUL-tree Selection
-        step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry, self.logger, self.writer)
+        step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry, self.writer)
 
         """if not step_result.sorted_scores:
             self.logger.write("No valid MUL-trees scored.", level=1)
@@ -261,29 +261,55 @@ class Engine:
 
     def run(self):
         final_res = None
-        if self.tcf.mode in ["full", "split"] and not self.ctx.norun:
-            # Flow Manager Init for Iterative Modes
-            self.flow_mgr = FlowManager(self.ctx, self.tcf.mode, self.flow_logger)
-            if self.tcf.mode == "full":
-                final_res = self.run_full()
-            else:
-                final_res = self.run_split()
-        else:
-            # Other modes
-            final_res = Task(self.ctx, self.flow_logger).execute(self.tcf)
-        return final_res
         
-    def run_full(self):
+        # Init FlowManager for any iterative mode
+        if self.tcf.mode in ["full", "split", "mixed"] and not self.ctx.norun:
+            self.flow_mgr = FlowManager(self.ctx, self.tcf.mode, self.flow_logger)
+
+        if self.tcf.mode == "mixed":
+            final_res = self.run_mixed()
+        elif self.tcf.mode == "full":
+            final_res = self.run_full()
+        elif self.tcf.mode == "split":
+            final_res = self.run_split()
+        else:
+            final_res = Task(self.ctx, self.flow_logger).execute(self.tcf)
+            
+        return final_res
+
+    def run_mixed(self):
         """
-        Iterative mode. 
-        Creates a dedicated folder and Run instance for each iteration.
-        Passes tree objects in memory to avoid reloading.
+        Executes Full mode until iteration N, then switches to Split mode.
+        """
+        self.flow_logger.log(f"Starting Mixed Mode: Full until iter {self.ctx.mixed_switch}, then Split.", 'i')
+        
+        full_limit = self.ctx.mixed_switch
+        
+        # Run Full Mode up to switch point
+        last_st, last_gts = self.run_full(limit_override=full_limit)
+        
+        if not last_st:
+            self.flow_logger.log("Full Mode terminated before reaching switch point. Split Mode will not be executed.", 'i')
+            return
+        self.flow_logger.log(f"Switching to Split Mode at iteration {full_limit}.", 'i')
+        
+        # Prepare the root task for split mode. 
+        # The ID is simply the iteration number (e.g., "5"), representing depth 5, index 0 effectively.
+        # Split logic expects "Depth.Index": since we ran linear 0..4, the next depth is 5 (and index 0).
+        root_id = f"{full_limit}.0"
+        self.run_split(initial_payload=(last_st, last_gts, root_id))
+        
+    def run_full(self, limit_override: int = None) -> Tuple[Optional[SmrtTree], Optional[Dict[int, SmrtTree]]]:
+        """
+        Iterative mode. Returns final (st, gts) if limit reached, or (None, None) if finished naturally.
         """
         self.flow_logger.log("Starting Fully Sequential Mode", 'i')
 
         # Setup: initial parameters must have been parsed already in io.py
         i = self.ctx.start_pt
-        max_iter = self.ctx.max_iter
+        max_iter = limit_override if limit_override is not None else self.ctx.max_iter
+        if max_iter > self.ctx.max_iter:
+            self.flow_logger.log(f"Provided Mixed Mode switch ({max_iter}) exceeds global max_iter ({self.ctx.max_iter}). Using override.", 'w')
         iter_msg = '(inf mode)' if max_iter == float('inf') else f'of {int(max_iter)}' # ∞
         
         perm_tcf = self.tcf
@@ -298,6 +324,9 @@ class Engine:
         try:
             while True:
                 if i >= max_iter:
+                    if limit_override is not None:
+                        self.flow_logger.log(f"Reached Mixed Mode switch point. Terminating with handoff.", 'i')
+                        return current_st, current_gts
                     self.flow_logger.log(f"Reached maximum valid events set by user ({max_iter}). Terminating.", 'i')
                     break
 
@@ -321,7 +350,7 @@ class Engine:
 
                 # Process result and handle potential nesting
                 # This returns the trees prepared for the NEXT iteration
-                next_mt, next_gts = self.flow_mgr.handle_iteration_result(
+                next_mt, next_gts, _ = self.flow_mgr.handle_iteration_result(
                     i, res,
                     engine_callback=lambda st, gts, h1, h2, out: self._run_nested_subproblem(st, gts, h1, h2, out),
                     iter_out = self.ctx.root_dir / str(i) / "output", 
@@ -341,6 +370,7 @@ class Engine:
         if self.ctx.plot: self.flow_mgr.plot()
         
         self.flow_logger.log("Fully Sequential Mode Finished.", 'i')
+        return None, None # Natural finish
 
     def _run_nested_subproblem(self, mem_st: SmrtTree, mem_gts: Dict[int, SmrtTree], h1_str: str, h2_str: str, fix_dir: Path) -> TaskResult:
         """Helper to run a constrained nested fix run."""
@@ -360,9 +390,11 @@ class Engine:
         
         return Task(fix_ctx, logger=None).execute(fix_tcf)
     
-    def run_split(self):
+    def run_split(self, initial_payload: Tuple = None):
         """
-        Binary-Recursive Mode: Executes sub-problems in parallel where possible.
+        Binary Split Mode:
+        Executes sub-problems in parallel where possible.
+        Can accept an initial_payload (st, gts, id) to resume/mixed-start.
         Each depth of the recursion tree is dispatched to the process pool.
         Tracking should be Process-Safe and Unified.
         Matches the recursive sub-problem architecture: folder 'Depth.Index' (as tracked in 'history').
@@ -375,30 +407,40 @@ class Engine:
         2. scheduling batches based on task weights (e.g., number of species leaves).
         Possibly due to overhead of scheduling and load balancing.
         """
-        self.flow_logger.log("Starting Parallelized Split Mode (Binary Recursive Search)", 'i')
-        
-        # Initialize Task Queue to the root problem
-        perm_tcf = self.tcf
-        root_task = (perm_tcf.st, perm_tcf.gts, "0")
-        current_tasks = [root_task]
-        max_iter = self.ctx.max_iter
-        
-        total_procs = self.ctx.num_processes
-        
-        # Fast-Forward (Resume) Logic
-        # If we have history, we might have completed the root or others.
-        # We need to reconstruct the frontier.
-        events_found = 0
-        if self.ctx.history:
-            self.flow_logger.log(f"History found ({len(self.ctx.history)} entries). Checking for resume...", 'i')
-            current_tasks = self.flow_mgr.fast_forward_split(current_tasks)
-            events_found = 0 # to be implemented !!!
+        self.flow_logger.log("Starting Binary Split Mode", 'i')
 
-        depth = 0
+        perm_tcf = self.tcf
+        current_tasks = []
         
+        # Initialize Tasks
+        if initial_payload:
+            # Mixed Mode Handoff
+            current_tasks = [initial_payload]
+            # We assume previous iterations count towards max_iter
+            events_found = int(float(initial_payload[2])) # Start count at depth
+            ### TBD:
+            ### at the end of this gluing needs to only apply until the switchpoint, and then do a different glue!
+            ### Also, we might want to fast-forward the history if we are resuming deep, but TBD on how to track that with the mixed start.
+        else:
+            # Standard Start
+            # Initialize Task Queue to the root problem
+            root_task = (perm_tcf.st, perm_tcf.gts, "0")
+            current_tasks = [root_task]
+            # Fast-Forward (Resume) Logic
+            # If we have history, we might have completed the root or others.
+            # We need to reconstruct the frontier.
+            events_found = 0
+            if self.ctx.history:
+                self.flow_logger.log(f"History found ({len(self.ctx.history)} entries). Checking for resume...", 'i')
+                current_tasks = self.flow_mgr.fast_forward_split(current_tasks)
+                events_found = 0 # to be implemented !!!
+
         # Adjust depth display if resuming deep
+        depth = 0
         if current_tasks and "." in str(current_tasks[0][2]):
             depth = int(str(current_tasks[0][2]).split('.')[0])
+
+        max_iter = self.ctx.max_iter
 
         while current_tasks:
 
@@ -505,7 +547,7 @@ class Engine:
 
         if self.ctx.plot: self.flow_mgr.plot()
 
-        self.flow_logger.log("Parallelized Split Mode Finished.", 'i')
+        self.flow_logger.log("Binary Split Mode Finished.", 'i')
 
 def main():
     ctx, tcf = InitParser().parse()

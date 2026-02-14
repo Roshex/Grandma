@@ -32,7 +32,7 @@ class GranMetadata:
     github: str = "TBD"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "2.9.0 (Modern)"
+    version: str = "3.0.0"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -60,12 +60,15 @@ class GlobalContext:
     norun: bool = False
     nolog: bool = False
     debug: bool = False
+    optim: bool = False
 
-    # Global Algorithm Options
+    # Global Flow/Algorithm Options
     orth_opt: bool = False
     max_iter: Union[int, float] = 0
+    mixed_switch: int = 0
     cutoff: Tuple[str, Optional[Union[int, float]]] = ("auto", None)
-    ignore_nesting: bool = False # for full mode # --nestedness (i)gnore / (r)ectify / (m)odel [tbd: when generating mts! no correction needed]
+    nestedness: str = "rectify" # ignore_nesting: bool = False -> ignore (False), rectify (True), model (New)
+    nest_in_only: bool = False
     min_st_lvs: int = 1 # for split mode
     min_gt_lvs: int = 2 # for split mode
       
@@ -89,7 +92,8 @@ class GlobalContext:
         """
         # Certain fields should not be allowed to be changed
         forbidden_keys = {"seed", "plot", "norun", "nolog", "orth_opt", "max_iter",
-        "min_gt_lvs", "min_st_lvs", "root_dir", "log_file", "history", "start_pt"}
+        "nestedness", "nest_in_only", "mixed_switch", "min_gt_lvs", "min_st_lvs",
+        "root_dir", "log_file", "history", "start_pt"}
         # Safety check to ensure we aren't inventing new fields
         valid_fields = {f.name for f in fields(self)}
         for key in changes:
@@ -123,7 +127,9 @@ class TaskConfig:
     h1_nodes: Optional[Union[str, List[str]]] = None
     h2_nodes: Optional[Union[str, List[str]]] = None
     ploidies: Optional[Union[Path, str, Dict[str, int]]] = None
+    predefined_rets: Dict[int, List[Tuple[str, str]]] = field(default_factory=dict)
     group_cap: int = 8
+    weights: Tuple[int, int] = (1, 1) # (w_dup, w_loss)
     to_map: int = 0 # False, True, int for max maps to keep, -1 for all
     max_select: int = 1 # max mts to select for processing per Run (non-overlapping H clades & scoring above ST)
 
@@ -280,7 +286,8 @@ def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: G
                 logger.log(f"Failed to load history file ({e}). Starting fresh.", 'w')
                 history = {}
         else:
-            logger.log(f"No history file found at {history_file}. Starting from scratch.", 'i')
+            pass
+            #logger.log(f"No history file found at {history_file}. Starting from scratch.", 'i')
     else:
         logger.log(f"Previous output directory {base_output_dir} does not exist. Starting from scratch.", 'i')
     
@@ -366,7 +373,7 @@ def check_loop_length(n: int, i: int, st_file: Path, history: Dict, logger: Gran
     """Determines the true loop length based on input and history."""
     # If n is non-positive, run while True, otherwise run n times
     if n <= 0:
-        logger.log('Important: -i (--iter) is set to 0 or less, running indefinitely until no new H-nodes are found.', 'i')
+        #logger.log('Important: -i (--iter) is set to 0 or less, running indefinitely until no new H-nodes are found.', 'i')
         n = float('inf')
     if i > 0:
         if history[(i, 0)]['gt_file'] == 'NA' and st_file.exists():
@@ -427,17 +434,19 @@ class InitParser:
 
         # --- Algorithmic Options ---
         g_algo = self.parser.add_argument_group("Algorithmic Options")
-        g_algo.add_argument("-h1", "--h1", type=str,
-            help="A space separated nodes/leaves list of one or more node labels from the species tree to be "
-                 "considered as parental node 1 (H1). If no labels are specified, all nodes "
-                 "in the species tree are considered.")
-        g_algo.add_argument("-h2", "--h2", type=str, help="As -h1, but for parental node 2 (H2).")
+        g_algo.add_argument("-h1", "--h1", type=str, nargs='+',
+            help="Node name or a comma-separated leaves list of one or more (space-separated) nodes from the species "
+                 "tree to be considered as parental node 1 (H1). For each node given as a list, the LCA is taken. "
+                 "If no labels are specified, all nodes in the species tree are considered.")
+        g_algo.add_argument("-h2", "--h2", type=str, nargs='+', help="As -h1, but for parental node 2 (H2).")
         g_algo.add_argument("-x", "--ploidy", type=str, default=None,
             help="Ploidy file formatted as a Polyphest Multiset file. If provided, H1 and H2 nodes will be enforced by "
                  "ploidy levels. Default: None.")
         g_algo.add_argument("-c", "--cap", type=int, default=8,
             help="The maximum number of groups a gene tree is allowed to have. A gene tree with more than --cap "
-                 "number of groups for a given MUL-tree, will be skipped. Default = 8.")
+                 "number of groups for a given MUL-tree, will be skipped. Default = 8 [to be raised to 15 on release].")
+        g_algo.add_argument("-w", "--weights", type=int, nargs=2, default=[1, 1],
+            help="Space-separated integer weights for the parsimony score calculation: 'w_dup w_loss'. Default = '1 1'.")
         g_algo.add_argument("-n", "--max_select", type=int, default=1,
             help="Maximum MUL-trees to select per run for parallel inference heuristics. Default: 1, i.e., only the best "
                  "scoring MT is considered per iteration.")
@@ -447,16 +456,35 @@ class InitParser:
         g_algo.add_argument("--min_gt_lvs", type=int, default=2,
             help="Minimum gene trees leaves per tree for a gene tree to be considered valid. Specifically relevant for "
                  "the split mode. Default: 2.")
+        g_algo.add_argument('--nestedness', type=str, choices=['ignore', 'i', 'rectify', 'r', 'model', 'm'], default='rectify',
+            help="Behavior for nested hybridization events treatment during the full and mixed modes. "
+                 "(i)gnore: Do nothing [ignore nesting]. "
+                 "(r)ectify: Autocorrect nested events between iterations [default]. "
+                 "(m)odel: Model nested copies during MT creation [computationally expensive].")
+        g_algo.add_argument('--nest-in-only', dest='nest_in_only', action='store_true',
+            help="If set, only consider internally nested events when tracing missing subgenomes. Default is to "
+            "consider a sister relationship as nested, too. Only relevant if --nestedness is set to 'rectify' or 'model'.")
+        
+        g_algo.add_argument('--optim', dest='optim', action='store_true',
+            help="If set, will run alternative algorithms for [1.] MT construction and [2.] reconciliation: " 
+                "these are unrelated and can be mixed if merged into default. However, testing them I observe no significant speedup. "
+                "[1.] may be worth to keep due to safety (?) but [2.] is over-engineered and seems to not be worth it at all.")
 
         # --- Flow Control Options ---
         g_flow = self.parser.add_argument_group("Flow Control Options")
         g_flow.add_argument("-m", "--mode", type=str, default="single",
-            choices=["single", "split", "full", "label-sp", "count-mts", "build-mts", "check-nums", "no-recon", "no-st", "st-only"], 
-            help="Execution mode. Options: single => simple run [default] | split => parallelized binary-recursive | "
-                 "full => fully sequencial with nestedness inference | label-sp => only label input species tree internal "
-                 "nodes | count-mts => count possible MUL-trees only | build-mts => build MUL-trees only | check-nums => "
-                 "count groups only | no-recon => build MTs & count groups | no-st => skip reconciliation to input | st-only "
-                 "=> reconciliation to input only.")
+            help="Execution mode. Supported options: "
+                 "single: Simple run with a single iteration, equivalent to running Grampa [default]. "
+                 "full: Fully sequential search allowing for nested hybridization event inference [computationally expensive]. "
+                 "split: Binary split search reducing each depth into outer/inner subproblems [cheap; supports subproblem parallelism]. "
+                 "mixed-<int>: Start with full mode, then switch to split mode after <int> iterations [default w/o int: mixed-3]. "
+                 "label-sp: Only label input species tree internal nodes. "
+                 "count-mts: Count possible MUL-trees only. "
+                 "build-mts: Build MUL-trees only. "
+                 "check-nums: Count groups only. "
+                 "no-recon: Build MTs & count groups. "
+                 "no-st: Skip reconciliation to input. "
+                 "st-only: Reconciliation to input only.")
         g_flow.add_argument('-i', '--iter', type=int, default=0,
             help="Maximun number of iterations or (~depth) event num for iterative modes; <int>, non-positive to be unlimited. Default = 0.")
         g_flow.add_argument('-r', '--repair', action='store_true',
@@ -466,9 +494,6 @@ class InitParser:
         g_flow.add_argument('--cutoff', type=str, default='auto',
             help="Stopping condition when comparing MP score; 'auto' [default] for abs:0+lookback, 'abs:<int>' for "
                  "absolute, or 'rel:<float>' for relative.")
-        g_flow.add_argument('--ignore-nesting', action='store_true',
-            help="If set, do not automatically fix nested hybridization events; let GRANDMA iterate normally without "
-                 "corrections. Ignored in all modes except 'full'.")
         g_flow.add_argument("--orthologies", action="store_true",
             help="If set, will output an additional file containing the pairwise orthology "
                  "relationships for each gene tree to the lowest scoring MUL-tree.")
@@ -530,11 +555,23 @@ class InitParser:
                 self.logger.log(f'Invalid absolute cutoff: {val}', 'e')
         self.logger.log(f'Invalid cutoff format: "{val}". Use "auto", "rel:<float>", or "abs:<int>".', 'e')
 
-    def resolve_mode_logic(self, mode, label_sp, count_mts, build_mts, check_nums, st_only, no_st) -> str:
+    def resolve_mode_logic(self, mode, label_sp, count_mts, build_mts, check_nums, st_only, no_st) -> Tuple[str, int]:
         """
         Consolidates modern --mode and legacy flags into a single mode string.
-        Returns resolved mode.
+        Returns resolved mode and mixed switch value.
         """
+
+        mixed_switch = 3 # default switch point
+        if mode.startswith("mixed"):
+            if '-' in mode:
+                try:
+                    _, mixed_switch = mode.split('-')
+                    mixed_switch = int(mixed_switch)
+                    assert mixed_switch > 0
+                except (ValueError, AssertionError):
+                    self.logger.log(f"Invalid mixed mode format: {mode}. Expected 'mixed' or 'mixed-<int>', where <int> is strictly positive.", 'e')
+            mode = "mixed"
+
         m = "default"
         if label_sp: m = "label-sp"
         elif count_mts: m = "count-mts"
@@ -550,14 +587,21 @@ class InitParser:
         # Priority 1: Direct --mode selection (if not single)
         if mode != "single" and mode != m:
             self.logger.log("--mode flag overrides legacy flags!", 'w')
-            return mode
+            return mode, mixed_switch
         
         # Priority 2: If mode is single and no legacy flags are set
         if m == "default":
-            return "single"
+            return "single", mixed_switch
             
-        return m
+        return m, mixed_switch
 
+    @staticmethod
+    def resolve_nestedness(val: str) -> str:
+        if val in ['ignore', 'i']: return 'ignore'
+        if val in ['rectify', 'r']: return 'rectify'
+        if val in ['model', 'm']: return 'model'
+        return 'rectify'
+        
     @staticmethod
     def _parse_mem(mem_str: str) -> Optional[int]:
         """
@@ -589,11 +633,289 @@ class InitParser:
             
         return None
 
+    def plot_and_exit(self):
+        # plot hardcoded data here for convinience of testing
+
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import matplotlib.patches as mpatches
+        import sys
+        from matplotlib.ticker import FixedLocator
+
+        # --- 1. Hardcoded Data ---
+        y_label = "Elapsed time (s) [Log Scale]"
+        # --- 1. Hardcoded Data ---
+        #y_labels = ["Elapsed time (s)", "Elapsed time (h)"]
+        x_label = "Step (computing the first event)"
+        
+        datasets_for_legend = ['Kalanchoe backbone', 'Bendiksby et al. 2011', 'Díaz-Pérez et al. 2018']
+        tools_for_legend = ['Grampa', 'Grandma: base-mode']
+        
+        # Data structure: List of tuples corresponding to datasets. 
+        # Tuple: (Time_Grampa, Time_Grandma)
+        time_steps = {
+            'Build MTs': [
+                (0.4926, 0.16781),   # Dataset 1
+                (10.36343, 5.13517),   # Dataset 2
+                (1.58598, 0.41652)   # Dataset 3
+            ],
+            'Load GTs': [
+                (1.34652, 0.22395),    # Dataset 1 (Usually similar I/O)
+                (0.47741, 0.76329),    # Dataset 2
+                (0.71326, 0.69493)   # Dataset 3
+            ],
+            'Collapse & Filter GTs': [
+                (59.32991+4.95699, 0.02194+2.52801),    # Dataset 1
+                (6557.39175+61.27786, 0.21467+8.58491),   # Dataset 2
+                (382.01572+10.56089, 0.15849+4.31518)    # Dataset 3
+            ],
+            'Reconcile': [
+                (156.28378, 16.03081),  # Dataset 1 (Core algo speed similar per tree)
+                (16735.90709, 429.51364),  # Dataset 2
+                (1041.99585, 77.38802) # Dataset 3
+            ],
+        }
+        '''# Group 1: Fast / Low Magnitude
+        steps_fast = {
+            'Build MTs': [
+                (0.4926, 0.16781),   # Dataset 1
+                (10.36343, 5.13517),   # Dataset 2
+                (1.58598, 0.41652)   # Dataset 3
+            ],
+            'Load GTs': [
+                (1.34652, 0.22395),    # Dataset 1 (Usually similar I/O)
+                (0.47741, 0.76329),    # Dataset 2
+                (0.71326, 0.69493)   # Dataset 3
+            ]
+        }
+        
+        # Group 2: Slow / High Magnitude
+        steps_slow = {
+            'Collapse & Filter GTs': [
+                (59.32991+4.95699, 0.02194+2.52801),    # Dataset 1
+                (6557.39175+61.27786, 0.21467+8.58491),   # Dataset 2
+                (382.01572+10.56089, 0.15849+4.31518)    # Dataset 3
+            ],
+            'Reconcile': [
+                (156.28378, 16.03081),  # Dataset 1 (Core algo speed similar per tree)
+                (16735.90709, 429.51364),  # Dataset 2
+                (1041.99585, 77.38802) # Dataset 3
+            ]
+        }'''
+
+        # --- 2. Plotting Setup ---
+        step_names = list(time_steps.keys())
+        n_steps = len(step_names)
+        n_datasets = len(datasets_for_legend)
+        n_tools = len(tools_for_legend)
+
+        # Layout calculations
+        x = np.arange(n_steps)  # Base positions for steps
+        total_width = 0.8       # Width of the entire group for one step
+        group_width = total_width / n_datasets  # Width for one dataset block
+        bar_width = group_width / n_tools       # Width for a single tool bar
+        
+        fig, ax = plt.subplots(figsize=(12, 7))
+
+        # Colors for Datasets
+        colors = ['#66c2a5', '#fc8d62', '#8da0cb'] # Qualitative Set2 style
+        # Hatches for Tools: Empty for Grampa, Hatched for Grandma
+        hatches = ['', '////'] 
+
+        # --- 3. The Plotting Loop ---
+        for i, step in enumerate(step_names):
+            data_for_step = time_steps[step] # List of tuples
+            
+            # Center the entire group on the x tick
+            group_start_x = x[i] - (total_width / 2)
+            
+            for j in range(n_datasets):
+                # Calculate start x for this dataset block
+                dataset_x_start = group_start_x + (j * group_width)
+                
+                tool_times = data_for_step[j] # (Time_Tool1, Time_Tool2)
+                
+                for k in range(n_tools):
+                    # Calculate exact x for this bar
+                    bar_x = dataset_x_start + (k * bar_width)
+                    time_val = tool_times[k]
+                    
+                    ax.bar(bar_x, time_val, width=bar_width, 
+                           color=colors[j], edgecolor='black', linewidth=0.7,
+                           hatch=hatches[k], align='edge',
+                           label=f"{datasets_for_legend[j]}" if i==0 and k==0 else "")
+
+        # --- 4. Formatting ---
+        ax.set_ylabel(y_label, fontsize=12, fontweight='bold')
+        ax.set_xlabel(x_label, fontsize=12, fontweight='bold')
+        ax.set_title("Single Event Performance: GRAMPA vs. GRANDMA", fontsize=14, pad=20)
+        
+        ax.set_xticks(x)
+        ax.set_xticklabels(step_names, fontsize=11)
+        
+        # 1. LOG SCALE
+        ax.set_yscale('log')
+        
+        # Add grid for readability
+        ax.yaxis.grid(True, linestyle='--', alpha=0.7, which='major')
+        ax.yaxis.grid(True, linestyle=':', alpha=0.4, which='minor')
+        ax.set_axisbelow(True)
+
+        # 2. SECONDARY Y-AXIS (Time Units)
+        ax2 = ax.twinx()
+        ax2.set_yscale('log')
+        ax2.set_ylim(ax.get_ylim()) # Sync limits
+        
+        # Define ticks: 1s, 1m, 1h, 6h
+        human_ticks = [1, 10, 60, 600, 3600, 21600]
+        human_labels = ['1s', '10s', '1m', '10m', '1h', '6h']
+        
+        ax2.yaxis.set_major_locator(FixedLocator(human_ticks))
+        ax2.set_yticklabels(human_labels)
+        #ax2.set_ylabel("Human Readable Time", fontsize=12, rotation=270, labelpad=15)
+        
+        # --- 5. Custom Legend Construction ---
+        # Legend 1: Colors (Datasets)
+        color_handles = [mpatches.Patch(facecolor=colors[i], edgecolor='black', label=datasets_for_legend[i]) 
+                         for i in range(n_datasets)]
+        
+        # Legend 2: Patterns (Tools)
+        # Create neutral grey patches to show the pattern
+        pattern_handles = [mpatches.Patch(facecolor='lightgrey', edgecolor='black', hatch=hatches[i], label=tools_for_legend[i]) 
+                           for i in range(n_tools)]
+
+        # Add Legends
+        first_legend = ax.legend(handles=color_handles, title="Datasets", loc='upper left', frameon=True)
+        ax.add_artist(first_legend) # Add back mainly because the next call overwrites it
+        
+        ax.legend(handles=pattern_handles, title="Tools", loc='upper left', bbox_to_anchor=(0, 0.75), frameon=True)
+
+        plt.tight_layout()
+        #plt.show()
+        out_dir = Path.cwd()
+        print(f"Saving figure to: {out_dir}")
+        plt.savefig(out_dir / "performance_comparison.png", dpi=600)
+        sys.exit()
+
+        '''# For the "All Operations" plot, we will use all steps
+        steps_fast.update(steps_slow)
+        # In slow, convert to hours for the second plot
+        for step in steps_slow:
+            steps_slow[step] = [(t[0]/3600, t[1]/3600) for t in steps_slow[step]]
+
+        step_groups = [steps_fast, steps_slow]
+        titles = ["All Operations", "Intensive Operations"]
+
+        # --- 2. Plotting Setup ---
+        # 2 Rows, 1 Column
+        fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+        
+        # Colors for Datasets
+        colors = ['#66c2a5', '#fc8d62', '#8da0cb'] # Qualitative Set2 style
+        # Hatches for Tools: Empty for Grampa, Hatched for Grandma
+        hatches = ['', '////'] 
+
+        n_datasets = len(datasets_for_legend)
+        n_tools = len(tools_for_legend)
+        
+        # --- 3. The Plotting Loop ---
+        for ax_idx, ax in enumerate(axes):
+            current_steps = step_groups[ax_idx]
+            step_names = list(current_steps.keys())
+            n_steps = len(step_names)
+            
+            x = np.arange(n_steps)
+            total_width = 0.8
+            group_width = total_width / n_datasets
+            bar_width = group_width / n_tools
+
+            for i, step in enumerate(step_names):
+                data_for_step = current_steps[step] # List of tuples
+                group_start_x = x[i] - (total_width / 2)
+                
+                for j in range(n_datasets):
+                    dataset_x_start = group_start_x + (j * group_width)
+                    tool_times = data_for_step[j]
+                    
+                    for k in range(n_tools):
+                        bar_x = dataset_x_start + (k * bar_width)
+                        time_val = tool_times[k]
+                        
+                        rects = ax.bar(bar_x, time_val, width=bar_width, 
+                               color=colors[j], edgecolor='black', linewidth=0.7,
+                               hatch=hatches[k], align='edge')
+
+                        # --- ADD VALUE LABELS ---
+                        # Loop over the bars just created (usually just 1 per iteration here)
+                        for rect in rects:
+                            height = rect.get_height()
+                            if height < 11 and ax_idx == 0:
+                                continue
+                            if height < 0.3 and ax_idx == 1:
+                                continue
+                            
+                            # Formatting: If small (<100), show decimal. If large, show integer.
+                            # Also handle the unit conversion (h vs s) for display if needed.
+                            # Since we already divided by 3600 for the slow plot, the 'height' is in hours.
+                            
+                            if height < 10:
+                                label_text = f'{height:.1f}'
+                            else:
+                                label_text = f'{int(height)}'
+                            
+                            text_h = 11.05 if ax_idx == 0 else 0.306
+
+                            # Place text slightly above the bar
+                            ax.text(rect.get_x() + rect.get_width() / 2, text_h, label_text,
+                                    ha='center', va='bottom', fontsize=9, fontweight='bold',
+                                    rotation=45, clip_on=False)
+
+            # --- 4. Formatting ---
+            ax.set_ylabel(y_labels[ax_idx], fontsize=12, fontweight='bold')
+            ax.set_title(titles[ax_idx], fontsize=12, loc='left', pad=10)
+
+            if step_groups[ax_idx] == steps_fast:
+                ax.set_ylim(0, 11)
+            else:
+                ax.set_ylim(0, 0.3)
+            
+            ax.set_xticks(x)
+            ax.set_xticklabels(step_names, fontsize=11, fontweight='bold')
+            
+            # Independent scales for each plot (Linear is fine since we split by magnitude)
+            # ax.set_yscale('log') # Uncomment if log scale is still desired
+            
+            ax.yaxis.grid(True, linestyle='--', alpha=0.7)
+            ax.set_axisbelow(True)
+
+        # --- 5. Legends (Add to Top Plot) ---
+        color_handles = [mpatches.Patch(facecolor=colors[i], edgecolor='black', label=datasets_for_legend[i]) 
+                         for i in range(n_datasets)]
+        pattern_handles = [mpatches.Patch(facecolor='lightgrey', edgecolor='black', hatch=hatches[i], label=tools_for_legend[i]) 
+                           for i in range(n_tools)]
+
+        ax_top = axes[0]
+        first_legend = ax_top.legend(handles=color_handles, title="Datasets", loc='upper left', frameon=True)
+        ax_top.add_artist(first_legend)
+        ax_top.legend(handles=pattern_handles, title="Tools", loc='upper left', bbox_to_anchor=(0, 0.65), frameon=True)
+
+        axes[1].set_xlabel(x_label, fontsize=12, fontweight='bold')
+        fig.suptitle("Performance Comparison: GRAMPA vs. GRANDMA", fontsize=16, y=0.95)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.93]) # Adjust for suptitle
+        # save the figure if needed
+        out_dir = Path.cwd()
+        print(f"Saving figure to: {out_dir}")
+        plt.savefig(out_dir / "performance_comparison.png", dpi=600)
+        sys.exit()'''
+    
     def parse(self, args_=None) -> Tuple[GlobalContext, TaskConfig]:
         """
         Parses arguments and returns strictly typed configuration objects.
         """
         args = self.parser.parse_args(args_)
+
+        #self.plot_and_exit()
         
         # --- Setup Environment and Banner ---
         out_dir = args.outdir if args.outdir else get_default_outdir()
@@ -615,7 +937,7 @@ class InitParser:
         ###
 
         # --- Resolve Argument Logistics ---
-        mode = self.resolve_mode_logic(
+        mode, mixed_switch = self.resolve_mode_logic(
             args.mode,
             args.labeltree,
             args.numtrees,
@@ -624,6 +946,14 @@ class InitParser:
             args.st_only,
             args.no_st
         )
+        """legacy_flags = {
+            'label_sp': args.labeltree, 'count_mts': args.numtrees,
+            'build_mts': args.buildmultrees, 'check_nums': args.checknums,
+            'st_only': args.st_only, 'no_st': args.no_st
+        }
+        mode, mixed_switch = self.resolve_mode_logic(args.mode, legacy_flags)"""
+
+        nestedness = self.resolve_nestedness(args.nestedness)
 
         # Handle folder deletion and history loading BEFORE the engine starts
         start = args.start if args.start == 'auto' else int(args.start)
@@ -678,42 +1008,47 @@ class InitParser:
 
         # --- Build Global Context ---
         ctx = GlobalContext(
-            num_processes=  n_procs,
-            max_memory=     self._parse_mem(args.mem),
-            verbosity=      args.verbosity,
-            seed=           args.seed,
-            plot=           args.plot,
-            norun=          args.norun,
-            nolog=          args.nolog,
-            debug=          args.debug,
-            orth_opt=       args.orthologies,
-            max_iter=       check_loop_length(args.iter, i, None, history, self.logger),
-            cutoff=         self.parse_cutoff(args.cutoff),
-            ignore_nesting= args.ignore_nesting,
-            min_gt_lvs=     args.min_gt_lvs,
-            min_st_lvs=     args.min_st_lvs,
-            root_dir=       out_dir,
-            log_file=       log_file,
-            history=        history,
-            start_pt=       i
+            num_processes = n_procs,
+            max_memory    = self._parse_mem(args.mem),
+            verbosity     = args.verbosity,
+            seed          = args.seed,
+            plot          = args.plot,
+            norun         = args.norun,
+            nolog         = args.nolog,
+            debug         = args.debug,
+            optim         = args.optim,
+            orth_opt      = args.orthologies,
+            max_iter      = check_loop_length(args.iter, i, None, history, self.logger),
+            mixed_switch  = mixed_switch,
+            cutoff        = self.parse_cutoff(args.cutoff),
+            #ignore_nesting= args.ignore_nesting,
+            nestedness    = nestedness,
+            nest_in_only  = args.nest_in_only,
+            min_gt_lvs    = args.min_gt_lvs,
+            min_st_lvs    = args.min_st_lvs,
+            root_dir      = out_dir,
+            log_file      = log_file,
+            history       = history,
+            start_pt      = i
         )
 
         # --- Prepare Step Config ---
         tcf = TaskConfig(
-            output_dir=     ctx.root_dir,
-            st=             args.spec_input,
-            gts=            args.genes_input,
-            run_prefix=     args.prefix,
-            mode=           mode,
-            overwrite=      args.overwrite,
-            repair=         args.repair,
-            h1_nodes=       args.h1,
-            h2_nodes=       args.h2,
-            ploidies=       args.ploidy,
-            group_cap=      args.cap,
-            to_map=         args.maps,
-            max_select=     max(args.max_select, 1),
-            is_mul_input=   args.is_mul_input,
+            output_dir    = ctx.root_dir,
+            st            = args.spec_input,
+            gts           = args.genes_input,
+            run_prefix    = args.prefix,
+            mode          = mode,
+            overwrite     = args.overwrite,
+            repair        = args.repair,
+            h1_nodes      = args.h1,
+            h2_nodes      = args.h2,
+            ploidies      = args.ploidy,
+            group_cap     = args.cap,
+            weights       = tuple(args.weights),
+            to_map        = args.maps,
+            max_select    = max(args.max_select, 1),
+            is_mul_input  = args.is_mul_input,
         )
 
         return ctx, tcf

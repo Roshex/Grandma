@@ -1,10 +1,14 @@
 import os
+from platform import node
 import re
 import sys
+import bisect
 import pickle
+import tempfile
 import multiprocessing as mp
 from tqdm import tqdm
 from pathlib import Path
+from itertools import chain
 from functools import partial
 from typing import Tuple, List, Optional, Dict, Union
 
@@ -128,6 +132,9 @@ class TreeLoader:
         line = TreeLoader._sanitize_line(line)
         line = CommonOps._fix_semicolon(line)
 
+        # MUL-Tree processing
+        line = TreeLoader._process_mul_status(tcf, line, logger)
+
         # Parse
         try:
             # Format 1 allows internal node names, which we might need
@@ -141,11 +148,8 @@ class TreeLoader:
         if not is_valid:
             logger.log(f"Species tree invalid: {msg}", 'e')
 
-        # MUL-Tree Validation
-        TreeLoader._validate_mul_status(t, tcf.is_mul_input, logger)
-
         if tcf.repair:
-            CommonOps._write_handoff_files(tcf.output_dir, st=t)
+            CommonOps.write_handoff_files(tcf.output_dir, st=t)
 
         logger.report_step(step, "Success: species tree read")
         return SmrtTree(tree_obj=t)
@@ -218,7 +222,7 @@ class TreeLoader:
             logger.log(f"No valid gene trees survived filtering (required in {tcf.mode} mode).", 'e')
         
         if tcf.repair:
-            CommonOps._write_handoff_files(tcf.output_dir, gts=valid_gts)
+            CommonOps.write_handoff_files(tcf.output_dir, gts=valid_gts)
                 
         logger.report_step(step, f"Success: {len(valid_gts)} gene trees read")
         return {idx: SmrtTree(tree_obj=gt) for idx, gt in enumerate(valid_gts)}
@@ -268,27 +272,189 @@ class TreeLoader:
         return True, ""
 
     @staticmethod
-    def _validate_mul_status(t: Tree, is_mul_input: bool, logger: GranLogger):
-        """Validates species counts against the flag."""
-        leaves = [n.name for n in t.get_leaves()]
-        counts = {}
-        for l in leaves:
-            counts[l] = counts.get(l, 0) + 1
+    def shrink_reticulation_depths(predef_rets: dict) -> dict:
+        """
+        Compresses a depth-keyed dictionary of reticulation pairs into continuous 
+        iteration levels (0, 1, ...).
         
-        # Detect actual status
-        has_dups = any(v > 1 for v in counts.values())
+        Independent (non-overlapping) reticulations are grouped into the same level 
+        so they can be evaluated concurrently in the same iteration.
+        """
+        def get_taxa(pair):
+            """Extracts a set of clean leaf names from an (h1_str, h2_str) pair."""
+            taxa = set()
+            for group in pair:
+                for t in group.split(','):
+                    t = t.strip()
+                    if t:
+                        taxa.add(t)
+            return taxa
+
+        # 1. Flatten the dict and sort by original depth (ascending)
+        # Items look like: (original_depth, (h1_str, h2_str))
+        flat_items = []
+        for depth, pairs in predef_rets.items():
+            for pair in pairs:
+                flat_items.append((int(depth), pair))
+                
+        # Shallower depths (ancestors) must be processed before deeper depths (descendants)
+        flat_items.sort(key=lambda x: x[0])
         
-        if is_mul_input:
-            # Appear exactly once or twice
-            # Check if any appear > 2 (or 0, implicit)
-            bad_taxa = [k for k, v in counts.items() if v > 2]
-            if bad_taxa:
-                logger.log(f"You have entered a tree type (--multree) of multree, species in your tree should appear exactly once or twice. (Violators: {bad_taxa})", 'w')
-        else:
-            # Standard mode, no dups allowed
-            if has_dups:
-                bad_taxa = [k for k, v in counts.items() if v > 1]
-                logger.log("You have not entered a tree type (--multree) of multree, but there are labels in your tree that appear more than once!", 'w')
+        # 2. Determine the new iteration level for each pair
+        new_levels = []
+        for i, (depth_i, pair_i) in enumerate(flat_items):
+            taxa_i = get_taxa(pair_i)
+            
+            max_parent_level = -1
+            # Check all previously processed (shallower) pairs
+            for j in range(i):
+                depth_j, pair_j = flat_items[j]
+                taxa_j = get_taxa(pair_j)
+                
+                # If they share leaves, the deeper one (pair_i) is nested in the shallower one (pair_j)
+                if taxa_i.intersection(taxa_j):
+                    max_parent_level = max(max_parent_level, new_levels[j])
+                    
+            # Assign to the level immediately following its deepest parent
+            # If it has no parents (no intersection), it defaults to -1 + 1 = 0.
+            new_levels.append(max_parent_level + 1)
+            
+        # 3. Rebuild the dictionary grouped by the new iteration levels
+        shrunk_dict = {}
+        for level, (_, pair) in zip(new_levels, flat_items):
+            if level not in shrunk_dict:
+                shrunk_dict[level] = []
+            shrunk_dict[level].append(pair)
+            
+        return shrunk_dict
+
+    @staticmethod
+    def _process_mul_status(tcf: TaskConfig, t_line: str, logger: GranLogger) -> str:
+
+        from Reticulate_Tree.reticulate_tree import ReticulateTree
+        from collections import Counter
+        
+        def singlify_tree(t: Tree) -> None:
+            '''Remove duplicate labels.'''
+            leaves_to_keep = set()
+            for l in t.get_leaves():
+                if not l.name or l.name in leaves_to_keep:
+                    l.name = None
+                else:
+                    leaves_to_keep.add(l.name)
+            t.prune(leaves_to_keep, preserve_branch_length=True)
+
+        # --- Autodetect MULTree/eNewick and collapse if needed ---
+        rt = ReticulateTree(t_line, is_multree=True)
+        t = rt.tree
+        G = rt.dag
+
+        # rt.visualize() # For debugging, can be removed later
+        
+        if tcf.is_mul_input and not rt.get_reticulation_count():
+            logger.log("Warning: --multree was given but the input species tree is not a MUL-tree or eNewick.", 'w')
+        if not tcf.is_mul_input and rt.get_reticulation_count():
+            logger.log("You have not entered a tree type (--multree) of multree, but there are labels in your tree that appear more than once.", 'w')
+
+        # No reticulations found, just return original string
+        if not rt.retnodes:
+            return t_line
+        
+        logger.log(f"Tree:\n{t.get_ascii(show_internal=True)}", 'd')
+        
+        g_depths = rt.compute_depths(G)
+        sorted_rets = sorted(rt.retnodes, key=lambda n: g_depths[n])#, reverse=True) # Process deeper reticulations first (descendants before ancestors)
+
+        ret_struct = {}
+        for ret_node in sorted_rets:
+            preds = list(G.predecessors(ret_node))
+            succs = list(G.successors(ret_node))
+            logger.log(f"Reticulation node '{ret_node}' has predecessors {len(preds)} and successors {len(succs)}", 'd')
+            ret_struct[ret_node] = (G.nodes[succs[0]]['ete'], [G.nodes[p]['ete'] for p in preds])
+
+        '''if len(ret_struct) > 1:
+            logger.log("Multiple reticulations detected in the input tree. This is currently not supported as input.", 'e')
+        
+        first_ret = next(iter(ret_struct.values()))
+        if len(first_ret[1]) != 2:
+            counts = Counter(n.name for n in t.traverse() if n.name)
+            violators = [k for k, v in counts.items() if v > 2]
+            logger.log(f"Reticulation node with degree != 2 detected (all violators: {violators}). This is currently not supported as input.", 'e')
+
+        '''
+
+        predefined_rets = {}
+
+        # Process ALL reticulations for Guided Iterative Search
+        for ret_node, (succ, parents) in ret_struct.items():
+            if len(parents) != 2:
+                counts = Counter(n.name for n in t.traverse() if n.name)
+                violators = [k for k, v in counts.items() if v > 2]
+                logger.log(f"Reticulation node with degree != 2 detected (all violators: {violators}). This is currently not supported as input.", 'e')
+                raise NotImplementedError("Reticulations with degree != 2 not supported.")
+
+            n1, n2 = parents
+
+            logger.log(f"Reticulation structure: Succ: {succ.get_leaf_names()} N1: {n1.get_leaf_names()} N2: {n2.get_leaf_names()}", 'd')
+            logger.log(f"Succ Tree:\n{succ.get_ascii(show_internal=True)}", 'd')
+            logger.log(f"Succ up Tree:\n{succ.up.get_ascii(show_internal=True)}", 'd')
+            logger.log(f"N1 Tree:\n{n1.get_ascii(show_internal=True)}", 'd')
+            logger.log(f"N2 Tree:\n{n2.get_ascii(show_internal=True)}", 'd')
+
+            n1_children = n1.get_children()
+            n2_children = n2.get_children()
+            
+            succ_leaves = set(succ.get_leaf_names())
+            if set(n2_children[0].get_leaf_names()) == succ_leaves:
+                n2_sister = n2_children[1]
+            else:
+                n2_sister = n2_children[0]
+
+            if set(n1_children[0].get_leaf_names()) == succ_leaves:
+                n1_sister = n1_children[1]
+            else:
+                n1_sister = n1_children[0]
+
+            h_str = ",".join(succ.get_leaf_names())
+            p1_str = ",".join(n1_sister.get_leaf_names())
+            p2_str = ",".join(n2_sister.get_leaf_names())
+            
+            logger.log(f"Hybrid clade (h): {h_str}", 'd')
+            logger.log(f"Hybrid clade parent 1 (p1): {p1_str}", 'd')
+            logger.log(f"Hybrid clade parent 2 (p2): {p2_str}", 'd')
+
+            ret_depth = g_depths[ret_node]
+            if ret_depth in predefined_rets:
+                predefined_rets[ret_depth].append((h_str, p1_str, p2_str))
+            else:
+                predefined_rets[ret_depth] = [(h_str, p1_str, p2_str)]
+
+        singlify_tree(t) # in-place
+
+        logger.log(f"T after collapsing reticulations to singly-labeled:\n{t.get_ascii(show_internal=True)}", 'd')
+
+        logger.log(f"Predefined reticulations for iterative search: {predefined_rets}", 'd')
+
+        predefined_rets = TreeLoader.shrink_reticulation_depths(predefined_rets)
+        for level, pairs in predefined_rets.items():
+            fixed_pairs = []
+            for h_str, p1_str, p2_str in pairs:
+                p1 = t.get_common_ancestor(p1_str.split(',')) if ',' in p1_str else t.search_nodes(name=p1_str)[0]
+                p1_sis = p1.get_sisters()[0]
+                if set(p1_sis.get_leaf_names()) == set(h_str.split(',')):
+                    fixed_pairs.append((h_str, p2_str))
+                else:
+                    fixed_pairs.append((h_str, p1_str))
+            predefined_rets[level] = fixed_pairs
+
+        # Inject the queue into the config: update() won't work here
+        object.__setattr__(tcf, 'predefined_rets', predefined_rets)
+        logger.log(f"Predefined reticulations for iterative search: {tcf.predefined_rets}", 'd')
+        
+        # Pass the collapsed tree string forward
+        t_line = t.write(format=1)
+
+        return t_line
 
     @staticmethod
     def _sanitize_line(s: str) -> str:
@@ -321,6 +487,122 @@ class MulTreeManager:
         self.st = st
         self.logger = logger
         self.ploidies = self._parse_ploidy_file(self.tcf.ploidies, logger)
+
+        # DFS Cache for optimizations (Lazy loaded)
+        self.dfs_order = None
+        self.subtree_range = None
+        self.st_adj = None
+
+    def _linearize_tree(self):
+        """
+        Performs DFS to map topological relationships to integer ranges.
+        O(N) Pre-computation.
+        """
+        if self.dfs_order: return # Already done
+
+        # 1. Build Adjacency for traversal
+        # SmrtTree/Ete3 structure: node.children is list of objects
+        root = self.st.ete_tree
+        
+        self.dfs_order = {}      # obj -> int
+        self.subtree_range = {}  # obj -> (min, max)
+        
+        timer = 0
+        # Stack: (node, state) 0=Enter, 1=Exit
+        work_stack = [(root, 0)]
+        
+        while work_stack:
+            node, state = work_stack.pop()
+            
+            if state == 0:
+                # Entry
+                timer += 1
+                self.dfs_order[node] = timer
+                # Push exit
+                work_stack.append((node, 1))
+                # Push children
+                for child in node.children:
+                    work_stack.append((child, 0))
+            else:
+                # Exit
+                start = self.dfs_order[node]
+                self.subtree_range[node] = (start, timer)
+
+    def countMULTrees_Optimized(self, h1_nodes: List[str], h2_nodes: List[str]) -> int:
+        """
+        O(H1 * log H2) Counting using DFS Ranges.
+        """
+        # Ensure linearization
+        self._linearize_tree()
+        
+        # Map strings back to objects
+        h1_objs = [self.st.get_node(n) for n in h1_nodes if self.st.get_node(n)]
+        h2_objs = [self.st.get_node(n) for n in h2_nodes if self.st.get_node(n)]
+        
+        # Sort H2 DFS indices (O(M log M))
+        h2_indices = []
+        for h2 in h2_objs:
+            if h2 in self.dfs_order:
+                h2_indices.append(self.dfs_order[h2])
+        h2_indices.sort()
+        
+        total_h2 = len(h2_indices)
+        valid_count = 0
+        
+        for h1 in h1_objs:
+            if h1.is_leaf():
+                # Leaf has empty clade (in terms of internal nesting check)
+                valid_count += total_h2
+                continue
+            
+            if h1 not in self.subtree_range: continue
+            
+            L, R = self.subtree_range[h1]
+
+            # [FIX] Strict Inequality (bisect_right of L)
+            # Naive iter_descendants() excludes self. 
+            # To match naive, we want strictly descendants: (L, R]
+            
+            # Find first element > L (Excludes self)
+            start_idx = bisect.bisect_right(h2_indices, L) 
+            # Find first element > R
+            end_idx = bisect.bisect_right(h2_indices, R)
+
+            nested_count = end_idx - start_idx
+            valid_count += (total_h2 - nested_count)
+            
+        return valid_count
+
+    def _find_all_targets(self, primary_h2: str) -> List[str]:
+        """
+        For 'Model' mode: Finds all nodes in the ST that belong to the same lineage as primary_h2.
+        Useful when ST is already a MUL-tree (e.g. Iteration > 0).
+        """
+        # 1. Identify the 'Pure' lineage name
+        # If input is 'Species|1.0', pure is 'Species'. 
+        # If input is 'Species', pure is 'Species'.
+        if '|' in primary_h2:
+            pure_name = primary_h2.split('|')[0]
+        else:
+            pure_name = primary_h2
+            
+        pure_name = pure_name.replace('*', '')
+
+        # 2. Find all matches in the current ST
+        matches = self.st.match(pure_name)
+        
+        # 3. Return their unique names
+        # We sort them to ensure deterministic behavior (Primary H2 usually comes first naturally or via sort)
+        target_names = sorted([n.name for n in matches])
+        
+        # Ensure the requested primary_h2 is in the list (it should be if logic is correct)
+        if primary_h2 not in target_names:
+            # Fallback for edge cases where .match() might behave differently on leaves vs internals
+            target_names.append(primary_h2)
+            
+        return target_names
+
+
 
     @staticmethod
     def _parse_ploidy_file(ploidies: Optional[Union[Path, str, Dict[str, int]]], logger: GranLogger) -> Dict[str, int]:
@@ -470,7 +752,9 @@ class MulTreeManager:
             internal = [n.name for n in self.st.ete_tree.traverse("postorder") if not n.is_leaf()]
             return tips + internal
 
-        if " " in raw_input:
+        if isinstance(raw_input, list):
+            clade_lists = [g.split(",") for g in raw_input]
+        elif " " in raw_input:
             groups = raw_input.split(" ")
             clade_lists = [g.split(",") for g in groups]
         else:
@@ -500,17 +784,50 @@ class MulTreeManager:
                 input_set = set(cleaned_clade)
                 
                 # Check subset relationship
-                if len(lca_leaves) != len(input_set) and not input_set.issubset(lca_leaves):
-                     pass
+                if len(lca_leaves) != len(input_set) or not input_set.issubset(lca_leaves):
+                    self.logger.log(f"All hybrid clades specified {h_type} must be monophyletic. LCA produced {lca_leaves} and supercedes input {input_set}", 'd')
 
                 if lca_node.name not in h_nodes:
                     h_nodes.append(lca_node.name)
                     
         return h_nodes
 
-    def build(self) -> dict:
+    ### multi_H to debug the new builder
+    def build(self, optim: bool = False, nestedness: str ='ignore') -> dict:
         mul_trees = {}
         
+        # --- GUIDED ITERATIVE INTERCEPT ---
+        if hasattr(self.tcf, 'predefined_rets') and self.tcf.predefined_rets:
+            step = "Building Predefined MUL-trees"
+            self.logger.report_step(step, "In progress...")
+            
+            mul_trees[0] = MulTree(mt=self.st) # Index 0 is always the ST
+            mul_num = 1
+
+            prerets = list(self.tcf.predefined_rets.values())
+            # Flatten the lists
+            prerets = [pair for sublist in prerets for pair in sublist]
+            print("Predefined reticulations for this iteration:", prerets)
+            
+            for h1_str, h2_str in prerets:
+                # Resolve the raw strings against the current ST context (which may now contain <P2> tags from previous iters)
+                h1_res = self._resolve_h_inputs(h1_str, "h1")
+                h2_res = self._resolve_h_inputs(h2_str, "h2")
+                
+                if not h1_res or not h2_res: continue
+                
+                h1, h2 = h1_res[0], h2_res[0]
+                h1_st_node = self.st.get_node(h1)
+                h_clade = [l.name for l in h1_st_node.iter_leaves()]
+                
+                mt_wrapper, h1_obj, h2_obj = self.st.to_mul_tree(h1, h2)
+                if mt_wrapper:
+                    mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, hx_nodes=[h2_obj])
+                    mul_num += 1
+                    
+            self.logger.report_step(step, f"Success: {mul_num-1} Predefined MUL-trees built")
+            return mul_trees, [], [], self.ploidies
+
         if self.tcf.mode != "st-only":
             step = "Parsing hybrid clades"
             self.logger.report_step(step, "In progress...")
@@ -527,19 +844,23 @@ class MulTreeManager:
             step = "Counting MUL-trees to generate"
             self.logger.report_step(step, "In progress...")
             
-            num_mul_trees = 0
-            for n1_name in h1_resolved:
-                n1_node = self.st.get_node(n1_name)
-                if n1_node.is_leaf():
-                    n1_clade_names = set()
-                else:
-                    n1_clade_names = {n.name for n in n1_node.iter_descendants()}
-                
-                ni = 0
-                for n2_name in h2_resolved:
-                    if n2_name not in n1_clade_names:
-                        ni += 1
-                num_mul_trees += ni
+            if optim:
+                num_mul_trees = self.countMULTrees_Optimized(h1_resolved, h2_resolved)
+            else:
+            
+                num_mul_trees = 0
+                for n1_name in h1_resolved:
+                    n1_node = self.st.get_node(n1_name)
+                    if n1_node.is_leaf():
+                        n1_clade_names = set()
+                    else:
+                        n1_clade_names = {n.name for n in n1_node.iter_descendants()}
+                    
+                    ni = 0
+                    for n2_name in h2_resolved:
+                        if n2_name not in n1_clade_names:
+                            ni += 1
+                    num_mul_trees += ni
                 
             self.logger.report_step(step, f"Success: {num_mul_trees} total MUL-trees")
         else:
@@ -557,17 +878,70 @@ class MulTreeManager:
             for h1 in h1_resolved:
                 h1_st_node = self.st.get_node(h1)
                 h_clade = [l.name for l in h1_st_node.iter_leaves()]
-                for h2 in h2_resolved:
 
-                    mt_wrapper, h1_obj, h2_obj = self.st.to_mul_tree(h1, h2)
+                # Pre-calculate set for naive check to speed up (sets are O(1))
+                # Only needed if NOT optim
+                if not optim and not h1_st_node.is_leaf():
+                    n1_descendants = {n.name for n in h1_st_node.iter_descendants()}
+                else:
+                    n1_descendants = set()
+
+                processed_targets = set()
+
+                for h2 in h2_resolved:
+                    
+                    is_nested = False
+                    
+                    if optim:
+                        # DFS Logic
+                        n1_node = self.st.get_node(h1)
+                        if not n1_node.is_leaf():
+                            if n1_node in self.subtree_range:
+                                L, R = self.subtree_range[n1_node]
+                                h2_node = self.st.get_node(h2)
+                                if h2_node in self.dfs_order:
+                                    idx = self.dfs_order[h2_node]
+                                    # [FIX] Strict L < idx (Exclude self from nested definition to match naive)
+                                    if L < idx <= R:
+                                        is_nested = True
+                    else:
+                        # [FIX] RESTORE NAIVE LOGIC
+                        # If optim is OFF, we MUST still check!
+                        if h2 in n1_descendants:
+                            is_nested = True
+                            
+                    if is_nested: continue # Skip this pair
+
+                    # --- MODEL MODE LOGIC ---
+                    if nestedness == 'model':
+                        if h2 in processed_targets: continue
+                        
+                        all_targets = self._find_all_targets(h2)
+                        processed_targets.update(all_targets)
+                        
+                        mt_wrapper, h1_obj, hx_objs = self.st.to_mul_tree_multi(h1, all_targets)
+                        
+                        if mt_wrapper:
+                            mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, hx_nodes=hx_objs)
+                            mul_num += 1
+
+                    # --- STANDARD LOGIC (Rectify/Ignore) ---
+                    else:
+                        mt_wrapper, h1_obj, h2_obj = self.st.to_mul_tree(h1, h2)
+                        if mt_wrapper:
+                            # Wrap single H2 in list for consistency
+                            mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, hx_nodes=[h2_obj])
+                            mul_num += 1
+                    
+                    """mt_wrapper, h1_obj, h2_obj = self.st.to_mul_tree(h1, h2)
                     if mt_wrapper:
                         mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, h2_obj)
-                        mul_num += 1
+                        mul_num += 1"""
 
             self.logger.report_step(step, f"Success: {mul_num-1} MUL-trees built")
             
         return mul_trees, h1_resolved, h2_resolved, self.ploidies
-    
+
     # --- Legacy Support ---
 
     def report_num_trees(self):
@@ -641,26 +1015,50 @@ class MulTreeManager:
 
 # --- Multiprocessing Workers ---
 
-_worker_data = {}
+# --- Global Holders for Worker Processes ---
+_worker_gene_trees = {}
+_worker_registry = None
 
-def _init_collapse_worker(gts, reg, rec):
-    _worker_data['gts'] = gts
-    _worker_data['reg'] = reg
-    _worker_data['rec'] = rec
+def _init_collapse_worker(data_path):
+    """
+    Universal Initializer:
+    Loads data from the temporary dump file.
+    """
+    global _worker_gene_trees, _worker_registry
+    
+    # Load Data (Trees & Registry)
+    if data_path:
+        try:
+            # Determine how to open based on path type
+            # (pathlib objects work in open(), but safety cast doesn't hurt)
+            with open(str(data_path), 'rb') as f:
+                data_payload = pickle.load(f)
+            
+            _worker_gene_trees = data_payload['trees']
+            _worker_registry = data_payload['registry']
+            
+        except Exception as e:
+            # Critical failure reporting
+            print(f"CRITICAL: Worker process failed to load temp data from {data_path}: {e}", file=sys.stderr)
+            raise e
 
-def _collapse_worker(item):
-    m_idx, m_data = item
-    rec = _worker_data['rec']
-    h1_sis, h2_sis = rec.get_sister_clades(m_data)
+def _collapse_worker(task_item):
+    """
+    Standard worker logic using global data.
+    """
+    m_idx, m_data = task_item
+    
+    # Access globals
+    h1_sis, hx_sis_list = Reconciler.get_sister_clades(m_data)
     
     current_mt_groups = {}
-    for g_idx, gt_obj in _worker_data['gts'].items():
-        # Reconciler logic is pure, safe to call here
-        group_data = rec.compute_groups(gt_obj, m_data, _worker_data['reg'], h1_sis, h2_sis)
+    for g_idx, gt_obj in _worker_gene_trees.items():
+        group_data = Reconciler.compute_groups(gt_obj, m_data, _worker_registry, h1_sis, hx_sis_list)
         current_mt_groups[g_idx] = group_data
+    
     return m_idx, current_mt_groups
 
-# Worker for parallel filtering
+# --- Worker for parallel filtering ---
 def _check_worker(payload):
     """
     Worker to process a single MUL-tree's checknums logic.
@@ -760,54 +1158,25 @@ class GeneTreeManager:
 
         n_proc = self.reconciler.num_processes
 
-        # --- CRITICAL FIX: PRIME REGISTRY ---
+        # --- PRIME REGISTRY ---
         # We must register all gene tree taxa in the main registry BEFORE forking.
         # Otherwise, workers create divergent ID mappings (e.g., 'TaxonA' is ID 5 in Worker 1, but ID 8 in Main).
         # We assume compute_groups uses registry.get_id(name). 
         # By iterating and 'touching' names here, we lock the IDs globally.
         if n_proc > 1:
-            for gt in gene_trees.values():
-                for node in gt.ete_tree.traverse():
-                    if node.name:
-                        registry.get_id(node.name)
-        # This step may be costly for large GT sets - if we later fix the tips to follow an easier scheme, we can optimize this.
-        # This is because the st will have all the species
-        # ------------------------------------
+            # Optimization: Use C-level iteration to collect all keys at once
+            # Note: iterating a dict (gt.node_map) yields its keys automatically
+            all_names = set(chain.from_iterable(gt.node_map for gt in gene_trees.values()))
+            # Register all at once
+            for name in all_names:
+                registry.get_id(name)
         
         pickle_dir = self.tcf.pickle_dir
         pickle_dir.mkdir(parents=True, exist_ok=True)
 
         registry_path = pickle_dir / f"{self.tcf.run_prefix}_registry.pickle"
         force_regenerate = self._check_registry_safety(registry_path, registry)
-
-        '''#for m_idx, m_data in mul_trees.items():
-        # Disable if verbosity < 3
-        for m_idx, m_data in tqdm(mul_trees.items(), desc="Processing MUL-trees", unit="mt", disable=self.logger.verbosity < 3):
-            if m_idx == 0: continue
-            
-            pickle_path = pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
-            # Skip only if pickles exist AND we successfully restored the registry state
-            if pickle_path.exists() and not self.tcf.overwrite and not force_regenerate:
-                continue
-                
-            # Compute groups using the registry for speed
-            current_mt_groups: Dict[int, GroupData] = {}
-            
-            # Pre-calculate sister clades (returned as Sets of Strings)
-            h1_sis, h2_sis = self.reconciler.get_sister_clades(m_data)
-
-            for g_idx, gt_obj in gene_trees.items():
-                group_data = self.reconciler.compute_groups(gt_obj, m_data, registry, h1_sis, h2_sis)
-                current_mt_groups[g_idx] = group_data
-            
-            try:
-                with open(pickle_path, 'wb') as f:
-                    pickle.dump(current_mt_groups, f)
-            except Exception as e:
-                self.logger.log(f"saving pickle {pickle_path}: {e}", 'e')
-            
-            del current_mt_groups'''
-        
+     
         # Prepare Tasks (skip 0)
         # Only process if pickle doesn't exist or forced
         tasks = []
@@ -832,15 +1201,50 @@ class GeneTreeManager:
 
         if tasks:
             if n_proc > 1:
-                # Pass gene_trees and registry once via initializer to avoid repeated pickling overhead
-                with mp.Pool(processes=n_proc, initializer=_init_collapse_worker, initargs=(gene_trees, registry, self.reconciler)) as pool:
-                    for res in tqdm(pool.imap_unordered(_collapse_worker, tasks), total=len(tasks), desc="Collapsing", unit="mt", disable=self.logger.verbosity < 3):
-                        save_result(res)
+                # Create a temporary file to hold the massive data
+                # delete=False is safer for Windows (prevents access errors if opened twice)
+                # We manually unlink later.
+                fd, temp_file_path = tempfile.mkstemp(suffix=".pkl", prefix="grandma_worker_data_")
+                os.close(fd) 
+
+                try:
+                    # Dump data once
+                    #self.logger.log("Serializing worker data to temp file...", 'd')
+                    payload = {'trees': gene_trees, 'registry': registry}
+                    with open(temp_file_path, 'wb') as f:
+                        pickle.dump(payload, f)
+                    
+                    # Init Workers pointing to file
+                    # This works on ALL OSs
+                    with mp.Pool(processes=n_proc, initializer=_init_collapse_worker, initargs=(temp_file_path,)) as pool:
+                        for res in tqdm(pool.imap_unordered(_collapse_worker, tasks), total=len(tasks), desc="Collapsing", unit="mt", 
+                                      disable=self.logger.verbosity < 3):
+                            save_result(res)
+                            
+                finally:
+                    # Cleanup Temp File
+                    if os.path.exists(temp_file_path):
+                        try:
+                            os.remove(temp_file_path)
+                            #self.logger.log(f"Cleaned up temp file {temp_file_path}", 'd')
+                        except OSError as e:
+                            self.logger.log(f"Failed to delete temp file {temp_file_path}: {e}", 'w')
+
             else:
-                _init_collapse_worker(gene_trees, registry, self.reconciler)
+                # Serial Execution (Single Core)
+                # Manually set globals to avoid rewriting worker logic
+                global _worker_gene_trees, _worker_registry
+                _worker_gene_trees = gene_trees
+                _worker_registry = registry
+                
+                # We don't need init function, just call worker directly
                 for item in tqdm(tasks, desc="Collapsing", unit="mt", disable=self.logger.verbosity < 3):
                     res = _collapse_worker(item)
                     save_result(res)
+                
+                # Cleanup globals
+                _worker_gene_trees = {}
+                _worker_registry = None
             
         # Save the registry state so the next run can interpret the IDs in the group pickles
         try:
@@ -922,100 +1326,6 @@ class GeneTreeManager:
                 self.logger.log(f"Gene tree on line {g_idx+1} is over the group cap in {fail_count} MTs and will be filtered.", 'w')
                 del gene_trees[g_idx]
                 
-    def filter_and_check2(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]):
-        """
-        Writes checknums file and filters trees exceeding group cap.
-        Optimized regex formatting and pre-sorted iteration.
-        """
-        step = "Filtering gene trees over group cap"
-        self.logger.report_step(step, "In progress...")
-        
-        check_path = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-checknums.txt"
-        
-        gt_failures = {} 
-        sorted_mul_ids = sorted(mul_trees.keys())
-        sorted_gene_ids = sorted(gene_trees.keys())
-
-        # OPTIMIZATION: Memoize regex patterns for formatting
-        # Since h_clade is constant for a given MUL-tree, we compile the regex once per MT.
-        mt_regex_cache = {}
-
-        def format_mt_optimized(mt, h_clade, m_idx):
-            s = mt.to_str(internal_labels=True)
-            if s.endswith(';'): s = s[:-1]
-            
-            # Use cached compiled regex for this MUL-tree
-            if m_idx not in mt_regex_cache:
-                # Matches any species in h_clade that is NOT followed by a *
-                # Pattern: \b(SpecA|SpecB|SpecC)(?!\*)
-                pattern_str = r'\b(' + '|'.join(map(re.escape, h_clade)) + r')(?!\*)'
-                mt_regex_cache[m_idx] = re.compile(pattern_str)
-            
-            # Single pass replacement using regex engine
-            s = mt_regex_cache[m_idx].sub(r'\1+', s)
-            s = s.replace("+*", "*")
-            return s
-
-        with open(check_path, 'w') as f:
-            f.write("mul.tree\tgene.tree\tgroups\tfixed\tcombinations\tover.cap.filtered\n")
-            
-            for m_idx in sorted_mul_ids:
-                if m_idx == 0: continue
-                m_data = mul_trees[m_idx]
-                
-                # Use optimized formatter
-                mt_str = format_mt_optimized(m_data.mt, m_data.h_clade, m_idx)
-                
-                h_info = ""
-                if not self.tcf.is_mul_input:
-                    h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
-                    h2_name = m_data.h2_node.name if m_data.h2_node else "NA"
-                    h_info = f"\tH1 Node:{h1_name}\tH2 Node:{h2_name}"
-                
-                f.write(f"# MT-{m_idx}:{mt_str}{h_info}\n")
-
-                pickle_path = self.tcf.pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
-                if not pickle_path.exists(): continue
-                
-                current_mt_groups = {}
-                try:
-                    with open(pickle_path, 'rb') as pf:
-                        current_mt_groups = pickle.load(pf)
-                except Exception:
-                    continue
-                
-                buffer = []
-                
-                for g_idx in sorted_gene_ids:
-                    if g_idx not in current_mt_groups: continue
-                    
-                    groups = current_mt_groups[g_idx]
-                    num_ambig = len(groups.ambiguous_groups)
-                    num_fixed = len(groups.fixed_groups)
-                    total_groups = num_ambig + num_fixed
-                    
-                    over_cap = "N"
-                    if num_ambig > self.tcf.group_cap:
-                        over_cap = "Y"
-                        if g_idx not in gt_failures: gt_failures[g_idx] = []
-                        gt_failures[g_idx].append(m_idx)
-
-                    combos = 1 << num_ambig 
-                    buffer.append(f"{m_idx}\t{g_idx}\t{total_groups}\t{num_fixed}\t{combos}\t{over_cap}\n")
-                
-                if buffer:
-                    f.write("".join(buffer))
-                
-                del current_mt_groups
-
-        self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap")
-        
-        for g_idx in sorted(gt_failures.keys()):
-            if g_idx in gene_trees:
-                fail_count = len(gt_failures[g_idx])
-                self.logger.log(f"Gene tree on line {g_idx} is over the group cap in {fail_count} MTs and will be filtered.", 'w')
-                del gene_trees[g_idx]
-
     def write_filtered_trees(self, gene_trees: Dict[int, SmrtTree]):
         """Matches GRAMPA's filterOut logic."""
         step = "Writing filtered gene trees to file"
