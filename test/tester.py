@@ -21,9 +21,9 @@ if __name__ == "__main__":
 
     datasets = [
 #        ("ex_no_w", "manual_gene_trees_no_w.txt", "manual_species_tree_no_w.tre"),
-#        ("ex_w", "manual_gene_trees_w.txt", "manual_species_tree_w.tre"),
+        ("ex_w", "manual_gene_trees_w.txt", "manual_species_tree_w.tre"),
 #        ("ex_w_snested", "manual_gene_trees_w_sn.txt", "manual_species_tree_w_sn.tre"),
-        ("ex_k_back", "backbone.txt", "astral.tre"),
+#        ("ex_k_back", "backbone.txt", "astral.tre"),
 #        ("ex_bend", "grampa_trees.tre", "species.tre"),
 #        ("ex_diaz", "grampa_trees.tre", "species.tre"),
 #        ("ex_kall", "kall.nw", "kall.treefile"),
@@ -45,11 +45,11 @@ if __name__ == "__main__":
         o_old = path_manual / 'o_old/'
         o_new = path_manual / 'o_new'
 
-        #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}/ {other_args} --debug --plot -v 3 -p 10", "new") # --debug --plot -w 1 50
+        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}/ {other_args} --debug --plot -v 3 -p 10", "new") # --debug --plot -w 1 50
         #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_nm/ {other_args} --debug --plot -v 3 -p 10 --nestedness model", "new") # --debug --plot
         #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_op/ {other_args} --debug --plot -v 3 -p 10 --optim", "new")
         #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_np/ {other_args} --debug --plot -v 3 -p 10 --optim --nestedness model", "new") # --debug --plot
-        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug --plot -v 3 -p 10 --start auto", "new") #--plot --start 1 -i 2
+        #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug --plot -v 3 -p 10 --start auto", "new") #--plot --start 1 -i 2
         #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_deep/ {other_args} -m full --debug --plot -v 3 -p 10", "new")
 
         #time_tool(f"python {old_tool} -g {g} -s {s} -o {o_old}_v0 --overwrite {other_args} --maps -v 0", "old")

@@ -1,5 +1,4 @@
 import os
-from platform import node
 import re
 import sys
 import bisect
@@ -27,6 +26,7 @@ class CommonOps:
     @staticmethod
     def write_handoff_files(dir: Path, st: Tree=None, gts: Optional[List[Tree]]=None):
         """Writes the trees to disk to allow inspection/resume, matching iter_mode.py."""
+        ### Bug : we need to save with all names - internals and root too!
         if st:
             st_path = dir / 'multree.tre'
             with open(st_path, 'w') as f: f.write(st.write(format=0))
@@ -272,7 +272,7 @@ class TreeLoader:
         return True, ""
 
     @staticmethod
-    def shrink_reticulation_depths(predef_rets: dict) -> dict:
+    def _shrink_ret_depths(predef_rets: dict) -> dict:
         """
         Compresses a depth-keyed dictionary of reticulation pairs into continuous 
         iteration levels (0, 1, ...).
@@ -343,6 +343,24 @@ class TreeLoader:
                 else:
                     leaves_to_keep.add(l.name)
             t.prune(leaves_to_keep, preserve_branch_length=True)
+
+        def singlify_enewick(t_line: str) -> Tree:
+            t = Tree(t_line, format=1) # ENewick parsing to handle reticulation labels
+            # Identify valid backbone leaves (excluding any node with #H in the name)
+            backbone_leaves = [n for n in t.get_leaves() if not (n.name and "#H" in n.name)]
+            # Prune strips the hybrid leaves and automatically collapses 
+            # any resulting unbranched internal nodes, preserving branch lengths.
+            t.prune(backbone_leaves, preserve_branch_length=True)
+            # Clean up any remaining internal branching nodes that were part of the reticulation
+            for n in t.traverse():
+                if n.name and "#H" in n.name:
+                    # Safely strip just the #H tag in case it had a real name prefix (e.g. 'NodeA#H1' -> 'NodeA')
+                    clean_name = n.name.split('#H')[0]
+                    n.name = clean_name if clean_name else ''
+                    '''# When wrapping a single leaf
+                    if len(n.children) == 1:
+                        n.delete()'''
+            return t
 
         # --- Autodetect MULTree/eNewick and collapse if needed ---
         rt = ReticulateTree(t_line, is_multree=True)
@@ -429,13 +447,16 @@ class TreeLoader:
             else:
                 predefined_rets[ret_depth] = [(h_str, p1_str, p2_str)]
 
-        singlify_tree(t) # in-place
+        if '#H' in t_line:
+            t = singlify_enewick(t_line)
+        else:
+            singlify_tree(t) # in-place
 
         logger.log(f"T after collapsing reticulations to singly-labeled:\n{t.get_ascii(show_internal=True)}", 'd')
 
         logger.log(f"Predefined reticulations for iterative search: {predefined_rets}", 'd')
 
-        predefined_rets = TreeLoader.shrink_reticulation_depths(predefined_rets)
+        predefined_rets = TreeLoader._shrink_ret_depths(predefined_rets)
         for level, pairs in predefined_rets.items():
             fixed_pairs = []
             for h_str, p1_str, p2_str in pairs:

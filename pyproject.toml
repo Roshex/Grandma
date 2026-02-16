@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grandma"
+version = "3.0.1"
+description = "Gene Reconciliation Algorithms for Nested Detection of Multiple Allopolyploidizations"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+  { name = "Ronen Shtein" },
+#  { name = "Gregg Thomas (Original GRAMPA)" },
+#  { name = "S. Hussain Ather (Original GRAMPA)" },
+#  { name = "Matthew Hahn (Original GRAMPA)" }
+]
+maintainers = [
+  { name = "Roshex" }
+]
+dependencies = [
+    "ete3>=3.1.2",
+    "networkx>=2.8",
+    "psutil>=5.9.0",
+    "tqdm>=4.64.0",
+    "matplotlib>=3.5.0",
+    "pandas>=1.4.0",
+    "pyvis>=0.3.1"
+]
+
+[project.urls]
+Homepage = "https://github.com/Roshex/Grandma"
+Repository = "https://github.com/Roshex/Grandma"
+# Documentation = "TBD"
+
+[project.scripts]
+# `grandma` CLI command
+grandma = "grampack.main:main"
+
+[tool.setuptools.packages.find]
+# Explicitly tell setuptools where your code lives so it doesn't accidentally package test folders
+include = ["grampack*", "Reticulate_Tree*"]
+

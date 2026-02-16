@@ -549,10 +549,24 @@ class Engine:
 
         self.flow_logger.log("Binary Split Mode Finished.", 'i')
 
-def main():
-    ctx, tcf = InitParser().parse()
+def main(args_list: Optional[List[str]] = None, return_results: bool = False) -> Optional[dict]:
+    """
+    Main entry point for GRANDMA (CLI and API).
+    
+    :param args_list: List of string arguments. If None, uses sys.argv (CLI mode).
+    :param return_results: If True, returns internal Python objects instead of exiting.
+    :return: A dictionary of results if return_results is True, else None.
+    """
+    ctx, tcf = InitParser().parse(args_list)
     engine = Engine(ctx, tcf)
-    engine.run()
+    final_results = engine.run()
+    if return_results:
+        # --- API PATH ---
+        print("Returning results to Python API.")
+        return final_results
+    else:
+        # --- CLI PATH ---
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()

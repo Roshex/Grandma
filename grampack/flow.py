@@ -735,7 +735,7 @@ class FlowManager:
     
     # --- Handlers for the Split mode ---
     
-    def extract_subproblems(self, res: TaskResult, depth: int, idx: int) -> None:
+    def extract_subproblems(self, res: TaskResult, depth: int, idx: int) -> Tuple[List[ConcurrTask], Dict[int, List[int]]]:
         """
         Refined binary recursion split using ETE3-safe surgery and O(N) GT extraction.
         1. Inner: Extracts independent 'pure' subtrees for each hybrid lineage.
@@ -767,17 +767,18 @@ class FlowManager:
         if len(set(l.pure for l in h1_node.get_leaves())) < 2:
             self.logger.log("All H clade leaves belong to a single species.", 'd')
             self.logger.log(f"Terminal autopolyploidy detected at depth {depth}, index {idx}. Stopping recursive branch.", 'i')
-            return []
+            return [], {}
 
         # A softer check: MT leaf count == H clade leaf count
         mt_lvs_list = [l.name for l in mt_wrapper.ete_tree.get_leaves()]
         if len(mt_lvs_list) == len(h_clade_names):
             self.logger.log("All MT leaves are H clades leaves.", 'd')
             self.logger.log(f"Terminal autopolyploidy detected at depth {depth}, index {idx}. Stopping recursive branch.", 'i')
-            return []
+            return [], {}
 
         outer_gts = {}
         inner_gts = {}
+        gt_split_dict = defaultdict(list)
         innie_counter = 0
 
         debug_sample = self.sample(list(gts.keys()))
@@ -845,7 +846,8 @@ class FlowManager:
                 
                 if g_idx in debug_sample:
                     self._debug_tree(f"Extracted Inner as Lineage {innie_counter}:", extracted_gt)
-                
+
+                gt_split_dict[g_idx].append(innie_counter)
                 innie_counter += 1
 
         # --- Species Tree Surgery ---
@@ -873,7 +875,7 @@ class FlowManager:
             next_tasks.append((SmrtTree(tree_obj=outer_st_obj), outer_gts, f"{depth + 1}.{idx * 2}"))
         if len(inner_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(inner_gts) > 0:
             next_tasks.append((SmrtTree(tree_obj=inner_st_obj), inner_gts, f"{depth + 1}.{idx * 2 + 1}"))
-        return next_tasks
+        return next_tasks, gt_split_dict
 
     @staticmethod
     def _trim_outer(tree_to_trim: Tree, h1_node: TreeNode, h2_node: TreeNode) -> Tuple[Tree, List[str]]:
@@ -938,9 +940,14 @@ class FlowManager:
         
         # 3. Extract Subproblems
         try:
-            next_tasks = self.extract_subproblems(res, depth, idx)
+            next_tasks, gt_split_dict = self.extract_subproblems(res, depth, idx)
         except Exception as e:
             self.logger.log(f"extracting subproblems at Depth {depth}, Index {idx}: {e}", 'e')
+
+        # Write gt_split_dict to a file
+        gt_split_path = iter_out.parent / f"gt_splits.json"
+        with open(gt_split_path, 'w') as f:
+            json.dump(gt_split_dict, f, indent=4)
 
         # Write handoff files for resume support
         for task_st, task_gts, task_id in next_tasks:
