@@ -2,7 +2,7 @@
 
 **G**ene-tree **R**econciliation **A**lgorithms for **N**ested **D**etection of **M**ultiple **A**llopolyploidizations
 
-GRANDMA is a highly optimized, modern Python reimplementation and massive iterative expansion of the classic GRAMPA algorithm. It reconciles large sets of gene trees against species trees infer polyploid events (e.g., allopolyploid hybridization and WGD) under Maximum Parsimony.
+GRANDMA is a highly optimized, modern Python reimplementation and massive iterative expansion of the classic GRAMPA algorithm (see https://github.com/gwct/grampa). It reconciles large sets of gene trees against species trees infer polyploid events (e.g., allopolyploid hybridization and WGD) under Maximum Parsimony.
 
 By utilizing flattened array-based tree structures and $O(1)$ Lowest Common Ancestor (LCA) lookups, GRANDMA achieves storage reductions and massive speedups over the original implementation. This efficiency enables the algorithm to move from the realrm of a single-event inference tool into an engine capable of iterative searches across complex evolutionary histories.
 
