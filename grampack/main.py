@@ -70,12 +70,20 @@ def task_worker(payload: Tuple[Any, Any, str], context: GlobalContext, config: T
     # Note: pickle_dir is a property of TaskConfig derived from output_dir, 
     # so we don't set it via replace.
 
+    # Temp fix
+    if config.mode == "split":
+        binary_id = int(task_id.split(".")[1]) if "." in task_id else 0
+    else:
+        binary_id = None
+
     # Create local TaskConfig for this step
     iter_tcf = config.update(
         output_dir=out,
         st=st,
-        gts=gts
+        gts=gts,
+        binary_id=binary_id
     )
+
 
     # Create local GlobalContext (e.g., to override verbosity for workers)
     iter_ctx = context.update(verbosity=verbosity)
@@ -156,6 +164,10 @@ class Task:
         self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(self.ctx.optim, self.ctx.nestedness)
         #if tcf.mode == "build-mts": return None, {}
 
+        if len(self.mul_trees) < 2:
+            self.logger.log("No valid MUL-trees could be built. Terminating.", 'w')
+            return None, {}
+
         # 3. Load Gene Trees
         self.gene_trees = TreeLoader.gene_trees(tcf, self.logger)
 
@@ -173,7 +185,7 @@ class Task:
         print(f"Species Tree: {self.spec_tree.to_str(internals=True)})"""
 
         # Re-init component with current task
-        self.reconciler = Reconciler(tcf, self.logger, self.ctx.num_processes, self.ctx.optim)
+        self.reconciler = Reconciler(tcf, self.ctx.num_processes)#self.logger, self.ctx.num_processes, self.ctx.optim)
         self.gene_mgr = GeneTreeManager(tcf, self.reconciler, self.logger)
 
         # 4. Collapse & Filter Groups
@@ -189,7 +201,7 @@ class Task:
         """
 
         # 5. Reconciliation and MUL-tree Selection
-        step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry, self.writer)
+        step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry, self.logger,self.writer)
 
         """if not step_result.sorted_scores:
             self.logger.write("No valid MUL-trees scored.", level=1)
@@ -215,11 +227,7 @@ class Task:
                                 min_data.h_clade, tcf.output_dir, tcf.run_prefix)
 
         # 8. Final Report
-        min_tree_str = min_data.mt.to_str(internals=True)
-        h_clade = min_data.h_clade
-        for spec in h_clade:
-            min_tree_str = re.sub(f"{spec}(?!\*)", f"{spec}+", min_tree_str)
-            min_tree_str = min_tree_str.replace("+*", "*")
+        self.logger.print_end_prog(tcf, step_result.mt_score(), step_result.mt_idx(), min_data)
 
         # Important:
         # ST and GTs are not needed here, as they are prepared from StepResult in FlowManager
@@ -229,8 +237,6 @@ class Task:
             #'h2_nodes': h2_nodes, to be supported later
             'repair': False # Disable repair for subsequent runs
         }
-            
-        self.logger.print_end_prog(tcf, (min_idx, step_result.mt_score(), min_tree_str))
 
         return step_result, tcf_updates
         
@@ -336,11 +342,11 @@ class Engine:
                 # We pass the persistent config (which might have parsed ploidies from iter 1)
                 # worker will apply transient updates (output_dir, st, gts) internally
                 _, res, updates, iter_log = task_worker(
-                    payload=(current_st, current_gts, str(i)),
-                    context=self.ctx,      # Pass Global Context
-                    config=perm_tcf,       # Pass updated Task Config 
-                    verbosity=self.ctx.verbosity,
-                    parent_logger=self.flow_logger
+                    payload = (current_st, current_gts, str(i)),
+                    context = self.ctx,      # Pass Global Context
+                    config  = perm_tcf,       # Pass updated Task Config 
+                    verbosity = self.ctx.verbosity,
+                    parent_logger = self.flow_logger
                 )
                 iter_logger = GranLogger(iter_log, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug,
                                          parent_logger=self.flow_logger, clear_log=False)
@@ -352,9 +358,9 @@ class Engine:
                 # This returns the trees prepared for the NEXT iteration
                 next_mt, next_gts, _ = self.flow_mgr.handle_iteration_result(
                     i, res,
-                    engine_callback=lambda st, gts, h1, h2, out: self._run_nested_subproblem(st, gts, h1, h2, out),
+                    engine_callback = lambda st, gts, h1, h2, out: self._run_nested_subproblem(st, gts, h1, h2, out),
                     iter_out = self.ctx.root_dir / str(i) / "output", 
-                    iter_logger=iter_logger,
+                    iter_logger = iter_logger,
                 )
 
                 if not next_gts:

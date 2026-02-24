@@ -32,7 +32,7 @@ class GranMetadata:
     github: str = "https://github.com/Roshex/Grandma"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "3.0.1"
+    version: str = "3.0.2"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -127,6 +127,7 @@ class TaskConfig:
     h1_nodes: Optional[Union[str, List[str]]] = None
     h2_nodes: Optional[Union[str, List[str]]] = None
     ploidies: Optional[Union[Path, str, Dict[str, int]]] = None
+    binary_id: Optional[int] = None # For split mode, identifies the current subproblem (the j number)
     predefined_rets: Dict[int, List[Tuple[str, str]]] = field(default_factory=dict)
     group_cap: int = 8
     weights: Tuple[int, int] = (1, 1) # (w_dup, w_loss)
@@ -391,6 +392,34 @@ def check_loop_length(n: int, i: int, st_file: Path, history: Dict, logger: Gran
 
     return n
 
+def assess_restart_compatibility(logger, ctx, tcf) -> bool:
+    """Pull the args from the log, if present.
+    Then determine if you can restart, or if the args are incompatible.
+    If no .log file, issue an error. [Log file not found. Cannot assess restart compatibility (not supported for --nolog runs).]
+    """
+
+    # use regex to get the line "# The program was called as: {args}\n"
+    log_file = logger.log_file
+    if not log_file or not log_file.exists():
+        logger.log("No log file found. Cannot assess restart compatibility (not supported for --nolog runs).", 'e')
+        return False
+    with open(log_file, 'r') as f:
+        log_content = f.read()
+    match = re.search(r"# The program was called as: (.+)", log_content)
+    if not match:
+        logger.log("No call signature found in log file. Cannot assess restart compatibility.", 'e')
+        return False
+    old_args_str = match.group(1)
+    old_ctx, old_tcf = InitParser().parser(old_args_str.split()) # unsafe as it may change the folders!
+    # move the output changing funtionality out of parser and into main?
+
+    # Compare relevant fields (those that affect the run logic and output structure)
+    pass
+
+
+
+    
+
 
 
 
@@ -440,8 +469,8 @@ class InitParser:
                  "If no labels are specified, all nodes in the species tree are considered.")
         g_algo.add_argument("-h2", "--h2", type=str, nargs='+', help="As -h1, but for parental node 2 (H2).")
         g_algo.add_argument("-x", "--ploidy", type=str, default=None,
-            help="Ploidy file formatted as a Polyphest Multiset file. If provided, H1 and H2 nodes will be enforced by "
-                 "ploidy levels. Default: None.")
+            help="Ploidy file or string formatted as a line-separated counter of diploid subgenomes (e.g., 'A 1' = "
+                 "A is at most diploid). If provided, H1 and H2 nodes will be enforced by ploidy levels. Default: None.")
         g_algo.add_argument("-c", "--cap", type=int, default=8,
             help="The maximum number of groups a gene tree is allowed to have. A gene tree with more than --cap "
                  "number of groups for a given MUL-tree, will be skipped. Default = 8 [to be raised to 15 on release].")

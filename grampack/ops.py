@@ -59,7 +59,7 @@ class CommonOps:
     
     @staticmethod
     def _load_single_content(input: Union[Path, str], desc: str, logger: GranLogger, key: str="e") -> str:
-        """Loads a single tree string from Path or String."""
+        """Loads a single input string from Path or String."""
         kind, paths = CommonOps._identify_path(input)
         if kind == "raw":
             return input
@@ -637,17 +637,17 @@ class MulTreeManager:
         ploidies = CommonOps._load_single_content(ploidies, "ploidies", logger, key="e")
         ploid_dict = {}
         try:
-            with open(ploidies, 'r') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) == 2:
-                        species, ploidy = parts
-                        ploid_dict[species] = int(ploidy)
+            lines = ploidies.splitlines()
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) == 2:
+                    species, ploidy = parts
+                    ploid_dict[species] = int(ploidy)
         except Exception as e:
             logger.log(f"reading ploidy file: {e}", 'e')
         if not ploid_dict:
             logger.log("Ploidy file is empty or invalid.", 'w')
-        logger.report_step(step, f"Success: Loaded ploidy info for {len(ploid_dict)} species")
+        logger.report_step(step, f"Success: Loaded ploidies for {len(ploid_dict)} species")
         return ploid_dict
 
     ### Beta
@@ -677,8 +677,9 @@ class MulTreeManager:
             """
             if node.is_leaf():
                 # Extract species name (remove '*' if present from previous MUL-tree ops)
-                sp = node.name.replace("*", "")
-                return (sp, 1)
+                '''sp = node.name.replace("*", "")
+                return (sp, 1)'''
+                return (node.pure, 1)
 
             # Get states of all children
             child_states = [get_state(child) for child in node.children]
@@ -725,15 +726,30 @@ class MulTreeManager:
         return {k: tuple(v) for k, v in counts.items()}
         
     ### Beta
-    def _apply_ploidy_constraints(self, h1_candidates: List[str]) -> List[str]:
+    def _apply_ploidy_constraints(self, h1_candidates: List[str], bin_id: Optional[int] = None) -> List[str]:
         """
         Filters H1 candidates based on the ploidy file loaded at init.
         Only H1 is filtered because H1 is the lineage being duplicated.
         """
         filtered_h1 = []
+        check_fn = None
 
         # 1. Get current counts: {species: (num_groups, max_size)}
-        current_stats = self._count_effective_lineages()
+        if not bin_id:
+            current_stats = self._count_effective_lineages()
+
+            check_fn = lambda current, limit: current >= limit # In this mode: num_of_groups >= limit: # or max_size*2 > limit: ??
+        else:
+            # Number of 1s in the binary representation indicates how many copies of this lineage will exist after gluing.
+            max_size = bin_id.bit_count()
+            # Eg, if the count is 2, this tree paricipated in 2 "inner" subproblems
+            # Meaning, it should have 2**2 = 4 copies already (if glued)
+            # Meaning, next iteration could create 2**3 = 8 copies - this is the number we should check!
+            max_size = 2**(max_size+1)
+            # Pure may not be needed here; for safety
+            current_stats = {l.pure: (max_size, None) for l in self.st.ete_tree.get_leaves()}
+
+            check_fn = lambda future, limit: future > limit # In this mode, it's very clear when we need to check
         
         for node_name in h1_candidates:
             node = self.st.get_node(node_name)
@@ -751,7 +767,7 @@ class MulTreeManager:
                 
                 num_of_groups, max_size = current_stats.get(sp, (0,0))
                 
-                if num_of_groups >= limit: # or max_size*2 > limit:
+                if check_fn(num_of_groups, limit):
                     is_valid = False
                     break
             
@@ -859,7 +875,8 @@ class MulTreeManager:
             if self.ploidies:
                 step = "Applying ploidy constraints"
                 self.logger.report_step(step, "In progress...")
-                h1_resolved = self._apply_ploidy_constraints(h1_resolved)
+                h1_resolved = self._apply_ploidy_constraints(h1_resolved, bin_id = self.tcf.binary_id)
+                self.logger.log(f"After ploidy filtering, {len(h1_resolved)} H1 candidates remain: {h1_resolved}", 'd')
                 self.logger.report_step(step, "Success: identified compatible H nodes")
 
             step = "Counting MUL-trees to generate"

@@ -1,7 +1,7 @@
 import math
 import array
 from ete3 import Tree, TreeNode
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, Set
 from dataclasses import dataclass, field
 
 class NameRegistry:
@@ -254,7 +254,7 @@ class TreeLinearizer:
 class SmrtTree:
     """Wrapper around ETE3 Tree to provide GRAMPA-specific functionality."""
 
-    __slots__ = ['ete_tree', 'node_map', 'match_map', 'lca_cache', 'flat_tree']
+    __slots__ = ['ete_tree', 'node_map', 'match_map', 'flat_tree']
 
     def __init__(self, newick: str = None, tree_obj: Tree = None):
         if tree_obj:
@@ -266,11 +266,9 @@ class SmrtTree:
             
         self.node_map: Dict[str, TreeNode] = {}
         self.match_map: Dict[str, List[TreeNode]] = {}
-        self.lca_cache: Dict[Tuple[int, ...], TreeNode] = {}
         self.flat_tree: Optional[FlatTree] = None
         
         self._index_nodes()
-        #self._cache_depths()
 
     """def _index_nodes(self):
         self.node_map = {} 
@@ -415,7 +413,6 @@ class SmrtTree:
         Returns all nodes matching the cleaned name, which is necessary for MUL trees.
         """
         if not self.match_map:
-            self.match_map = {}
             for node in self.ete_tree.traverse():
                 self.match_map.setdefault(node.pure, []).append(node)
         return self.match_map[name]
@@ -443,6 +440,85 @@ class SmrtTree:
                 new_internal.add_feature("pure", name.replace("*", ""))
         return tree
     
+    def rename_marked_nodes(self, target_nodes: List[Set[TreeNode]], suffixes: List[str]) -> List[Set[str]]:
+        """
+        Suffix is added to the name of all nodes in target_nodes.
+        This is used to mark the Hx lineages after grafting.
+        """
+        marked_names = []
+        for inner_targets, suffix in zip(target_nodes, suffixes):
+            marked_set = set()
+            for node in inner_targets:
+                old_name = node.name
+                marked_set.add(old_name)
+
+                if old_name == '<P>':
+                    # P nodes of different iterations shouldn't have the same pure name! (hence no separator '|')
+                    self.rename_node('<P>', f'<P{suffix}>')
+
+                else:
+                    # Generate New Name
+                    # Leaves: "Species" -> "Species|1.0"
+                    # Internals: "<1>" -> "<1|1.0>"
+                    # Replace existing '*' with the new suffix
+                    # Handle cases if | is already present - we want to replace it.
+                    
+                    '''if '|' in old_name:
+                        old_sf = old_name.split('|')[1].split('*')[0]
+                        new_name = old_name.replace(f'|{old_sf}*', f"|{suffix}")
+                    else:
+                        new_name = old_name.replace('*', f"|{suffix}")'''
+                    
+                    # REPLACE WITH:
+                    new_name = old_name.replace('*', f"|{suffix}")
+
+                    # Apply Rename using Wrapper (handles node_map updates)
+                    self.rename_node(old_name, new_name)
+
+            marked_names.append(marked_set)
+
+        # Must refresh after name modification
+        self.refresh()
+        return marked_names
+
+    def rename_leaves_based_on_map_targets(self, map: 'Map', targets: List[Set[str]], suffixes: List[str]) -> None:#targets: List[str], suffix: str) -> None:
+        
+        rev_map = map.rev # map_name -> List[names]
+
+        for inner_targets, suffix in zip(targets, suffixes):
+            for target in inner_targets:
+                node_name_to_modify = rev_map.get(target, [])
+                for node_name in node_name_to_modify:
+                    n = self.get_node(node_name)
+                    if n.is_leaf():
+
+                        '''
+                        if '|' in n.name: n.name = n.name.split('|')[0]
+                        n.name = f"{n.name}|{suffix}"'''
+
+                        # REPLACE WITH:
+                        n.name = f"{n.name}|{suffix}"
+
+                        # node.pure stays the same, as it's used for matching and should not be suffixed
+                    # No need to modify internal nodes - Reconcile only works on lvs
+
+        '''
+        t = self.ete_tree
+        # Iterate leaves
+        for l in t.iter_leaves():
+            # Find to where this leaf is mapped in the map
+            # map.cor[leaf_name] returns List[node_names]
+            # We take the first mapping (usually only one for optimal recon)
+            target_name = map.cor[l.name][0]
+            if target_name in targets:
+                if '|' in l.name: l.name = l.name.split('|')[0]
+                l.name = f"{l.name}|{suffix}"
+                # l.pure stays the same!
+                '''
+
+        # Must refresh after name modification
+        self.refresh()
+    
     def rename_node(self, old_name: str, new_name: str, tagged=False) -> None:
         """
         New name should be in pure form,
@@ -465,8 +541,13 @@ class SmrtTree:
 
         if not hasattr(node, 'pure'):
             node.add_feature('pure', new_name.split('|')[0])
+            if not node.is_leaf() and not node.pure.endswith('>'):
+                node.pure += '>'
         else:
             node.pure = new_name.split('|')[0]
+            if not node.is_leaf() and not node.pure.endswith('>'):
+                node.pure += '>'
+        # doesn't work because p!=p
 
         # Update node_map
         del self.node_map[old_name]
@@ -506,7 +587,7 @@ class SmrtTree:
 
         h2_subtree = SmrtTree.copy_lineage(h1_node, '*')
 
-        new_tree_obj = SmrtTree.graft_subtree(new_tree_obj, p_node, h2_subtree, '<P2>')
+        new_tree_obj = SmrtTree.graft_subtree(new_tree_obj, p_node, h2_subtree, '<P>')
 
         new_smrt = SmrtTree(tree_obj=new_tree_obj)
         return new_smrt, h1_node, h2_subtree # Note: returns objects in the new tree context
@@ -560,10 +641,34 @@ class SmrtTree:
         return new_smrt, h1_final, hx_nodes_final
 
 
+    # --- I/O and Pickling ---
 
-    def to_str(self, internals=True) -> str:
+    def to_mult_str(self, internals=True) -> str:
+        name_to_pure = {n.name: n.pure for n in self.ete_tree.traverse()}
+        return self.to_str(internals=internals, name_formatter=lambda name: name_to_pure.get(name, 'Error'))
+
+    def to_mult(self, internals=True) -> Tree:
+        mult_str = self.to_mult_str(internals=internals)
+        return Tree(mult_str, format=8 if internals else 9)
+
+    def to_marked_str(self, node_to_mark: TreeNode) -> str:
+        """
+        Node_to_mark is the node in the ete_tree that should be marked with a "+" in the string output.
+        Generally it is the H1 node after a new inference.
+        Returns a string representation of the tree with +/* marked nodes.
+        """
+        marked_nodes = [n for n in node_to_mark.traverse()] if node_to_mark else []
+        # Rename, create str, undo rename
+        for n in marked_nodes:
+            n.name = n.name + "+" if n.is_leaf() else n.name [:-1] + '+>'
+        marked_str = self.to_str(internals=True)
+        for n in marked_nodes:
+            n.name = n.name.replace("+", "")
+        return marked_str
+
+    def to_str(self, internals=True, name_formatter=None) -> str:
         root_name = str(self.ete_tree.name) if internals else ""
-        return self.ete_tree.write(format=8 if internals else 9)[:-1]+root_name+";"
+        return self.ete_tree.write(format=8 if internals else 9, name_formatter=name_formatter)[:-1]+root_name+";"
     
     def __getstate__(self):
         return self.ete_tree

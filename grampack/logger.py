@@ -308,7 +308,7 @@ class GranLogger:
             self.log("-" * 125, key)
             self.log(f"{self.get_date_time()} INFO: Starting GRAMPA. With -v 1 set, no more information will be printed to the screen until the end of the run.", key)
 
-    def print_end_prog(self, tcf, min_info=None):
+    def print_end_prog(self, tcf, min_score=0, min_idx=0, min_data=None):
         """Replicates endProg from reconcore.py"""
         total_time = time.time() - self.start_time
         key = 'i' if self.verbosity == 0 else 's' 
@@ -321,14 +321,14 @@ class GranLogger:
         if self.warnings > 0:
             self.log(f"\n# Task finished with {self.warnings} WARNINGS -- check log file for more info", key)
 
-        if min_info:
-            # min_info = (min_num, min_score, tree_string)
+        if min_data:
+            min_tree_str = min_data.mt.to_marked_str(min_data.h1_node)
             self.log("-" * 40, key)
-            if min_info[0] != 0:
-                 self.log(f"The MUL-tree with the minimum parsimony score is MT-{min_info[0]}:\t{min_info[2]}", key)
+            if min_idx != 0:
+                 self.log(f"The MUL-tree with the minimum parsimony score is MT-{min_idx}:\t{min_tree_str}", key)
             else:
-                 self.log(f"The tree with the minimum parsimony score is the singly-labled tree (ST):\t{min_info[2]}", key)
-            self.log(f"Score = {min_info[1]}", key)
+                 self.log(f"The tree with the minimum parsimony score is the singly-labeled tree (ST):\t{min_tree_str}", key)
+            self.log(f"Score = {min_score}", key)
             self.log("-" * 40, key)
 
         self.log("=" * 175, key)
