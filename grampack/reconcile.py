@@ -85,12 +85,16 @@ class Reconciler:
 
     @staticmethod
     def _get_sister_clade_labels(node_obj) -> List[str]:
+        """
+        Given a node object, returns the set of leaf labels in its sister clades.
+        Runs on the species tree, so labels are expected to be the raw leaf names (e.g. "Species" or "Species*") without GeneID.
+        """
         if not node_obj or not node_obj.up: return []
         sisters = [ch for ch in node_obj.up.children if ch != node_obj]
         labels = []
         for sis in sisters:
-            # Optimize: Avoid iter_leaves if cached, but for MT it's fast enough usually
-            labels.extend([l.name.split("_")[-1] for l in sis.iter_leaves()])
+            # Must use l.name to preserve the '*' so the .isdisjoint() checks evaluate correctly
+            labels.extend([l.name for l in sis.iter_leaves()])
         return labels
 
     @staticmethod
@@ -121,27 +125,13 @@ class Reconciler:
         h1_target = set(mul_data.h_clade)
         n1_obj = Reconciler._find_node_by_clade(mul_data.mt, h1_target)
 
-        hx_sisters_list = []
-        targets = mul_data.hx_nodes if mul_data.hx_nodes else ([mul_data.h2_node] if mul_data.h2_node else [])
-        
-        '''h1_sisters = set(Reconciler._get_sister_clade_labels(n1_obj) if n1_obj else [])
-
-        for hx_node in targets:
-            if hx_node:
-                sisters = Reconciler._get_sister_clade_labels(hx_node)
-                if not set(h1_sisters).isdisjoint({l.name for l in hx_node.iter_leaves()}): 
-                    h1_sisters = set()
-                if n1_obj and not set(sisters).isdisjoint({l.name for l in n1_obj.iter_leaves()}): 
-                    sisters = []
-                # Append Set of clean names directly to the list
-                hx_sisters_list.append({s.replace("*", "") for s in sisters})
-            else:
-                hx_sisters_list.append(set())'''
-
         h1_sisters = Reconciler._get_sister_clade_labels(n1_obj) if n1_obj else []
+        hx_sisters_list = []
         
-        for idx, _ in enumerate(targets):
-            # Restore Old logic: Dynamically find the node in the current tree topology
+        # Targets (mul_data.hx_nodes) is guaranteed to be a list (either empty or populated)
+        # Can't use the hx_node object directly due to risk of stale references, so we find the node by clade each time.
+        for idx, _ in enumerate(mul_data.hx_nodes):
+            # Dynamically find the node in the current tree topology
             # to avoid stale node references yielding incorrect sister clades.
             target_suffix = "*" * (idx + 1)
             hx_target = {f"{x}{target_suffix}" for x in mul_data.h_clade}
@@ -187,7 +177,7 @@ class Reconciler:
         for node in ginfo.traverse("postorder"):
             if node.is_leaf():
                 # Extract name and convert to ID
-                sp_name = node.name.split("_")[-1]
+                sp_name = node.name.split("_", 1)[-1] if "_" in node.name else node.name # node.name.split("_")[-1]
                 sp_id = registry.get_id(sp_name)
                 
                 is_h1 = sp_id in h1_target_ids
@@ -271,7 +261,7 @@ class Reconciler:
 
         def check_fix(unit_nodes, anc_leaves):
             # Convert to Set for fast subset math
-            group_sis_specs = {n.split("_")[-1] for n in anc_leaves}
+            group_sis_specs = {n.split("_", 1)[-1] if "_" in n else n for n in anc_leaves} # {n.split("_")[-1] for n in anc_leaves}
             
             if group_sis_specs:
                 if h1_sisters and group_sis_specs.issubset(h1_sisters):
@@ -627,10 +617,12 @@ class Reconciler:
         for idx, grp_ids in enumerate(ambig_groups):
             # Dynamic Range: limits combinations to the exact number of available copies
             sample_node = grp_ids[0]
-            gt_name_id = gt_flat.node_to_name_id[sample_node]
+            sp_base_id = gt_flat.node_to_name_id[sample_node]
+
+            '''gt_name_id = gt_flat.node_to_name_id[sample_node]
             gt_name = registry.get_name(gt_name_id)
             sp_name = gt_name.split("_")[-1]
-            sp_base_id = registry.get_id(sp_name)
+            sp_base_id = registry.get_id(sp_name)'''
             
             available_targets = target_map.get(sp_base_id, [0])
             ambig_ranges.append(range(len(available_targets)))
@@ -652,9 +644,11 @@ class Reconciler:
         
         for i in range(gt_flat.num_nodes):
             if gt_flat.children_start[i] == gt_flat.children_start[i+1]:
-                sp_name_id = gt_flat.node_to_name_id[i]
+                sp_base_id = gt_flat.node_to_name_id[i]
+
+                '''sp_name_id = gt_flat.node_to_name_id[i]
                 sp_base_name = registry.get_name(sp_name_id).split("_")[-1]
-                sp_base_id = registry.get_id(sp_base_name)
+                sp_base_id = registry.get_id(sp_base_name)'''
                 
                 targets = target_map.get(sp_base_id, [0])
                 base_leaf_targets[i] = targets
@@ -727,39 +721,19 @@ class Reconciler:
         ambig_groups, fixed_groups = Reconciler.translate_groups_to_ids(gt_flat, group_data)
 
         # Build Instructions
+        # Because the H1 clade is duplicated as a whole, it's enough to sample one node from each group to determine the target options for the entire group.
         instructions = {}
         ambig_ranges = [] 
-        '''for idx, grp_ids in enumerate(ambig_groups):
+        for idx, grp_ids in enumerate(ambig_groups):
+            # Dynamic Range: limits combinations to the exact number of available copies
+            # This works because TreeLinearizer.linearize() of the GT intercepts the leaf
+            # nodes and cleans their names before requesting an ID from the registry.
             sample_node = grp_ids[0]
-            gt_name_id = gt_flat.node_to_name_id[sample_node]
-            gt_name = registry.get_name(gt_name_id)
-            sp_name = gt_name.split("_")[-1]
-            sp_base_id = registry.get_id(sp_name)
-            
+            sp_base_id = gt_flat.node_to_name_id[sample_node]
             available_targets = target_map.get(sp_base_id, [0])
             ambig_ranges.append(range(len(available_targets)))
 
-            for nid in grp_ids: instructions[nid] = (0, idx)'''
-
-        for idx, grp_ids in enumerate(ambig_groups):
-            # Dynamic Range: limits combinations to the exact number of available copies
-            # FIX: Find the max available targets across ALL nodes in the group.
-            max_targets = 1
-            for nid in grp_ids:
-                gt_name_id = gt_flat.node_to_name_id[nid]
-                gt_name = registry.get_name(gt_name_id)
-                sp_name = gt_name.split("_")[-1]
-                sp_base_id = registry.get_id(sp_name)
-                
-                available_targets = target_map.get(sp_base_id, [0])
-                if len(available_targets) > max_targets:
-                    max_targets = len(available_targets)
-            
-            ambig_ranges.append(range(max_targets))
-
-            for nid in grp_ids: 
-                instructions[nid] = (0, idx)
-                # Note: Keep `dirty_leaves.append(nid)` here if you are editing reconcile_permutation_optim
+            for nid in grp_ids: instructions[nid] = (0, idx)
 
         for grp_ids, t_idx in fixed_groups:
             for nid in grp_ids: 
@@ -769,11 +743,8 @@ class Reconciler:
         base_leaf_targets = {}
         for i in range(gt_flat.num_nodes):
             if gt_flat.children_start[i] == gt_flat.children_start[i+1]:
-                sp_name_id = gt_flat.node_to_name_id[i]
-                sp_base_name = registry.get_name(sp_name_id).split("_")[-1]
-                sp_base_id = registry.get_id(sp_base_name)
-                
-                targets = target_map.get(sp_name_id, [0]) #sp_base_id
+                sp_base_id = gt_flat.node_to_name_id[i]
+                targets = target_map.get(sp_base_id, [0])
                 base_leaf_targets[i] = targets
 
         # --- Permutation Loop ---

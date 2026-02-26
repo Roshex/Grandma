@@ -130,7 +130,7 @@ class TreeLinearizer:
                 # For GT: "Gene_Species" -> "Species"
                 # For ST (MUL): "Species*" -> "Species*" (Preserves distinction)
                 # A clean name is needed to find matching species in ST
-                sp_name = raw_name.split("_")[-1] 
+                sp_name = raw_name.split("_", 1)[-1] if "_" in raw_name else raw_name # raw_name.split("_")[-1] 
                 name_idx = registry.get_id(sp_name)
                 
                 # Also index the full leaf name for Group lookup (e.g. "Gene1_Species")
