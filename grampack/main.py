@@ -185,7 +185,7 @@ class Task:
         print(f"Species Tree: {self.spec_tree.to_str(internals=True)})"""
 
         # Re-init component with current task
-        self.reconciler = Reconciler(tcf, self.ctx.num_processes)#self.logger, self.ctx.num_processes, self.ctx.optim)
+        self.reconciler = Reconciler(tcf, self.logger, self.ctx.num_processes, self.ctx.optim)#self.ctx.num_processes)
         self.gene_mgr = GeneTreeManager(tcf, self.reconciler, self.logger)
 
         # 4. Collapse & Filter Groups
@@ -201,7 +201,7 @@ class Task:
         """
 
         # 5. Reconciliation and MUL-tree Selection
-        step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry, self.logger,self.writer)
+        step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry, self.writer)#self.logger,
 
         """if not step_result.sorted_scores:
             self.logger.write("No valid MUL-trees scored.", level=1)

@@ -740,7 +740,7 @@ class FlowManager:
         (Iterative Stack-Based Implementation)
         Returns:
             the final merged tree for the given root task ID, or;
-            the original input tree if the root task was rejected or not found in history.
+            the original input tree if the root task was rejected.
         """
         # Stack stores tuples: (task_id, children_visited_flag)
         stack = [(root_task_id, False)]
@@ -933,6 +933,7 @@ class FlowManager:
         if results.get(root_task_id) is None:
             # Fallback to original ST
             self.logger.log("No valid recombination found. Returning the original ST.", 'i')
+            # Not finding root in history SHOULD raise an error!
             return Tree(self.ctx.history[root_task_id]['best_mt'], format=1)
         return results.get(root_task_id)
 
