@@ -699,7 +699,7 @@ class FlowManager:
         self.logger = backup_logger
         return next_tasks
 
-    def glue_split_results(self, output_dir: Path, original_st_path: Path, logger: GranLogger) -> None:
+    def glue_split_results(self, output_dir: Path, logger: GranLogger) -> None:
         """
         Recombines results by recursively diving to the innermost subproblems.
         """
