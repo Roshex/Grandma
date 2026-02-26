@@ -734,10 +734,13 @@ class FlowManager:
         
         self.logger.report_step(step, "Success")
 
-    def _iterative_glue(self, root_task_id: Tuple[int, int]) -> Tuple[Optional[TreeNode], dict]:
+    def _iterative_glue(self, root_task_id: Tuple[int, int]) -> Tree:
         """
         Recombines split results using history 'trackers' to identify graft locations.
         (Iterative Stack-Based Implementation)
+        Returns:
+            the final merged tree for the given root task ID, or;
+            the original input tree if the root task was rejected or not found in history.
         """
         # Stack stores tuples: (task_id, children_visited_flag)
         stack = [(root_task_id, False)]
