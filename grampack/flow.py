@@ -699,11 +699,10 @@ class FlowManager:
         self.logger = backup_logger
         return next_tasks
 
-    def glue_split_results(self, output_dir: Path, logger: GranLogger) -> None:
+    def glue_split_results(self) -> None:
         """
         Recombines results by recursively diving to the innermost subproblems.
         """
-        self.logger = logger
         step = "Recombining Split Results (Recursive)"
         self.logger.report_step(step, "In progress...", start=True)
 
@@ -716,6 +715,7 @@ class FlowManager:
             final_tree = Tree(self.ctx.history[(0, 0)]['best_mt'], format=1)
 
         # Output the results
+        output_dir = self.ctx.root_dir
         out_st = output_dir / "merged_single_label_form.tre"
         out_mul = output_dir / "merged_multree.tre"
         

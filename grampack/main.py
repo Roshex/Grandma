@@ -549,7 +549,7 @@ class Engine:
             current_tasks = next_tasks
             depth += 1
 
-        self.flow_mgr.glue_split_results(self.ctx.root_dir, self.flow_logger)
+        self.flow_mgr.glue_split_results()
 
         if self.ctx.plot: self.flow_mgr.plot()
 
