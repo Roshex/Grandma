@@ -1,3 +1,4 @@
+import sys
 import pickle
 import itertools
 import multiprocessing as mp
@@ -508,11 +509,11 @@ class Reconciler:
                 flat_tasks = [(k, v.mt.flat_tree) for k, v in tasks]
                 #for idx, score in pool.imap_unordered(worker_func, flat_tasks):
                 iterator = pool.imap_unordered(worker_func, flat_tasks)
-                for idx, score in tqdm(iterator, total=len(tasks), desc="Scoring   ", unit="mt", disable=logger.verbosity < 3):
+                for idx, score in tqdm(iterator, total=len(tasks), desc="Scoring   ", unit="mt", disable=logger.disable_tqdm):
                     all_scores[idx] = score
         else:
             #for k, v in tasks:
-            for k, v in tqdm(tasks, total=len(tasks), desc="Scoring   ", unit="mt", disable=logger.verbosity < 3):
+            for k, v in tqdm(tasks, total=len(tasks), desc="Scoring   ", unit="mt", disable=logger.disable_tqdm):
                 item = (k, v.mt.flat_tree)
                 idx, score = worker_func(item)
                 all_scores[idx] = score
@@ -1409,13 +1410,13 @@ class Reconciler:
                 flat_tasks = [(k, v.mt.flat_tree) for k, v in tasks]
                 #for idx, score in pool.imap_unordered(worker_func, flat_tasks):
                 iterator = pool.imap_unordered(worker_func, flat_tasks)
-                for idx, score, gt_res in tqdm(iterator, total=len(tasks), desc="Scoring   ", unit="st", disable=self.logger.verbosity < 3):
+                for idx, score, gt_res in tqdm(iterator, total=len(tasks), desc="Scoring   ", unit="st", disable=self.logger.disable_tqdm):
                     all_scores[idx] = score
                     if retmap:
                         detailed_res[idx] = gt_res
         else:
             #for k, v in tasks:
-            for k, v in tqdm(tasks, total=len(tasks), desc="Scoring   ", unit="st", disable=self.logger.verbosity < 3):
+            for k, v in tqdm(tasks, total=len(tasks), desc="Scoring   ", unit="st", disable=self.logger.disable_tqdm):
                 item = (k, v.mt.flat_tree)
                 idx, score, gt_res = worker_func(item)
                 all_scores[idx] = score

@@ -1256,7 +1256,7 @@ class GeneTreeManager:
                     # This works on ALL OSs
                     with mp.Pool(processes=n_proc, initializer=_init_collapse_worker, initargs=(temp_file_path,)) as pool:
                         for res in tqdm(pool.imap_unordered(_collapse_worker, tasks), total=len(tasks), desc="Collapsing", unit="mt", 
-                                      disable=self.logger.verbosity < 3):
+                                      disable=self.logger.disable_tqdm):
                             save_result(res)
                             
                 finally:
@@ -1276,7 +1276,7 @@ class GeneTreeManager:
                 _worker_registry = registry
                 
                 # We don't need init function, just call worker directly
-                for item in tqdm(tasks, desc="Collapsing", unit="mt", disable=self.logger.verbosity < 3):
+                for item in tqdm(tasks, desc="Collapsing", unit="mt", disable=self.logger.disable_tqdm):
                     res = _collapse_worker(item)
                     save_result(res)
                 
@@ -1334,7 +1334,7 @@ class GeneTreeManager:
         if tasks:
             if n_proc > 1:
                 with mp.Pool(processes=n_proc) as pool:
-                    for res in tqdm(pool.imap_unordered(_check_worker, tasks), total=len(tasks), desc="Checking  ", unit="mt", disable=self.logger.verbosity < 3):
+                    for res in tqdm(pool.imap_unordered(_check_worker, tasks), total=len(tasks), desc="Checking  ", unit="mt", disable=self.logger.disable_tqdm):
                         m_idx, buf, fails = res
                         results_map[m_idx] = buf
                         # Merge failures
@@ -1342,7 +1342,7 @@ class GeneTreeManager:
                             if g_idx not in gt_failures: gt_failures[g_idx] = []
                             gt_failures[g_idx].extend(failures)
             else:
-                for task in tqdm(tasks, desc="Checking  ", unit="mt", disable=self.logger.verbosity < 3):
+                for task in tqdm(tasks, desc="Checking  ", unit="mt", disable=self.logger.disable_tqdm):
                     m_idx, buf, fails = _check_worker(task)
                     results_map[m_idx] = buf
                     for g_idx, failures in fails.items():

@@ -43,6 +43,11 @@ class GranLogger:
             with open(self.log_file, 'w') as f:
                 f.write("")
 
+    @property
+    def disable_tqdm(self) -> bool:
+        stream = sys.stderr
+        return self.verbosity < 3 or not (hasattr(stream, "isatty") and stream.isatty())
+
     def log(self, msg: str, key: str, to_screen: bool = True, kill_on_error: bool = True):
         """
         Unified logging function.
