@@ -707,12 +707,7 @@ class FlowManager:
         self.logger.report_step(step, "In progress...", start=True)
 
         # Start the chain from the root task (0,0)
-        #final_tree = self._recursive_glue("0.0")
-        final_tree = self._iterative_glue("0.0")
-        # Fallback: original ST
-        if final_tree is None:
-            self.logger.log("No valid recombination found. Returning the original ST.", 'i')
-            final_tree = Tree(self.ctx.history[(0, 0)]['best_mt'], format=1)
+        final_tree = self._iterative_glue((0,0))
 
         # Output the results
         output_dir = self.ctx.root_dir
@@ -739,7 +734,7 @@ class FlowManager:
         
         self.logger.report_step(step, "Success")
 
-    def _iterative_glue(self, root_task_id: str) -> Tuple[Optional[TreeNode], dict]:
+    def _iterative_glue(self, root_task_id: Tuple[int, int]) -> Tuple[Optional[TreeNode], dict]:
         """
         Recombines split results using history 'trackers' to identify graft locations.
         (Iterative Stack-Based Implementation)
@@ -751,18 +746,14 @@ class FlowManager:
         while stack:
             task_id, visited = stack.pop()
             
-            # Convert "0.0" task_id to the (depth, idx) tuple used in history keys
-            depth, idx = (int(x) for x in task_id.split('.'))
-            key = (depth, idx)
-            
             # Base Case: If this task was never run or didn't pass, 
             # we return None or the input tree.
-            if key not in self.ctx.history:
+            if task_id not in self.ctx.history:
                 self.logger.log(f"Glue {task_id}: Task {task_id} not found in history.", 'd')
                 results[task_id] = None
                 continue
 
-            event = self.ctx.history[key]
+            event = self.ctx.history[task_id]
 
             # Check Pass/Fail
             if not event['passed']:
@@ -774,8 +765,9 @@ class FlowManager:
             # --- STEP 1: Dive to children (Post-order traversal) ---
             # Outer child: (depth+1, idx*2)
             # Inner child: (depth+1, idx*2 + 1)
-            outer_id = f"{depth + 1}.{idx * 2}"
-            inner_id = f"{depth + 1}.{idx * 2 + 1}"
+            depth, idx = task_id
+            outer_id = (depth + 1, idx * 2)
+            inner_id = (depth + 1, idx * 2 + 1)
 
             if not visited:
                 self.logger.log(f"--- Processing Task {task_id} ---", 'd')
@@ -935,6 +927,10 @@ class FlowManager:
 
             results[task_id] = outer_tree
 
+        if results.get(root_task_id) is None:
+            # Fallback to original ST
+            self.logger.log("No valid recombination found. Returning the original ST.", 'i')
+            return Tree(self.ctx.history[root_task_id]['best_mt'], format=1)
         return results.get(root_task_id)
 
     def fast_forward_split(self, current_tasks: List[ConcurrTask]) -> List[ConcurrTask]:
