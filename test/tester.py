@@ -22,11 +22,11 @@ if __name__ == "__main__":
     datasets = [
 #        ("ex_none", "manual_gene_trees_none.txt", "manual_species_tree_none.tre"),
 #        ("ex_no_w", "manual_gene_trees_no_w.txt", "manual_species_tree_no_w.tre"),
-#        ("ex_w", "manual_gene_trees_w.txt", "manual_species_tree_w.tre"),
+        ("ex_w", "manual_gene_trees_w.txt", "manual_species_tree_w.tre"),
 #        ("ex_w_snested", "manual_gene_trees_w_sn.txt", "manual_species_tree_w_sn.tre"),
 #        ("ex_k_back", "backbone.txt", "astral.tre"),
 #        ("ex_bend", "grampa_trees.tre", "species.tre"),
-        ("ex_diaz", "grampa_trees.tre", "species.tre"),
+#        ("ex_diaz", "grampa_trees.tre", "species.tre"),
 #        ("ex_kall", "kall.nw", "kall.treefile"),
 
 #        ("ding2023", "grampa_trees.tre", "grampa_species_tree.tre"),
@@ -57,7 +57,7 @@ if __name__ == "__main__":
         #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_nm/ {other_args} --debug --plot -v 3 -p 10 --nestedness model", "new") # --debug --plot
         #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_op/ {other_args} --debug --plot -v 3 -p 10 --optim", "new")
         #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_np/ {other_args} --debug --plot -v 3 -p 10 --optim --nestedness model", "new") # --debug --plot
-        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug --plot -v 3 -p 10 --start auto -x {path_manual/'ploidies.txt'}", "new") #--plot --start 1 -i 2
+        time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_splt/ {other_args} -m split --debug --plot -v 3 -p 10 --start auto -x {path_manual/'ploidies.txt'} --maps 6", "new") #--plot --start 1 -i 2
         #time_tool(f"python {new_tool} -g {g} -s {s} -o {o_new}_deep/ {other_args} -m full --debug --plot -v 3 -p 10 -x {path_manual/'ploidies.txt'}", "new")
 
         #time_tool(f"python {old_tool} -g {g} -s {s} -o {o_old}_v0 --overwrite {other_args} --maps -v 0", "old")
@@ -65,6 +65,6 @@ if __name__ == "__main__":
         #time_tool(f"python {old_tool} -g {g} -s {s} -o {o_old}_v2 --overwrite {other_args} --maps -v 2", "old")
         #time_tool(f"python {old_tool} -g {g} -s {s} -o {o_old} --overwrite {other_args} -v 3 -p 10", "old")#_v3
 
-        #time_tool(f"python {Path(__file__).parent / 'exe_compare.py'} -log {path_manual / 'compare_log.txt'} -old {o_old} -new {o_new}", "compare")
+        #time_tool(f"python {Path(__file__).parent / 'exe_compare.py'} -log {path_manual / 'compare_log.txt'} -old {o_old} -new {o_new}", "compare")#_splt\\0\\output
 
 

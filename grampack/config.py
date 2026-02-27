@@ -32,7 +32,7 @@ class GranMetadata:
     github: str = "https://github.com/Roshex/Grandma"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "3.0.2"
+    version: str = "3.0.3"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -1081,96 +1081,4 @@ class InitParser:
         )
 
         return ctx, tcf
-
-class GranWriter:
-    def __init__(self, config: TaskConfig, logger: GranLogger):
-        self.tcf = config
-        self.logger = logger
-
-    def write_results(self, sorted_scores: list, detailed_res: dict, mul_trees: dict, gene_trees: dict):
-        self._write_detailed(detailed_res, gene_trees)
-        self._write_scores(sorted_scores, mul_trees)
-        self._write_dup_counts(detailed_res, mul_trees)
-
-    def _write_detailed(self, detailed_res: dict, gene_trees: dict):
-        step = "Writing detailed output file"
-        self.logger.report_step(step, "In progress...")
-        
-        p = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-detailed.txt"
-        with open(p, 'w') as f:
-            f.write("mul.tree\tgene.tree\tdups\tlosses\ttotal.score\tmaps\n")
-            i = 0
-            to_map = self.tcf.to_map
-            for mul_idx, res_dict in detailed_res.items():
-                if to_map >= 0 and i >= to_map:
-                    break
-                for gene_idx, res in res_dict.items():
-                    gt_obj = gene_trees[gene_idx]
-                    # Handle multiple maps if present
-                    if (maps_len := len(res.maps)) > 1:
-                        f.write(f"# GT-{gene_idx} to MT-{mul_idx}\t{maps_len} maps found!\n")
-                    for map in res.maps:
-                        map_str = GranWriter.detailed_out_string(gt_obj, map.cor, map.dups)
-                        f.write(f"{mul_idx}\t{gene_idx}\t{map.n_dups}\t{map.n_losses}\t{res.score}\t{map_str}\n")
-                i += 1
-                         
-        self.logger.report_step(step, "Success")
-
-    @staticmethod
-    def detailed_out_string(gt: SmrtTree, maps: Map, dups: dict) -> str:
-        """
-        Recreates the regex-based string manipulation from detailedOut in gene_tree.py
-        to produce the [Map-Dup] labels in the output string.
-        """
-        # We work on a copy to not mutate the main tree
-        out_tree = gt.ete_tree.copy()
-        
-        for node in out_tree.traverse():
-            if node.name in maps:
-                cur_map = maps[node.name][0]
-                if "*" not in cur_map:
-                    cur_map += "+"
-                
-                dup_count = dups.get(node.name, 0)
-                # Format: Node[Map-Dups]
-                node.name = f"{node.name}[{cur_map}-{dup_count}]"
-                
-        return out_tree.write(format=8) # Format 8 = All names
-
-    def _write_scores(self, sorted_scores: list, mul_trees: dict):
-        step = "Writing main output file"
-        self.logger.report_step(step, "In progress...")
-        
-        p = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-scores.txt"
-        import re
-        with open(p, 'w') as f:
-            f.write("mul.tree\th1.node\th2.node\tscore\tlabeled.tree\n")
-            for idx, score in sorted_scores:
-                mul_data = mul_trees[idx]
-                tree_str = mul_data.mt.to_str(internals=True) 
-                for spec in mul_data.h_clade:
-                    tree_str = re.sub(f"{spec}(?!\*)", f"{spec}+", tree_str)
-                    tree_str = tree_str.replace("+*", "*")
-                     
-                f.write(f"{idx}\t{mul_data.h1_node}\t{mul_data.h2_node}\t{score}\t{tree_str}\n")
-        self.logger.report_step(step, "Success")
-
-    def _write_dup_counts(self, detailed_res: dict, mul_trees: dict):
-        p_dup = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-dup-counts.txt"
-        with open(p_dup, 'w') as f:
-            f.write("mul.tree\tnode\tdups\n")
-            for mul_idx, res_dict in detailed_res.items():
-                hybrid_clade = mul_trees[mul_idx].h_clade
-                main_dups = {}
-                for g_idx, res in res_dict.items():
-                    first_map = res.maps[0]
-                    maps = first_map.cor
-                    for gt_node, count in first_map.dups.items():
-                        if count != 0:
-                            map_node = maps[gt_node][0]
-                            main_dups[map_node] = main_dups.get(map_node, 0) + 1
-                            
-                for node, count in main_dups.items():
-                    out_node = node + "+" if node in hybrid_clade else node
-                    f.write(f"{mul_idx}\t{out_node}\t{count}\n")
-                    
+    

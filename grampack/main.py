@@ -13,13 +13,12 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 """
 
-import re
 import sys
 import random
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, List, Union
+from typing import Optional, Tuple, Dict, Any, List
 
-from .config import InitParser, GlobalContext, TaskConfig, GranWriter
+from .config import InitParser, GlobalContext, TaskConfig
 from .flow import FlowManager
 from .logger import GranLogger
 from .models import SmrtTree, NameRegistry, TaskResult
@@ -105,7 +104,7 @@ def task_worker(payload: Tuple[Any, Any, str], context: GlobalContext, config: T
 class Task:
     """
     Represents a discrete execution unit of GRAMPA analysis.
-    It contains its own logger, writer, and configuration state specific to this execution.
+    It contains its own logger and configuration state specific to this execution.
     It does not know about iteration history or other runs.
     """
     def __init__(self, context: GlobalContext, logger: GranLogger = None):
@@ -122,7 +121,6 @@ class Task:
         self.reconciler = None
         self.mul_mgr = None
         self.gene_mgr = None
-        self.writer = None # Initialized in execute when we have a TaskSpec
              
     def execute(self, tcf: TaskConfig) -> Tuple[Optional[TaskResult], Dict[str, Any]]:
 
@@ -132,7 +130,6 @@ class Task:
             # Create a new logger if one wasn't passed (standard behavior)
             log_file = Path(tcf.output_dir) / f"{tcf.run_prefix}.log"
             self.logger = GranLogger(log_file, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug)
-        self.writer = GranWriter(tcf, self.logger)
         self.logger.start_run(self.ctx, tcf)
 
         # --norun Implementation
@@ -185,8 +182,8 @@ class Task:
         print(f"Species Tree: {self.spec_tree.to_str(internals=True)})"""
 
         # Re-init component with current task
-        self.reconciler = Reconciler(tcf, self.logger, self.ctx.num_processes, self.ctx.optim)#self.ctx.num_processes)
-        self.gene_mgr = GeneTreeManager(tcf, self.reconciler, self.logger)
+        self.reconciler = Reconciler(tcf, self.logger, self.ctx.num_processes, self.ctx.optim)
+        self.gene_mgr = GeneTreeManager(tcf, self.logger, self.ctx.num_processes)
 
         # 4. Collapse & Filter Groups
         # Note: In iterative modes, we are filtering the *memory* gene trees, 
@@ -201,7 +198,7 @@ class Task:
         """
 
         # 5. Reconciliation and MUL-tree Selection
-        step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry, self.writer)#self.logger,
+        step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry)
 
         """if not step_result.sorted_scores:
             self.logger.write("No valid MUL-trees scored.", level=1)

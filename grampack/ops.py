@@ -8,13 +8,11 @@ import multiprocessing as mp
 from tqdm import tqdm
 from pathlib import Path
 from itertools import chain
-from functools import partial
 from typing import Tuple, List, Optional, Dict, Union
 
 from .config import TaskConfig
 from .logger import GranLogger
 from .models import Tree, SmrtTree, MulTree, GroupData, NameRegistry
-from .reconcile import Reconciler
 
 class CommonOps:
     @staticmethod
@@ -1057,7 +1055,7 @@ class MulTreeManager:
 _worker_gene_trees = {}
 _worker_registry = None
 
-def _init_collapse_worker(data_path):
+def _init_collapse_worker(data_path: Optional[Union[Path, str]] = None) -> None:
     """
     Universal Initializer:
     Loads data from the temporary dump file.
@@ -1080,26 +1078,27 @@ def _init_collapse_worker(data_path):
             print(f"CRITICAL: Worker process failed to load temp data from {data_path}: {e}", file=sys.stderr)
             raise e
 
-def _collapse_worker(task_item):
+def _collapse_worker(payload: Tuple[int, MulTree]) -> Tuple[int, Dict[int, GroupData]]:
     """
     Standard worker logic using global data.
     """
-    m_idx, m_data = task_item
+    m_idx, m_data = payload
     
     # Access globals
-    h1_sis, hx_sis_list = Reconciler.get_sister_clades(m_data)
+    h1_sis, hx_sis_list = m_data.get_sister_clades()
     
     current_mt_groups = {}
     for g_idx, gt_obj in _worker_gene_trees.items():
-        group_data = Reconciler.compute_groups(gt_obj, m_data, _worker_registry, h1_sis, hx_sis_list)
+        group_data = gt_obj.compute_groups(m_data, _worker_registry, h1_sis, hx_sis_list)
         current_mt_groups[g_idx] = group_data
     
     return m_idx, current_mt_groups
 
 # --- Worker for parallel filtering ---
-def _check_worker(payload):
+def _check_and_write_worker(payload: Tuple[int, MulTree, Path, List[int], int, bool]) -> Tuple[int, str, Dict[int, List[int]]]:
     """
-    Worker to process a single MUL-tree's checknums logic.
+    Worker to process a single MUL-tree's checknums logic and create formatted output string.
+    Payload: (m_idx, m_data, pickle_path, sorted_gene_ids, group_cap, is_mul_input)
     Returns: (m_idx, formatted_string_buffer, failures_dict)
     """
     m_idx, m_data, pickle_path, sorted_gene_ids, group_cap, is_mul_input = payload
@@ -1107,23 +1106,18 @@ def _check_worker(payload):
     buffer = []
     local_failures = {} # g_idx -> list of m_idxs (just [m_idx])
 
-    # 1. Format Tree String (Regex logic localized)
-    # We re-compile regex per worker task (negligible overhead for one regex)
-    # Pattern: \b(SpecA|SpecB)(?!\*)
-    pattern_str = r'\b(' + '|'.join(map(re.escape, m_data.h_clade)) + r')(?!\*)'
-    regex = re.compile(pattern_str)
-    
-    mt_str = m_data.mt.to_str(internals=True)
-    if mt_str.endswith(';'): mt_str = mt_str[:-1]
-    
-    mt_str = regex.sub(r'\1+', mt_str)
-    mt_str = mt_str.replace("+*", "*")
-    
+    # Format Tree String
+    mt_str = m_data.mt.to_marked_str(m_data.h1_node)
+
     h_info = ""
     if not is_mul_input:
         h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
-        h2_name = m_data.h2_node.name if m_data.h2_node else "NA"
-        h_info = f"\tH1 Node:{h1_name}\tH2 Node:{h2_name}"
+        hx_sisters = m_data.hx_sisters
+        if hx_sisters:
+            hx_str = "\t".join([f'H{i+2} Node:{hx.name}' for i, hx in enumerate(hx_sisters)])
+        else:
+            hx_str = "Hx Nodes:NA"
+        h_info = f"\tH1 Node:{h1_name}\t{hx_str}"
     
     buffer.append(f"# MT-{m_idx}:{mt_str}{h_info}\n")
 
@@ -1147,26 +1141,28 @@ def _check_worker(payload):
                     local_failures[g_idx] = [m_idx]
 
                 combos = 1 << num_ambig 
-                buffer.append(f"{m_idx}\t{g_idx}\t{total_groups}\t{num_fixed}\t{combos}\t{over_cap}\n")
+                buffer.append(f"{m_idx}\t{g_idx+1}\t{total_groups}\t{num_fixed}\t{combos}\t{over_cap}\n")
                 
         except Exception:
             # If pickle fails in worker, we might log or ignore? 
             # For now, append error to buffer so it appears in file
             buffer.append(f"# Error processing groups for MT-{m_idx}\n")
-            
+
+    buffer.append(f"# ----------------------------------\n")
     return m_idx, "".join(buffer), local_failures
 
 class GeneTreeManager:
-    def __init__(self, config: TaskConfig, reconciler: Reconciler, logger: GranLogger):
+    def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1):
         self.tcf = config
-        self.reconciler = reconciler
         self.logger = logger
+        self.n_procs = num_processes
         
     def cull(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry):
         if self.tcf.mode != "st-only":
             self.collapse_groups(mul_trees, gene_trees, registry)
-        self.filter_and_check(mul_trees, gene_trees)
-        self.write_filtered_trees(gene_trees)
+        original_count = max(gene_trees.keys()) + 1 if gene_trees else 0
+        gt_failures = self.filter_and_check(mul_trees, gene_trees)
+        self.write_filtered_trees(gene_trees, gt_failures, original_count)
 
     def _check_registry_safety(self, registry_path: Path, registry: NameRegistry) -> bool:
         """Registry Persistence Logic"""
@@ -1194,14 +1190,12 @@ class GeneTreeManager:
         step = "Collapsing gene tree groupings"
         self.logger.report_step(step, "In progress...")
 
-        n_proc = self.reconciler.num_processes
-
         # --- PRIME REGISTRY ---
         # We must register all gene tree taxa in the main registry BEFORE forking.
         # Otherwise, workers create divergent ID mappings (e.g., 'TaxonA' is ID 5 in Worker 1, but ID 8 in Main).
         # We assume compute_groups uses registry.get_id(name). 
         # By iterating and 'touching' names here, we lock the IDs globally.
-        if n_proc > 1:
+        if self.n_procs > 1:
             # Optimization: Use C-level iteration to collect all keys at once
             # Note: iterating a dict (gt.node_map) yields its keys automatically
             all_names = set(chain.from_iterable(gt.node_map for gt in gene_trees.values()))
@@ -1226,7 +1220,7 @@ class GeneTreeManager:
                 continue
             tasks.append((m_idx, m_data))
 
-        # Parallel Execution
+        # --- Parallel Execution ---
         
         def save_result(res):
             m_idx, groups = res
@@ -1238,7 +1232,7 @@ class GeneTreeManager:
                 self.logger.log(f"saving pickle {pickle_path}: {e}", 'e')
 
         if tasks:
-            if n_proc > 1:
+            if self.n_procs > 1:
                 # Create a temporary file to hold the massive data
                 # delete=False is safer for Windows (prevents access errors if opened twice)
                 # We manually unlink later.
@@ -1254,7 +1248,7 @@ class GeneTreeManager:
                     
                     # Init Workers pointing to file
                     # This works on ALL OSs
-                    with mp.Pool(processes=n_proc, initializer=_init_collapse_worker, initargs=(temp_file_path,)) as pool:
+                    with mp.Pool(processes=self.n_procs, initializer=_init_collapse_worker, initargs=(temp_file_path,)) as pool:
                         for res in tqdm(pool.imap_unordered(_collapse_worker, tasks), total=len(tasks), desc="Collapsing", unit="mt", 
                                       disable=self.logger.disable_tqdm):
                             save_result(res)
@@ -1293,7 +1287,7 @@ class GeneTreeManager:
             
         self.logger.report_step(step, "Success")
 
-    def filter_and_check(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]):
+    def filter_and_check(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]) -> Dict[int, int]:
         """
         Writes checknums file and filters trees exceeding group cap.
         [UPDATED] Uses multiprocessing to prepare string buffers.
@@ -1317,24 +1311,18 @@ class GeneTreeManager:
             
             # Payload: (m_idx, m_data, pickle_path, gene_ids, cap, is_mul_input)
             tasks.append((
-                m_idx, 
-                m_data, 
-                str(pickle_path), 
-                sorted_gene_ids, 
-                self.tcf.group_cap, 
-                self.tcf.is_mul_input
+                m_idx, m_data, str(pickle_path), 
+                sorted_gene_ids, self.tcf.group_cap, self.tcf.is_mul_input
             ))
-
-        n_proc = self.reconciler.num_processes
         
         # Results container: Map m_idx -> string buffer
         results_map = {}
 
         # Execution
         if tasks:
-            if n_proc > 1:
-                with mp.Pool(processes=n_proc) as pool:
-                    for res in tqdm(pool.imap_unordered(_check_worker, tasks), total=len(tasks), desc="Checking  ", unit="mt", disable=self.logger.disable_tqdm):
+            if self.n_procs > 1:
+                with mp.Pool(processes=self.n_procs) as pool:
+                    for res in tqdm(pool.imap_unordered(_check_and_write_worker, tasks), total=len(tasks), desc="Checking  ", unit="mt", disable=self.logger.disable_tqdm):
                         m_idx, buf, fails = res
                         results_map[m_idx] = buf
                         # Merge failures
@@ -1343,7 +1331,7 @@ class GeneTreeManager:
                             gt_failures[g_idx].extend(failures)
             else:
                 for task in tqdm(tasks, desc="Checking  ", unit="mt", disable=self.logger.disable_tqdm):
-                    m_idx, buf, fails = _check_worker(task)
+                    m_idx, buf, fails = _check_and_write_worker(task)
                     results_map[m_idx] = buf
                     for g_idx, failures in fails.items():
                         if g_idx not in gt_failures: gt_failures[g_idx] = []
@@ -1360,11 +1348,12 @@ class GeneTreeManager:
         
         for g_idx in sorted(gt_failures.keys()):
             if g_idx in gene_trees:
-                fail_count = len(gt_failures[g_idx])
-                self.logger.log(f"Gene tree on line {g_idx+1} is over the group cap in {fail_count} MTs and will be filtered.", 'w')
+                gt_failures[g_idx] = len(gt_failures[g_idx])
+                self.logger.log(f"Gene tree on line {g_idx+1} is over the group cap in {gt_failures[g_idx]} MTs and will be filtered.", 'w')
                 del gene_trees[g_idx]
+        return gt_failures
                 
-    def write_filtered_trees(self, gene_trees: Dict[int, SmrtTree]):
+    def write_filtered_trees(self, gene_trees: Dict[int, SmrtTree], gt_failures: Dict[int, int], original_count: int):
         """Matches GRAMPA's filterOut logic."""
         step = "Writing filtered gene trees to file"
         self.logger.report_step(step, "In progress...")
@@ -1372,9 +1361,14 @@ class GeneTreeManager:
         p = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-trees-filtered.txt"
         count = 0
         with open(p, 'w') as f:
-            for idx in sorted(gene_trees.keys()):
-                # GRAMPA writes the original newick string
-                f.write(gene_trees[idx].to_str(internals=False) + "\n")
-                count += 1
+            for idx in range(original_count):
+                if idx in gt_failures:
+                    f.write(f"# Over group cap in {gt_failures[idx]} MUL-trees\n")
+                elif idx in gene_trees:
+                    f.write(gene_trees[idx].to_str(internals=True) + "\n")
+                    count += 1
+                else:
+                    # This happens in later iterations, especially by the split mode
+                    f.write(f"# Already filtered out\n")
                 
         self.logger.report_step(step, f"Success: {count} gene trees written")

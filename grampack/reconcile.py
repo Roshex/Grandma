@@ -4,18 +4,14 @@ import multiprocessing as mp
 from tqdm import tqdm
 from pathlib import Path
 from functools import partial
-from typing import List, Dict, Tuple, Any, Set, Union, Optional
+from typing import List, Dict, Tuple, Union, Optional
 
 from .config import TaskConfig
 from .logger import GranLogger
 from .models import SmrtTree, MulTree, GroupData, Map, ReconResult, TaskResult, FlatTree, NameRegistry
 
-GroupsPickle = Dict[int, GroupData]
-
-# --- Worker Function ---
-
 def _worker_reconcile_single(
-    mul_item: Tuple[int, Any], 
+    mul_item: Tuple[int, FlatTree],
     flat_gts: Dict[int, FlatTree],
     dup_cost: int,
     loss_cost: int,
@@ -68,9 +64,9 @@ def _worker_reconcile_single(
 class Reconciler:
     def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1, optim: bool = False):
         self.tcf = config
-        self.num_processes = num_processes
-        self.optim = optim
         self.logger = logger
+        self.n_procs = num_processes
+        self.optim = optim
     
     @staticmethod
     def reconcile_permutation(gt_flat, mul_flat, dup_cost, loss_cost, registry, group_data, target_map, retmap=False, optim=False):
@@ -79,215 +75,9 @@ class Reconciler:
         else:
             res = Reconciler.reconcile_permutation_old(gt_flat, mul_flat, dup_cost, loss_cost, registry, group_data, target_map, retmap=retmap)
         return res
-    # --------------------------------------------------------------------------
-    # GROUP COLLAPSING LOGIC (Object-based, run once per iter)
-    # --------------------------------------------------------------------------
-
-    @staticmethod
-    def _get_sister_clade_labels(node_obj) -> List[str]:
-        """
-        Given a node object, returns the set of leaf labels in its sister clades.
-        Runs on the species tree, so labels are expected to be the raw leaf names (e.g. "Species" or "Species*") without GeneID.
-        """
-        if not node_obj or not node_obj.up: return []
-        sisters = [ch for ch in node_obj.up.children if ch != node_obj]
-        labels = []
-        for sis in sisters:
-            # Must use l.name to preserve the '*' so the .isdisjoint() checks evaluate correctly
-            labels.extend([l.name for l in sis.iter_leaves()])
-        return labels
-
-    @staticmethod
-    def _find_node_by_clade(tree: SmrtTree, target_leaves: Set[str]) -> Any:
-        # OPTIMIZATION: Use Dictionary Lookup O(1) instead of search_nodes O(N)
-        leaf_nodes = []
-        for t in target_leaves:
-            # Use get_node from GrandmaTree wrapper
-            node = tree.get_node(t)
-            if node: leaf_nodes.append(node)
-        
-        if not leaf_nodes: return None
-        lca = tree.ete_tree.get_common_ancestor(leaf_nodes)
-        lca_leaves = {l.name for l in lca.iter_leaves()}
-        if lca_leaves == target_leaves: return lca
-        return None
-
-    @staticmethod
-    def get_sister_clades(mul_data: MulTree) -> Tuple[Set[str], List[Set[str]]]:
-        """
-        Returns:
-          1. h1_sisters: Set of names indicating H1 (Base) placement.
-          2. hx_sisters_list: List[Set[str]] where index 0 -> H2, 1 -> H3.
-        """
-        if mul_data.h1_node is None:
-            return set(), []
-            
-        h1_target = set(mul_data.h_clade)
-        n1_obj = Reconciler._find_node_by_clade(mul_data.mt, h1_target)
-
-        h1_sisters = Reconciler._get_sister_clade_labels(n1_obj) if n1_obj else []
-        hx_sisters_list = []
-        
-        # Targets (mul_data.hx_nodes) is guaranteed to be a list (either empty or populated)
-        # Can't use the hx_node object directly due to risk of stale references, so we find the node by clade each time.
-        for idx, _ in enumerate(mul_data.hx_nodes):
-            # Dynamically find the node in the current tree topology
-            # to avoid stale node references yielding incorrect sister clades.
-            target_suffix = "*" * (idx + 1)
-            hx_target = {f"{x}{target_suffix}" for x in mul_data.h_clade}
-            n_obj = Reconciler._find_node_by_clade(mul_data.mt, hx_target)
-            
-            if n_obj:
-                sisters = Reconciler._get_sister_clade_labels(n_obj)
-                if not set(h1_sisters).isdisjoint({l.name for l in n_obj.iter_leaves()}): 
-                    h1_sisters = []
-                if n1_obj and not set(sisters).isdisjoint({l.name for l in n1_obj.iter_leaves()}): 
-                    sisters = []
-                # Append Set of clean names directly to the list
-                hx_sisters_list.append({s.replace("*", "") for s in sisters})
-            else:
-                hx_sisters_list.append(set())
-
-        h1_sisters = {x.replace("*", "") for x in h1_sisters}
-
-        return h1_sisters, hx_sisters_list
-
-    @staticmethod
-    def compute_groups(gene_tree: SmrtTree, mul_data: MulTree, registry: NameRegistry,
-                       h1_sisters: Set[str] = None, hx_sisters_list: List[Set[str]] = None) -> GroupData:
-        """
-        Registry-Optimized O(N) implementation.
-        Uses integer IDs for Set operations (Union/IsSubset) to achieve significant speedup.
-        """
-        # 1. Pre-computation: Convert targets to Integer IDs
-        # This allows O(1) lookups and fast set operations
-        h1_target_ids = set()
-        for name in mul_data.h_clade:
-            h1_target_ids.add(registry.get_id(name))
-            
-        groups = {} 
-        singles = {} 
-        
-        # Cache: node -> (species_id_set, leaf_names_list, active_roots)
-        # species_id_set: Set[int] - much faster than Set[str]
-        node_info = {}
-
-        ginfo = gene_tree.ete_tree
-
-        for node in ginfo.traverse("postorder"):
-            if node.is_leaf():
-                # Extract name and convert to ID
-                sp_name = node.name.split("_", 1)[-1] if "_" in node.name else node.name # node.name.split("_")[-1]
-                sp_id = registry.get_id(sp_name)
-                
-                is_h1 = sp_id in h1_target_ids
-                
-                s_set = {sp_id}
-                l_list = [node.name]
-                
-                if is_h1:
-                    singles[node.name] = [] 
-                    a_roots = [node.name]
-                else:
-                    a_roots = []
-                
-                node_info[node] = (s_set, l_list, a_roots)
-                
-            else:
-                children = node.children
-                
-                u_s_set = set()
-                u_l_list = []
-                u_a_roots = []
-                
-                all_h1_descendants = True
-                total_species_count = 0
-                
-                for child in children:
-                    c_s_set, c_l_list, c_a_roots = node_info[child]
-                    
-                    u_s_set.update(c_s_set)
-                    u_l_list.extend(c_l_list)
-                    u_a_roots.extend(c_a_roots)
-                    total_species_count += len(c_s_set)
-                    
-                    # Integer set subset check is highly optimized
-                    if not c_s_set.issubset(h1_target_ids):
-                        all_h1_descendants = False
-                
-                children_disjoint = (len(u_s_set) == total_species_count)
-
-                if all_h1_descendants and children_disjoint and len(children) > 1:
-                    # Valid Group
-                    for r in u_a_roots:
-                        if r in groups: del groups[r]
-                        if r in singles: del singles[r]
-                    
-                    groups[node.name] = [u_l_list, []]
-                    u_a_roots = [node.name]
-                
-                node_info[node] = (u_s_set, u_l_list, u_a_roots)
-
-        # --- Post-Processing ---
-        
-        def fill_anc_leaves(n_name, is_group):
-            n_obj = gene_tree.get_node(n_name)
-            if not n_obj or not n_obj.up: return
-            
-            p_obj = n_obj.up
-            if p_obj in node_info and n_obj in node_info:
-                p_leaves = node_info[p_obj][1]
-                n_leaves_set = set(node_info[n_obj][1])
-                anc_list = [l for l in p_leaves if l not in n_leaves_set]
-                
-                if is_group:
-                    groups[n_name][1] = anc_list
-                else:
-                    singles[n_name] = anc_list
-
-        for g_name in groups: fill_anc_leaves(g_name, True)
-        for s_name in singles: fill_anc_leaves(s_name, False)
-
-        # --- Fixes Logic ---
-        final_ambiguous = [] # List of List[int]
-        final_fixed = []     # List of (List[int], str)
-
-        # Sister checking
-        if mul_data.h1_node and (h1_sisters is None):
-            h1_sisters, hx_sisters_list = Reconciler.get_sister_clades(mul_data)
-
-        def to_ids(names):
-            return [registry.get_id(n) for n in names]
-
-        def check_fix(unit_nodes, anc_leaves):
-            # Convert to Set for fast subset math
-            group_sis_specs = {n.split("_", 1)[-1] if "_" in n else n for n in anc_leaves} # {n.split("_")[-1] for n in anc_leaves}
-            
-            if group_sis_specs:
-                if h1_sisters and group_sis_specs.issubset(h1_sisters):
-                    # Index 0 corresponds to the Base/H1 target
-                    final_fixed.append((to_ids(unit_nodes), 0))
-                    return
-                
-                if hx_sisters_list:
-                    for t_idx, sis_set in enumerate(hx_sisters_list):
-                        if sis_set and group_sis_specs.issubset(sis_set):
-                            # Index t_idx + 1 corresponds to H2 (1), H3 (2), etc.
-                            final_fixed.append((to_ids(unit_nodes), t_idx + 1))
-                            return
-            
-            final_ambiguous.append(to_ids(unit_nodes))
-
-        for g_leaves, anc_leaves in groups.values():
-            check_fix(g_leaves, anc_leaves)
-            
-        for s_name, anc_leaves in singles.items():
-            check_fix([s_name], anc_leaves)
-
-        return GroupData(final_ambiguous, final_fixed)
 
     # --------------------------------------------------------------------------
-    # RECONCILIATION LOGIC (Unified Flat)
+    # COMMON LOGIC
     # --------------------------------------------------------------------------
 
     @staticmethod
@@ -338,12 +128,9 @@ class Reconciler:
             if valid_ids: ambig_groups_ids.append(valid_ids)
 
         fixed_groups_ids = []
-        for grp_ids, suffix in group_data.fixed_groups:
-            valid_ids = []
-            for nid in grp_ids:
-                if nid in gt_flat.name_id_to_node_id:
-                    valid_ids.append(gt_flat.name_id_to_node_id[nid])
-            if valid_ids: fixed_groups_ids.append((valid_ids, suffix))
+        for grp_ids, target_idx in group_data.fixed_groups:
+            valid_ids = [gt_flat.name_id_to_node_id[nid] for nid in grp_ids if nid in gt_flat.name_id_to_node_id]
+            if valid_ids: fixed_groups_ids.append((valid_ids, target_idx))
         
         return ambig_groups_ids, fixed_groups_ids
 
@@ -471,7 +258,9 @@ class Reconciler:
             
         return score
 
-    # --- Dirty Node Optimization ---
+    # --------------------------------------------------------------------------
+    # DIRTY RECONCILIATION LOGIC
+    # --------------------------------------------------------------------------
     
     @staticmethod
     def identify_dirty_nodes(gt_flat: FlatTree, dirty_leaves: List[int]) -> Tuple[List[int], List[bool]]:
@@ -712,6 +501,10 @@ class Reconciler:
             return ReconResult(best_score, all_maps)
         return best_score
     
+    # --------------------------------------------------------------------------
+    # RECONCILIATION LOGIC
+    # --------------------------------------------------------------------------
+
     @staticmethod
     def reconcile_permutation_old(gt_flat: FlatTree, mul_flat: FlatTree, dup_cost: int, loss_cost: int,
                             registry: NameRegistry, group_data: GroupData, target_map: Dict[int, List[int]],
@@ -810,8 +603,8 @@ class Reconciler:
                               optim=self.optim
                             )
         
-        if self.num_processes > 1:
-            with mp.Pool(processes=self.num_processes) as pool:
+        if self.n_procs > 1:
+            with mp.Pool(processes=self.n_procs) as pool:
                 flat_tasks = [(k, v.mt.flat_tree) for k, v in tasks]
                 #for idx, score in pool.imap_unordered(worker_func, flat_tasks):
                 iterator = pool.imap_unordered(worker_func, flat_tasks)
@@ -874,7 +667,7 @@ class Reconciler:
         self.logger.report_step(step, "Success")
         return detailed_res
         
-    def run(self, mul_trees: dict, gene_trees: dict, registry: NameRegistry, writer: Any) -> TaskResult:
+    def run(self, mul_trees: dict, gene_trees: dict, registry: NameRegistry) -> TaskResult:
 
         if registry is None: registry = NameRegistry()
 
@@ -903,7 +696,10 @@ class Reconciler:
             sorted_scores, _ = self.recon_all(mul_trees, gene_trees, registry, retmap=False)
             detailed_res = self.get_lowest_maps(sorted_scores, limit, mul_trees, gene_trees, registry)
 
-        writer.write_results(sorted_scores, detailed_res, mul_trees, gene_trees)
+        # Write outputs
+        self.write_detailed(detailed_res, gene_trees)
+        self.write_scores(sorted_scores, mul_trees)
+        self.write_dup_counts(detailed_res, mul_trees)
 
         # Get the first k,v pair from detailed_res
         # This dict will be "sorted"
@@ -922,3 +718,100 @@ class Reconciler:
                 break
 
         return TaskResult(sorted_scores, mul_trees, detailed_kept, gene_trees)
+    
+    # --------------------------------------------------------------------------
+    # WRITER LOGIC
+    # --------------------------------------------------------------------------
+
+    def write_detailed(self, detailed_res: dict, gene_trees: dict):
+
+        def map_formatter(name: str, maps: dict, dups: dict) -> str:
+            """
+            Dynamically injects [Map-Dup] labels into the Newick string 
+            using a formatter, completely avoiding slow tree copying/mutation.
+            """
+            if name in maps:
+                cur_map = maps[name][0]
+                # Append '+' if it mapped to the H1 (Base) copy
+                if "*" not in cur_map:
+                    cur_map += "+"
+                dup_count = dups.get(name, 0)
+                # Format: Node<|Map-Dups|> -> Node[Map-Dups]
+                return f"{name}<|{cur_map}-{dup_count}|>"
+            return name
+        
+        step = "Writing detailed output file"
+        self.logger.report_step(step, "In progress...")
+        
+        p = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-detailed.txt"
+        with open(p, 'w') as f:
+            f.write("mul.tree\tgene.tree\tdups\tlosses\ttotal.score\tmaps\n")
+            
+            i, to_map = 0, self.tcf.to_map
+            for mul_idx, res_dict in detailed_res.items():
+                if to_map >= 0 and i >= to_map:
+                    break
+                for gene_idx, res in res_dict.items():
+                    gt_obj = gene_trees[gene_idx]
+                    
+                    # Handle multiple maps if present
+                    if (maps_len := len(res.maps)) > 1:
+                        f.write(f"# GT-{gene_idx+1} to MT-{mul_idx}\t{maps_len} maps found!\n")
+                        
+                    for map_obj in res.maps:
+                        map_str = gt_obj.to_str(
+                            internals=True,
+                            name_formatter=map_formatter,
+                            maps=map_obj.cor,
+                            dups=map_obj.dups
+                            )
+                        map_str = map_str.replace("<|", "[").replace("|>", "]") # Avoid Newick issues with angle brackets
+                        f.write(f"{mul_idx}\t{gene_idx+1}\t{map_obj.n_dups}\t{map_obj.n_losses}\t{res.score}\t{map_str}\n")
+                i += 1
+                                 
+        self.logger.report_step(step, "Success")
+
+    def write_scores(self, sorted_scores: list, mul_trees: dict):
+
+        step = "Writing main output file"
+        self.logger.report_step(step, "In progress...")
+        
+        p = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-scores.txt"
+        with open(p, 'w') as f:
+            f.write("mul.tree\th1.node\thx.nodes\tscore\tlabeled.tree\n")
+            for idx, score in sorted_scores:
+                mul_data = mul_trees[idx]
+                tree_str = mul_data.mt.to_marked_str(mul_data.h1_node)
+                h1_name = mul_data.h1_node.name if mul_data.h1_node else "NA"
+                # Handle single or multiple Hx targets
+                hx_names = ",".join([n.name for n in mul_data.hx_sisters]) if mul_data.hx_sisters else "NA"  
+                f.write(f"{idx}\t{h1_name}\t{hx_names}\t{score}\t{tree_str}\n")
+
+        self.logger.report_step(step, "Success")
+
+    def write_dup_counts(self, detailed_res: dict, mul_trees: dict):
+        p_dup = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-dup-counts.txt"
+        with open(p_dup, 'w') as f:
+            f.write("mul.tree\tnode\tdups\n")
+            for mul_idx, res_dict in detailed_res.items():
+                mul_data = mul_trees[mul_idx]
+                hybrid_clade = mul_data.h_clade
+                ordered_nodes = mul_data.mt.get_node_order()
+                
+                # Pre-fill dictionary with 0s to guarantee NO missing rows
+                main_dups = {node: 0 for node in ordered_nodes}
+                
+                # Accumulate counts efficiently
+                for g_idx, res in res_dict.items():
+                    first_map = res.maps[0]
+                    cor_maps = first_map.cor
+                    for gt_node, count in first_map.dups.items():
+                        if count > 0:
+                            map_node = cor_maps[gt_node][0]
+                            main_dups[map_node] += count
+                                
+                # Write ordered output
+                for node in ordered_nodes:
+                    count = main_dups[node]
+                    out_node = node + "+" if node in hybrid_clade else node
+                    f.write(f"{mul_idx}\t{out_node}\t{count}\n")

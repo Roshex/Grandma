@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from .models import SmrtTree
+
+from .models import SmrtTree, splitSpec
 
 class OrthologyLabeler:
     @staticmethod
@@ -44,7 +45,7 @@ class OrthologyLabeler:
                     
                     # Identify genes in hybrid clade
                     for node in gt_obj.ete_tree.iter_leaves():
-                        sp = node.name.split("_")[-1]
+                        sp = splitSpec(node.name)
                         if sp in hybrid_clade:
                             cur_map = maps[node.name][0]
                             marker = "+" if "*" in cur_map else "^"

@@ -506,11 +506,13 @@ class FlowManager:
             return [], {}'''
 
         # A softer check: MT leaf count == H clade leaf count
+        return_flag = False
         mt_lvs_list = [l.name for l in mt_wrapper.ete_tree.get_leaves()]
         if len(mt_lvs_list) == len(h_clade_names):
             self.logger.log("All MT leaves are H clades leaves.", 'd')
             self.logger.log(f"Terminal autopolyploidy detected at depth {depth}, index {idx}. Stopping recursive branch.", 'i')
-            return [], {}
+            return_flag = True
+            #return [], {}
 
         outer_gts = {}
         inner_gts = {}
@@ -525,6 +527,8 @@ class FlowManager:
 
             if g_idx in debug_sample:
                 self._debug_tree(f"Pre-split GT {g_idx}:",source_gt)
+                # log debug the map as well
+                self.logger.log(f"Map for GT {g_idx}: {maps.cor}", 'd')
 
             rev_map = maps.rev
             inner_leaves = set()
@@ -585,6 +589,9 @@ class FlowManager:
 
                 gt_split_dict[g_idx].append(innie_counter)
                 innie_counter += 1
+
+        if return_flag:
+            return [], {}
 
         # --- Species Tree Surgery ---
 

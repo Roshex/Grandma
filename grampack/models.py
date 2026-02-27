@@ -1,8 +1,11 @@
 import math
 import array
+from functools import partial
 from ete3 import Tree, TreeNode
 from typing import List, Dict, Optional, Tuple, Any, Set
 from dataclasses import dataclass, field
+
+splitSpec = lambda raw: raw.split("_", 1)[-1] if "_" in raw else raw # raw.split("_")[-1]
 
 class NameRegistry:
     """
@@ -18,6 +21,9 @@ class NameRegistry:
             self._str_to_int[name] = len(self._int_to_str)
             self._int_to_str.append(name)
         return self._str_to_int[name]
+    
+    def get_ids(self, names: List[str]) -> List[int]:
+        return [self.get_id(name) for name in names]
     
     def get_name(self, idx: int) -> str:
         return self._int_to_str[idx]
@@ -130,7 +136,7 @@ class TreeLinearizer:
                 # For GT: "Gene_Species" -> "Species"
                 # For ST (MUL): "Species*" -> "Species*" (Preserves distinction)
                 # A clean name is needed to find matching species in ST
-                sp_name = raw_name.split("_", 1)[-1] if "_" in raw_name else raw_name # raw_name.split("_")[-1] 
+                sp_name = splitSpec(raw_name) 
                 name_idx = registry.get_id(sp_name)
                 
                 # Also index the full leaf name for Group lookup (e.g. "Gene1_Species")
@@ -250,6 +256,12 @@ class TreeLinearizer:
             node_id_to_name_id=node_id_to_name_id,
             rmq_table=rmq
         )
+
+@dataclass(slots=True, frozen=True)
+class GroupData:
+    # ints are IDs from NameRegistry
+    ambiguous_groups: List[List[int]]
+    fixed_groups: List[Tuple[List[int], int]]
 
 class SmrtTree:
     """Wrapper around ETE3 Tree to provide GRAMPA-specific functionality."""
@@ -373,7 +385,7 @@ class SmrtTree:
                     # Assume names are unique!
                     pass
                 
-                reco = n.name.split("_", 1)[1] if "_" in n.name else n.name
+                reco = splitSpec(name)
                 n.add_feature("reco", reco)
                 n.add_feature("r_id", self.registry.get_id(reco))
                 n.add_feature("u_id", self.registry.get_id(n.name))
@@ -643,15 +655,15 @@ class SmrtTree:
 
     # --- I/O and Pickling ---
 
-    def to_mult_str(self, internals=True) -> str:
+    def to_mult_str(self, internals: bool=True) -> str:
         name_to_pure = {n.name: n.pure for n in self.ete_tree.traverse()}
         return self.to_str(internals=internals, name_formatter=lambda name: name_to_pure.get(name, 'Error'))
 
-    def to_mult(self, internals=True) -> Tree:
+    def to_mult(self, internals: bool=True) -> Tree:
         mult_str = self.to_mult_str(internals=internals)
         return Tree(mult_str, format=8 if internals else 9)
 
-    def to_marked_str(self, node_to_mark: TreeNode) -> str:
+    def to_marked_str(self, node_to_mark: TreeNode, internals: bool=True) -> str:
         """
         Node_to_mark is the node in the ete_tree that should be marked with a "+" in the string output.
         Generally it is the H1 node after a new inference.
@@ -661,21 +673,284 @@ class SmrtTree:
         # Rename, create str, undo rename
         for n in marked_nodes:
             n.name = n.name + "+" if n.is_leaf() else n.name [:-1] + '+>'
-        marked_str = self.to_str(internals=True)
+        marked_str = self.to_str(internals=internals)
         for n in marked_nodes:
             n.name = n.name.replace("+", "")
         return marked_str
 
-    def to_str(self, internals=True, name_formatter=None) -> str:
+    def to_str(self, internals: bool=True, name_formatter=None, **kwargs) -> str:
+
+        # Determine the ETE3 format number based on your parameter
+        fmt_num = 8 if internals else 9
         root_name = str(self.ete_tree.name) if internals else ""
-        return self.ete_tree.write(format=8 if internals else 9, name_formatter=name_formatter)[:-1]+root_name+";"
-    
+        
+        if name_formatter:
+            # Bind extra arguments (like maps=, dups=) to the formatter
+            if kwargs:
+                name_formatter = partial(name_formatter, **kwargs)
+                
+            # Save original names and apply formatting in-place
+            original_names = {}
+            for node in self.ete_tree.traverse():
+                original_names[node] = node.name
+                raw_name = str(node.name) if node.name else ""
+                fmt_name = str(name_formatter(raw_name)) if raw_name else ""
+                node.name = fmt_name
+            # Do the same for the root name if needed
+            if root_name:
+                root_name = str(name_formatter(root_name))
+                # No need to revert root name as it's not part of the tree object
+                
+            base_str = self.ete_tree.write(format=fmt_num)
+            
+            # Revert the names to the original to avoid side effects on the tree object
+            for node, orig_name in original_names.items():
+                node.name = orig_name
+            
+        else:
+            # Standard ETE3 writing (No formatter provided)
+            base_str = self.ete_tree.write(format=fmt_num)
+        
+        return base_str[:-1] + root_name + ";"
+
+    def get_node_order(self) -> List[str]:
+        """
+        Returns nodes in legacy GRAMPA order: 
+        All leaves first (left-to-right), followed by all internal nodes (postorder).
+        Executes in a single O(N) pass and caches the result.
+        """
+        #if not hasattr(self, '_node_order'):
+        leaves = []
+        internals = []
+        # A single postorder traversal naturally visits leaves left-to-right!
+        for node in self.ete_tree.traverse("postorder"):
+            if node.is_leaf():
+                leaves.append(node.name)
+            else:
+                internals.append(node.name)
+        #self._node_order = leaves + internals
+        return leaves + internals
+            
+        #return self._node_order
+
+    def get_sis(self, node: Tree) -> Optional[Tree]:
+        """Returns the sister node of the given node"""
+        if node.is_root():
+            return None
+        parent = node.up
+        children = parent.get_children()
+        if len(children) != 2:
+            raise ValueError("Tree structure invalid for sister retrieval.")
+        sister = children[0] if children[1] == node else children[1]
+        return sister
+
     def __getstate__(self):
         return self.ete_tree
     
     def __setstate__(self, state):
         self.ete_tree = state
         self.refresh()
+
+    # --------------------------------------------------------------------------
+    # GROUP COLLAPSING LOGIC (Object-based, run once per iter)
+    # --------------------------------------------------------------------------
+
+    def compute_groups(self, mul_data: 'MulTree', registry: NameRegistry, 
+                       h1_sisters: Set[str] = None, hx_sisters_list: List[Set[str]] = None) -> GroupData:
+        """
+        Registry-Optimized O(N) implementation.
+        Uses integer IDs for Set operations (Union/IsSubset) to achieve significant speedup.
+        """
+        h1_target_ids = {registry.get_id(name) for name in mul_data.h_clade}
+        # Cache: node -> (species_id_set, leaf_names_list, active_roots)
+        # species_id_set: Set[int] - much faster than Set[str]
+        groups, singles, node_info = {}, {}, {}
+
+        # Raw ete3 traversal - Maximum speed!
+        for node in self.ete_tree.traverse("postorder"):
+            if node.is_leaf():
+                # Extract name and convert to ID
+                sp_name = splitSpec(node.name)
+                sp_id = registry.get_id(sp_name)
+                is_h1 = sp_id in h1_target_ids
+                
+                s_set, l_list = {sp_id}, [node.name]
+                if is_h1:
+                    singles[node.name] = [] 
+                    a_roots = [node.name]
+                else:
+                    a_roots = []
+                node_info[node] = (s_set, l_list, a_roots)
+                
+            else:
+                u_s_set, u_l_list, u_a_roots = set(), [], []
+                all_h1_descendants, total_species_count = True, 0
+                
+                for child in node.children:
+                    c_s_set, c_l_list, c_a_roots = node_info[child]
+                    u_s_set.update(c_s_set)
+                    u_l_list.extend(c_l_list)
+                    u_a_roots.extend(c_a_roots)
+                    total_species_count += len(c_s_set)
+                    
+                    # Integer set subset check is highly optimized
+                    if not c_s_set.issubset(h1_target_ids):
+                        all_h1_descendants = False
+                
+                if all_h1_descendants and (len(u_s_set) == total_species_count) and len(node.children) > 1:
+                    # Valid Group
+                    for r in u_a_roots:
+                        groups.pop(r, None)
+                        singles.pop(r, None)
+                    groups[node.name] = [u_l_list, []]
+                    u_a_roots = [node.name]
+                
+                node_info[node] = (u_s_set, u_l_list, u_a_roots)
+
+        # --- Post-Processing ---
+        
+        def fill_anc_leaves(n_name, target_dict):
+            n_obj = self.get_node(n_name)
+            if not n_obj or not n_obj.up: return
+            p_obj = n_obj.up
+            if p_obj in node_info and n_obj in node_info:
+                p_leaves = node_info[p_obj][1]
+                n_leaves_set = set(node_info[n_obj][1])
+                anc_list = [l for l in p_leaves if l not in n_leaves_set]
+                if target_dict is groups:
+                    target_dict[n_name][1] = anc_list
+                else: # is singles
+                    target_dict[n_name] = anc_list
+
+        for g_name in groups: fill_anc_leaves(g_name, groups)
+        for s_name in singles: fill_anc_leaves(s_name, singles)
+
+        # --- Fixes Logic ---
+
+        # List of List[int], List of (List[int], int)
+        final_ambiguous, final_fixed = [], [] 
+
+        # Sister checking
+        if mul_data.h1_node and (h1_sisters is None):
+            h1_sisters, hx_sisters_list = mul_data.get_sister_clades()
+
+        def check_fix(unit_nodes, anc_leaves):
+            # Convert to Set for fast subset math
+            group_sis_specs = {splitSpec(n) for n in anc_leaves}
+            if group_sis_specs:
+                if h1_sisters and group_sis_specs.issubset(h1_sisters):
+                    # Index 0 corresponds to the Base/H1 target
+                    final_fixed.append((registry.get_ids(unit_nodes), 0))
+                    return
+                for idx, hx_sisters in enumerate(hx_sisters_list):
+                    if hx_sisters and group_sis_specs.issubset(hx_sisters):
+                        # Index idx + 1 corresponds to H2 (1), H3 (2), etc.
+                        final_fixed.append((registry.get_ids(unit_nodes), idx + 1))
+                        return
+            final_ambiguous.append(registry.get_ids(unit_nodes))
+
+        for g_leaves, anc_leaves in groups.values(): check_fix(g_leaves, anc_leaves)
+        for s_name, anc_leaves in singles.items(): check_fix([s_name], anc_leaves)
+
+        return GroupData(final_ambiguous, final_fixed)
+
+@dataclass(slots=True, frozen=True)
+class MulTree:
+    mt: SmrtTree
+    h_clade: List[str] = field(default_factory=list)
+    # Storing OBJECTS optimizes the Reconciler (no lookups)
+    # These are safe to pickle TO workers, but shouldn't be used to map back TO main.
+    h1_node: Optional[TreeNode] = None 
+    # Replaced single h2_node with hx_nodes list
+    hx_nodes: List[TreeNode] = field(default_factory=list)
+
+    # For mode compatibility, h2_node can return the first element or None
+    @property
+    def h2_node(self) -> Optional[TreeNode]:
+        return self.hx_nodes[0] if self.hx_nodes else None
+    
+    @property
+    def hx_sisters(self) -> List[Optional[TreeNode]]:
+        sisters = []
+        for hx_node in self.hx_nodes:
+            sis = self.mt.get_sis(hx_node)
+            sisters.append(sis)
+        return sisters
+    
+    @property
+    def h1_sister(self) -> Optional[TreeNode]:
+        if self.h1_node is None: return None
+        return self.mt.get_sis(self.h1_node)
+    
+    # --- Sister Clade Logic ---
+    # The static methods below only run on MTs / STs, that's why they are in MulTree and not SmrtTree, to avoid confusion about applicability.
+    # For speed and pickling reasons, they are static and operate on the SmrtTree wrapper and use node names for lookups, rather than TreeNode objects which may become stale after grafting.
+
+    @staticmethod
+    def _find_node_by_clade(tree: SmrtTree, target_leaves: Set[str]) -> Any:
+        # Use Dictionary Lookup O(1) instead of search_nodes O(N)
+        leaf_nodes = []
+        for t in target_leaves:
+            # Use get_node from the wrapper
+            node = tree.get_node(t)
+            if node: leaf_nodes.append(node)
+        if not leaf_nodes: return None
+        lca = tree.ete_tree.get_common_ancestor(leaf_nodes)
+        lca_leaves = {l.name for l in lca.iter_leaves()}
+        if lca_leaves == target_leaves: return lca
+        return None
+    
+    @staticmethod
+    def _get_sister_clade_labels(node_obj: Any) -> List[str]:
+        """
+        Given a node object, returns the set of leaf labels in its sister clades.
+        Applicable only to the species tree, so labels are expected to be the raw leaf names (e.g. "Species" or "Species*") without GeneID.
+        """
+        if not node_obj or not node_obj.up: return []
+        sisters = [ch for ch in node_obj.up.children if ch != node_obj]
+        labels = []
+        for sis in sisters:
+            # Must be l.name (not l.pure) to preserve the '*' for disjoint checks!
+            labels.extend([l.name for l in sis.iter_leaves()])
+        return labels
+
+    def get_sister_clades(self) -> Tuple[Set[str], List[Set[str]]]:
+        """
+        Calculates sister clades entirely internally using SmrtTree helpers.
+        Returns:
+          1. h1_sisters: Set of names indicating H1 (Base) placement.
+          2. hx_sisters_list: List[Set[str]] where index 0 -> H2, 1 -> H3.
+        """
+        if self.h1_node is None: return set(), []
+            
+        h1_target = set(self.h_clade)
+        mt = self.mt
+        n1_obj = MulTree._find_node_by_clade(mt, h1_target)
+        h1_sisters = MulTree._get_sister_clade_labels(n1_obj) if n1_obj else []
+
+        hx_sisters_list = []
+        # Targets (mul_data.hx_nodes) is guaranteed to be a list (either empty or populated)
+        # Can't use the hx_node object directly due to risk of stale references, so we find the node by clade each time.
+        for idx, _ in enumerate(self.hx_nodes):
+            # Dynamically find the node in the current tree topology
+            # to avoid stale node references yielding incorrect sister clades.
+            target_suffix = "*" * (idx + 1)
+            hx_target = {f"{x}{target_suffix}" for x in self.h_clade}
+            n_obj = MulTree._find_node_by_clade(mt, hx_target)
+            
+            if n_obj:
+                sisters = MulTree._get_sister_clade_labels(n_obj)
+                if not set(h1_sisters).isdisjoint({l.name for l in n_obj.iter_leaves()}): 
+                    h1_sisters = []
+                if n1_obj and not set(sisters).isdisjoint({l.name for l in n1_obj.iter_leaves()}): 
+                    sisters = []
+                # Append Set of clean names directly to the list
+                hx_sisters_list.append({s.replace("*", "") for s in sisters})
+            else:
+                hx_sisters_list.append(set())
+
+        h1_sisters = {x.replace("*", "") for x in h1_sisters}
+        return h1_sisters, hx_sisters_list
 
 @dataclass(slots=True, frozen=True)
 class Map:
@@ -708,27 +983,6 @@ class Map:
 class ReconResult:
     score: int
     maps: List[Map]
-
-@dataclass(slots=True, frozen=True)
-class GroupData:
-    # Changed from List[str] to List[int] (IDs from NameRegistry)
-    ambiguous_groups: List[List[int]]
-    #fixed_groups: List[Tuple[List[int], str]]
-    fixed_groups: List[Tuple[List[int], int]] # Changed from str to int
-
-@dataclass(slots=True, frozen=True)
-class MulTree:
-    mt: SmrtTree
-    h_clade: List[str] = field(default_factory=list)
-    # Storing OBJECTS optimizes the Reconciler (no lookups)
-    # These are safe to pickle TO workers, but shouldn't be used to map back TO main.
-    h1_node: Optional[TreeNode] = None 
-    # Replaced single h2_node with hx_nodes list
-    hx_nodes: List[TreeNode] = field(default_factory=list)
-    # For mode compatibility, h2_node can return the first element or None
-    @property
-    def h2_node(self) -> Optional[TreeNode]:
-        return self.hx_nodes[0] if self.hx_nodes else None
 
 @dataclass(slots=True, frozen=True)
 class TaskResult:
