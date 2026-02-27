@@ -476,43 +476,16 @@ class FlowManager:
         best_mt = res.mul_trees[best_mt_idx]
 
         h1_node = best_mt.h1_node
-        h2_node = best_mt.h2_node
+        #h2_node = best_mt.h2_node
+        hx_nodes = best_mt.hx_nodes # Copies
         mt_wrapper = best_mt.mt
+
+        hx_str = [f'{n.name} (H{x+2})' for x, n in enumerate(hx_nodes)]
+
+        self._debug_tree(f"Renaming Context: {h1_node.name} (H1) | {' | '.join(hx_str)}", mt_wrapper.ete_tree)
+
         min_maps = res.kept_mul_maps[best_mt_idx]
         gts = res.gene_trees
-
-        self._debug_tree(f"Split Context: {h1_node.name} (H1) | {h2_node.name} (H2)", mt_wrapper.ete_tree)
-
-        h_clade_names = [l.name for l in h1_node.get_leaves()]
-        h_clade_names.extend([l.name for l in h2_node.get_leaves()])
-
-        # Bug fix:
-        # check if all leaves in best_mt are in h_clade_names
-        # if so, after splitting, all remaining leaves in outer will be old internal nodes:
-        # the detection was autopolyploidy -> next detection is guaranteed to be the same -> infinite loop
-        #mt_lvs_set = set(l.name for l in mt_wrapper.ete_tree.get_leaves())
-        #if mt_lvs_set.issubset(set(h_clade_names)):
-        #    self.logger.log("All MT leaves belong to duplicated clades.", 'd')
-
-        # Check if H clade only has one species (pure name)
-        # Check if H clade only has one species (pure name)
-        single_spec_flag = False
-        if len(set(l.pure for l in h1_node.get_leaves())) < 2 and len(h1_node.get_leaves()) > 1:
-            single_spec_flag = True
-
-        '''if len(set(l.pure for l in h1_node.get_leaves())) < 2:
-            self.logger.log("All H clade leaves belong to a single species.", 'd')
-            self.logger.log(f"Terminal autopolyploidy detected at depth {depth}, index {idx}. Stopping recursive branch.", 'i')
-            return [], {}'''
-
-        # A softer check: MT leaf count == H clade leaf count
-        return_flag = False
-        mt_lvs_list = [l.name for l in mt_wrapper.ete_tree.get_leaves()]
-        if len(mt_lvs_list) == len(h_clade_names):
-            self.logger.log("All MT leaves are H clades leaves.", 'd')
-            self.logger.log(f"Terminal autopolyploidy detected at depth {depth}, index {idx}. Stopping recursive branch.", 'i')
-            return_flag = True
-            #return [], {}
 
         outer_gts = {}
         inner_gts = {}
@@ -520,33 +493,48 @@ class FlowManager:
         innie_counter = 0
 
         debug_sample = self.sample(list(gts.keys()))
+
+        # Pre-compute a mapping from MT nodes to copy indices for O(1) lookup during GT leaf partitioning
+        mt_node_to_copy_idx = {}
+        for l in h1_node.get_leaves():
+            mt_node_to_copy_idx[l.name] = 0
+        for idx, hx_node in enumerate(best_mt.hx_nodes):
+            for l in hx_node.get_leaves():
+                mt_node_to_copy_idx[l.name] = idx + 1
+
         for g_idx, gt_wrapper in gts.items():
             maps = min_maps.get(g_idx)
             if not maps: continue
             source_gt = gt_wrapper.ete_tree
 
             if g_idx in debug_sample:
-                self._debug_tree(f"Pre-split GT {g_idx}:",source_gt)
-                # log debug the map as well
+                self._debug_tree(f"Pre-split GT {g_idx}:", source_gt)
                 self.logger.log(f"Map for GT {g_idx}: {maps.cor}", 'd')
 
+            # --- Partition leaves by homoeologous copy ---
             rev_map = maps.rev
-            inner_leaves = set()
-            outer_leaves = set()
-            for leaf, v in rev_map.items():
-                if leaf in h_clade_names:
-                    inner_leaves.update(v)
+            outer_gt_lvs = set()
+            gt_leaf_to_copy_idx = {} # Inner leaves
+
+            for mt_node, gt_nodes in rev_map.items():
+                if mt_node in mt_node_to_copy_idx:
+                    copy_idx = mt_node_to_copy_idx[mt_node]
+                    # Flatten the mapping so every GT leaf knows its exact state
+                    for gt_n in gt_nodes:
+                        gt_leaf_to_copy_idx[gt_n] = copy_idx
                 else:
-                    outer_leaves.update(v)
-            source_lvs = {l.name for l in source_gt.get_leaves()}
-            outer_leaves = outer_leaves.intersection(source_lvs)
-            inner_leaves = inner_leaves.intersection(source_lvs)
+                    outer_gt_lvs.update(gt_nodes)
+                    
+            source_gt_lvs = {l.name for l in source_gt.get_leaves()}
+            # We do not need to intersect gt_leaf_to_copy_idx with source_lvs 
+            # because during Pass 1, we only query using `node.is_leaf()`.
+            outer_gt_lvs = outer_gt_lvs.intersection(source_gt_lvs)
 
             # --- Outer Sub-problem (Backbone) ---
             gt_ete = source_gt.copy()
 
-            if len(outer_leaves) >= self.ctx.min_gt_lvs:
-                gt_ete.prune(list(outer_leaves), preserve_branch_length=True)
+            if len(outer_gt_lvs) >= self.ctx.min_gt_lvs:
+                gt_ete.prune(list(outer_gt_lvs), preserve_branch_length=True)
                 outer_gts[g_idx] = SmrtTree(tree_obj=gt_ete)
 
                 if g_idx in debug_sample:
@@ -555,28 +543,38 @@ class FlowManager:
             # --- Inner Sub-problem (Hybrid Clade) ---
             gt_ete = source_gt.copy()
 
-            # Pass 1: Bottom-up purity caching (Postorder)
-            node_is_pure = {}
+            # Pass 1: Bottom-up multi-state purity caching (Postorder)
+            node_copy_state = {}
             for node in gt_ete.traverse("postorder"):
                 if node.is_leaf():
-                    node_is_pure[node] = node.name in inner_leaves
+                    node_copy_state[node] = gt_leaf_to_copy_idx.get(node.name)
                 else:
-                    # Internal node is pure only if ALL its children are pure
-                    node_is_pure[node] = all(node_is_pure[child] for child in node.children)
+                    child_states = [node_copy_state[child] for child in node.children]
+                    # Internal node is pure ONLY if ALL children map to the EXACT SAME copy
+                    if child_states and all(s is not None for s in child_states) and len(set(child_states)) == 1:
+                        node_copy_state[node] = child_states[0]
+                    else:
+                        node_copy_state[node] = None
 
             # Pass 2: Top-down extraction (Optimized)
             final_pure_lineages = []
-            # We use a manual stack to allow 'skipping' subtrees
+            # Manual stack allows 'skipping' subtrees
             stack = [gt_ete]
             while stack:
                 node = stack.pop()
-                if node_is_pure.get(node, False):
+
+                copy_idx = node_copy_state.get(node)
+                
+                # If copy_idx is an integer (0, 1, 2...), this node is pure for that specific copy
+                if copy_idx is not None:
+
+                #if node_is_pure.get(node, False):
                     if len(node) >= self.ctx.min_gt_lvs:
                         final_pure_lineages.append(node)
-                    # SUCCESS: We found the largest clade for this branch. 
+                    # SUCCESS: We found the largest pure clade for this homoeolog. 
                     # Do NOT add children to the stack; this skips the entire subtree.
                 else:
-                    # Node isn't pure, so we must check its children
+                    # Node is mixed (eg, contains H1 and H2, or outer leaves), so we must check its children
                     stack.extend(node.children)
 
             for ph_node in final_pure_lineages:
@@ -590,9 +588,6 @@ class FlowManager:
                 gt_split_dict[g_idx].append(innie_counter)
                 innie_counter += 1
 
-        if return_flag:
-            return [], {}
-
         # --- Species Tree Surgery ---
 
         # Simply copy the subtree rooted at H1 for the Inner ST
@@ -603,25 +598,22 @@ class FlowManager:
         outer_st_obj = mt_wrapper.ete_tree.copy()
         # Re-locate nodes in the COPY
         h1_in_outer = outer_st_obj.search_nodes(name=h1_node.name)[0]
-        h2_in_outer = outer_st_obj.search_nodes(name=h2_node.name)[0]
-        self.logger.log(f"Removing hybrid clade ({h1_in_outer.name} and {h2_in_outer.name}) from Outer ST.", 'd')
-        outer_st_obj, _ = self._trim_outer(outer_st_obj, [h1_in_outer, h2_in_outer])
+        #h2_in_outer = outer_st_obj.search_nodes(name=h2_node.name)[0]
+        hx_in_outer = [outer_st_obj.search_nodes(name=hx_node.name)[0] for hx_node in hx_nodes]
+        self.logger.log(f"Removing hybrid clade ({h1_in_outer.name} and {', '.join(n.name for n in hx_in_outer)}) from Outer ST.", 'd')
+        outer_st_obj, trimmed_names = self._trim_outer(outer_st_obj, [h1_in_outer] + hx_in_outer)
 
         self._debug_tree("Inner Species Tree (Hybrid Clade):", inner_st_obj)
-        self._debug_tree("Outer Species Tree (Backbone):", outer_st_obj)
+        self._debug_tree(f"Outer Species Tree (Backbone){' is empty' if not trimmed_names else ''}:", outer_st_obj)
         self.logger.log(f'len(inner_gts)={len(inner_gts)}, len(outer_gts)={len(outer_gts)}', 'd')
 
         # --- Queue Tasks with Binary IDs ---
         # Only queue tasks if species tree has enough leaves to be valid
         next_tasks = []
-        if len(outer_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(outer_gts) > 0:
+        if len(outer_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(outer_gts) > 0 and trimmed_names:
             next_tasks.append((SmrtTree(tree_obj=outer_st_obj), outer_gts, f"{depth + 1}.{idx * 2}"))
         if len(inner_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(inner_gts) > 0:
-            if single_spec_flag:
-                self.logger.log("All H clade leaves belong to a single species.", 'd')
-                self.logger.log(f"Terminal autopolyploidy detected at depth {depth}, index {idx}. Stopping inner branch.", 'i')
-            else:
-                next_tasks.append((SmrtTree(tree_obj=inner_st_obj), inner_gts, f"{depth + 1}.{idx * 2 + 1}"))
+            next_tasks.append((SmrtTree(tree_obj=inner_st_obj), inner_gts, f"{depth + 1}.{idx * 2 + 1}"))
         return next_tasks, gt_split_dict
 
     @staticmethod
@@ -636,6 +628,8 @@ class FlowManager:
         trimmed_names = []
         for n in h_nodes_to_trim:
             n_up = n.up # Save parent before detaching
+            if n_up is None:
+                return Tree(), [] # Special case: if H node is root, we return an empty tree to indicate no valid outer tree
             trimmed_names.append(n_up.name)
             trackers = getattr(n_up, 'H', []) # Preserve any existing trackers
             n.detach()
