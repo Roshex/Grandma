@@ -800,8 +800,9 @@ class FlowManager:
             # Get correct H tag
             locs = event['H_locs']
             h_parent = current_tree_wrapper.get_node(locs[0])
-            G_tag = f"Graft_{task_id}" # Just in case, shouldn't be needed!
-            H_tag = h_parent.up.name if h_parent else f'<auto:{task_id}>'
+            task_id_str = f"{task_id[0]}.{task_id[1]}"
+            G_tag = f"Graft_{task_id_str}" # Just in case, shouldn't be needed!
+            H_tag = h_parent.up.name if h_parent else f'<auto:{task_id_str}>'
 
             # Rename P nodes
             current_tree_wrapper.rename_node('<P>', f"{H_tag}")
