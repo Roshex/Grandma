@@ -682,7 +682,8 @@ class SmrtTree:
 
         # Determine the ETE3 format number based on your parameter
         fmt_num = 8 if internals else 9
-        root_name = str(self.ete_tree.name) if internals else ""
+        # Checking children > 1 prevents printing single-leaf tree's label twice
+        root_name = str(self.ete_tree.name) if internals and len(self.ete_tree) > 1 else ""
         
         if name_formatter:
             # Bind extra arguments (like maps=, dups=) to the formatter

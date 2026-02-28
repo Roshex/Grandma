@@ -476,31 +476,30 @@ class FlowManager:
         best_mt = res.mul_trees[best_mt_idx]
 
         h1_node = best_mt.h1_node
-        #h2_node = best_mt.h2_node
-        hx_nodes = best_mt.hx_nodes # Copies
+        hx_nodes = best_mt.hx_nodes
         mt_wrapper = best_mt.mt
-
         hx_str = [f'{n.name} (H{x+2})' for x, n in enumerate(hx_nodes)]
+        self._debug_tree(f"Splitting Context: {h1_node.name} (H1) | {' | '.join(hx_str)}", mt_wrapper.ete_tree)
 
-        self._debug_tree(f"Renaming Context: {h1_node.name} (H1) | {' | '.join(hx_str)}", mt_wrapper.ete_tree)
+        # Pre-compute a mapping from MT nodes to copy indices for O(1) lookup during GT leaf partitioning
+        mt_node_to_copy_idx = {}
+        for l in h1_node.get_leaves():
+            mt_node_to_copy_idx[l.name] = 0
+        for idx, hx_node in enumerate(hx_nodes):
+            for l in hx_node.get_leaves():
+                mt_node_to_copy_idx[l.name] = idx + 1
 
         min_maps = res.kept_mul_maps[best_mt_idx]
         gts = res.gene_trees
 
         outer_gts = {}
         inner_gts = {}
-        gt_split_dict = defaultdict(list)
+        outie_below_min_counter = 0
+        innie_below_min_counter = 0
         innie_counter = 0
+        gt_split_dict = defaultdict(list)
 
         debug_sample = self.sample(list(gts.keys()))
-
-        # Pre-compute a mapping from MT nodes to copy indices for O(1) lookup during GT leaf partitioning
-        mt_node_to_copy_idx = {}
-        for l in h1_node.get_leaves():
-            mt_node_to_copy_idx[l.name] = 0
-        for idx, hx_node in enumerate(best_mt.hx_nodes):
-            for l in hx_node.get_leaves():
-                mt_node_to_copy_idx[l.name] = idx + 1
 
         for g_idx, gt_wrapper in gts.items():
             maps = min_maps.get(g_idx)
@@ -533,12 +532,14 @@ class FlowManager:
             # --- Outer Sub-problem (Backbone) ---
             gt_ete = source_gt.copy()
 
-            if len(outer_gt_lvs) >= self.ctx.min_gt_lvs:
+            if len(outer_gt_lvs) < self.ctx.min_gt_lvs:
+                outie_below_min_counter += 1
+            if outer_gt_lvs: # Not empty
                 gt_ete.prune(list(outer_gt_lvs), preserve_branch_length=True)
                 outer_gts[g_idx] = SmrtTree(tree_obj=gt_ete)
 
-                if g_idx in debug_sample:
-                    self._debug_tree(f"Pruned Outer GT {g_idx}:", gt_ete)
+            if g_idx in debug_sample:
+                self._debug_tree(f"Pruned Outer GT {g_idx}:", gt_ete)
 
             # --- Inner Sub-problem (Hybrid Clade) ---
             gt_ete = source_gt.copy()
@@ -567,11 +568,11 @@ class FlowManager:
                 
                 # If copy_idx is an integer (0, 1, 2...), this node is pure for that specific copy
                 if copy_idx is not None:
-
-                #if node_is_pure.get(node, False):
-                    if len(node) >= self.ctx.min_gt_lvs:
-                        final_pure_lineages.append(node)
+                    if len(node) < self.ctx.min_gt_lvs:
+                        innie_below_min_counter += 1
                     # SUCCESS: We found the largest pure clade for this homoeolog. 
+                    # Nodes are guaranteed to have at least one leaf, and no overlaps
+                    final_pure_lineages.append(node)
                     # Do NOT add children to the stack; this skips the entire subtree.
                 else:
                     # Node is mixed (eg, contains H1 and H2, or outer leaves), so we must check its children
@@ -588,6 +589,13 @@ class FlowManager:
                 gt_split_dict[g_idx].append(innie_counter)
                 innie_counter += 1
 
+        # If all GTs of a given subproblem are below the minimum leaf cutoff, we discard them.
+        # Previously, we discarded individual GTs based on this, but it biases the reconciliation score because changes to signal balance.
+        if innie_below_min_counter >= len(inner_gts):
+            inner_gts = {}
+        if outie_below_min_counter >= len(outer_gts):
+            outer_gts = {}
+
         # --- Species Tree Surgery ---
 
         # Simply copy the subtree rooted at H1 for the Inner ST
@@ -598,30 +606,28 @@ class FlowManager:
         outer_st_obj = mt_wrapper.ete_tree.copy()
         # Re-locate nodes in the COPY
         h1_in_outer = outer_st_obj.search_nodes(name=h1_node.name)[0]
-        #h2_in_outer = outer_st_obj.search_nodes(name=h2_node.name)[0]
         hx_in_outer = [outer_st_obj.search_nodes(name=hx_node.name)[0] for hx_node in hx_nodes]
         self.logger.log(f"Removing hybrid clade ({h1_in_outer.name} and {', '.join(n.name for n in hx_in_outer)}) from Outer ST.", 'd')
-        outer_st_obj, trimmed_names = self._trim_outer(outer_st_obj, [h1_in_outer] + hx_in_outer)
+        outer_st_obj, tree_not_empty = self._trim_outer(outer_st_obj, [h1_in_outer] + hx_in_outer)
 
         self._debug_tree("Inner Species Tree (Hybrid Clade):", inner_st_obj)
-        self._debug_tree(f"Outer Species Tree (Backbone){' is empty' if not trimmed_names else ''}:", outer_st_obj)
+        self._debug_tree(f"Outer Species Tree (Backbone){' is empty' if not tree_not_empty else ''}:", outer_st_obj)
         self.logger.log(f'len(inner_gts)={len(inner_gts)}, len(outer_gts)={len(outer_gts)}', 'd')
 
         # --- Queue Tasks with Binary IDs ---
-        # Only queue tasks if species tree has enough leaves to be valid
         next_tasks = []
-        if len(outer_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(outer_gts) > 0 and trimmed_names:
+        if len(outer_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(outer_gts) > 0 and tree_not_empty:
             next_tasks.append((SmrtTree(tree_obj=outer_st_obj), outer_gts, f"{depth + 1}.{idx * 2}"))
         if len(inner_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(inner_gts) > 0:
             next_tasks.append((SmrtTree(tree_obj=inner_st_obj), inner_gts, f"{depth + 1}.{idx * 2 + 1}"))
         return next_tasks, gt_split_dict
 
     @staticmethod
-    def _trim_outer(tree_to_trim: Tree, h_nodes_to_trim: List[TreeNode]) -> Tuple[Tree, List[str]]:
+    def _trim_outer(tree_to_trim: Tree, h_nodes_to_trim: List[TreeNode]) -> Tuple[Tree, List[Optional[str]]]:
         """
         Safely removes both hybrid clades from the Outer Species Tree.
         Returns: (trimmed_tree, trimmed_names)
-        trimmed_names: List of names of the parents of the removed H nodes.
+        trimmed_names: List of names of the parents of the removed H nodes. Empty indicates an empty tree.
         trimmed_tree is modified in place! Must be returned for the special root case!
         """
         # Safely remove H nodes from Outer ST: detach leaf, then delete the resulting knuckle node
@@ -680,10 +686,10 @@ class FlowManager:
         self.logger.log(f"Reticulation found at Depth {depth}, Index {idx} with score {res.mt_score()}.", 'i')
         
         # 3. Extract Subproblems
-        try:
-            next_tasks, gt_split_dict = self.extract_subproblems(res, depth, idx)
-        except Exception as e:
-            self.logger.log(f"extracting subproblems at Depth {depth}, Index {idx}: {e}", 'e')
+        #try:
+        next_tasks, gt_split_dict = self.extract_subproblems(res, depth, idx)
+        #except Exception as e:
+        #    self.logger.log(f"extracting subproblems at Depth {depth}, Index {idx}: {e}", 'e')
 
         # Write gt_split_dict to a file
         gt_split_path = iter_out.parent / f"gt_splits.json"
