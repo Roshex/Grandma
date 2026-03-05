@@ -92,11 +92,14 @@ args = [
 results = main(args_list=args, return_objects=True)
 
 # Interact with the results
-final_tree = results["final_tree"]["silt"]
-final_mult = results["final_tree"]["mult"]
+final_tree = results["final_tree"]
 history = results["history"]
 
-print(f"Final Merged Tree: {final_tree.write(format=9)}")
+print(f"Final Merged Tree: {final_tree.to_mult_str(internals=False)}")
+print(f"Singly-labelled: {final_tree.ete_tree}")
+
+# Inspect reticulations in the network
+final_tree.to_rt().visualize()
 
 # Inspect the iterative history
 for task_id, event in history.items():
