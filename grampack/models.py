@@ -1,9 +1,9 @@
-from collections import defaultdict
 import math
 import array
-from functools import partial
 from pathlib import Path
+from functools import partial
 from ete3 import Tree, TreeNode
+from collections import defaultdict
 from typing import List, Dict, Optional, Tuple, Any, Set, Union
 from dataclasses import dataclass, field
 

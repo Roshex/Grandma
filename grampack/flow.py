@@ -125,7 +125,7 @@ class FlowManager:
             raise ValueError("Sister node not found.")
         return res
 
-    def _update_history(self, i: int, j: int, res: TaskResult, hold: bool = False) -> bool:
+    def update_history(self, i: int, j: int, res: TaskResult, hold: bool = False) -> bool:
         """
         Logs the input and best, or, if input is best, input and second-best
         MulTree data for history tracking.
@@ -426,7 +426,7 @@ class FlowManager:
         next_mt, suffix_name_map = self._rename_best_mt(res, nonin_idx, i, j)
 
         # Update history & check if passed cutoff
-        passed = self._update_history(i, j, res)
+        passed = self.update_history(i, j, res)
         if not passed:
             self.logger.log(f"Cutoff reached: no parsimonious events found at Iteration {i}.", 'i')
             # Returns the input tree, i.e. index 0 in the mt dict.
@@ -671,7 +671,7 @@ class FlowManager:
         depth, idx = (int(x) for x in bin_id.split('.')) if '.' in bin_id else (0, 0)
 
         # Update history & check if passed cutoff
-        passed = self._update_history(depth, idx, res)
+        passed = self.update_history(depth, idx, res)
         if not passed:
             self.logger.log(f"Cutoff reached: no parsimonious events found at Depth {depth}, Index {idx}.", 'i')
             return None # Event not taken!
