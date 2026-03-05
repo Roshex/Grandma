@@ -16,7 +16,7 @@ class FlowManager:
     def __init__(self, ctx: GlobalContext, mode: str, logger: GranLogger):
         self.ctx = ctx
         self.mode = mode
-        self.sample = self.set_sampling_func(5)
+        self.sample = self.set_sampling_func(2)
         self.logger = logger
         
     # --- Init Methods ---

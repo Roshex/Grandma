@@ -3,7 +3,6 @@ Replaces params.py and global_vars.py. Holds constants and configuration datacla
 Handles the input parsing logic from opt_parse.py and spec_tree.py
 '''
 
-from html import parser
 import re
 import os
 import ast
