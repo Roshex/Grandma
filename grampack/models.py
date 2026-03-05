@@ -1,9 +1,13 @@
+from collections import defaultdict
 import math
 import array
 from functools import partial
+from pathlib import Path
 from ete3 import Tree, TreeNode
-from typing import List, Dict, Optional, Tuple, Any, Set
+from typing import List, Dict, Optional, Tuple, Any, Set, Union
 from dataclasses import dataclass, field
+
+from Reticulate_Tree.reticulate_tree import ReticulateTree
 
 splitSpec = lambda raw: raw.split("_", 1)[-1] if "_" in raw else raw # raw.split("_")[-1]
 
@@ -333,71 +337,6 @@ class SmrtTree:
             if not hasattr(node, 'pure'):
                 node.add_feature('pure', node.name.replace("*", ""))
 
-    def _index_nodes_2(self, repair: bool = False, suffixed: bool = False):
-        """
-        Node attrutes:
-        name = original name, must be **unique** (hence, node_map), serves for outputs and
-            getting the node (also unique but doesn't pickle well)
-        spec = cleaned species name - not unique, no affixes, serves as the "biological" unit
-        reco = species name used for reconciliation, not unique, may be later suffixed:
-            original gt may have two copies of "x" (=spec/reco)
-            ofter first conciliation, they may become "x.1" and "x.2" (while spec remains "x")
-            after second conciliation, they may become "x.1.1" and "x.2.2", for example
-        r_id = registry ID for reco
-        u_id = registry ID for name (may be same as r_id before suffixing is applied)
-        """
-        import re
-
-        leaf_counts = {}
-        self.node_map = {}
-        i = 1
-        for n in self.ete_tree.traverse("postorder"):
-            if not n.is_leaf():
-                name = f"<{i}>"
-                i += 1
-                if not n.name:
-                    n.name = name
-                n.add_feature("reco", n.name)
-                n.add_feature("r_id", self.registry.get_id(n.name))
-                n.add_feature("u_id", self.registry.get_id(n.name)) # not sure if needed
-            else:
-                n.name = str(n.name).strip()
-                if "<" in n.name and ">" in n.name:
-                    raise ValueError(f"Leaf name {n.name} cannot contain '<' or '>' characters.")
-
-                name = n.name
-
-                if repair:
-                    # Ensure unique names
-                    # Names are prefixed with count only if duplicates exist
-                    # Zeroth copy gets a prefix in a retroactive manner
-                    if name in leaf_counts:
-                        dup_count = leaf_counts[name]
-                        if dup_count == 0:
-                            first_node = self.node_map.pop(name)
-                            first_node.name = f"0_{name}"
-                            self.node_map[first_node.name] = first_node
-                        leaf_counts[name] += 1
-                        n.name = f"{leaf_counts[name]}_{name}"
-                    else:
-                        leaf_counts[name] = 0
-                else:
-                    # Assume names are unique!
-                    pass
-                
-                reco = splitSpec(name)
-                n.add_feature("reco", reco)
-                n.add_feature("r_id", self.registry.get_id(reco))
-                n.add_feature("u_id", self.registry.get_id(n.name))
-
-                spec = re.sub(r'(\.\d+)+$', '', reco) if suffixed else reco
-                n.add_feature("spec", spec)
-                
-                if name in self.node_map:
-                    raise ValueError(f"Duplicate leaf name detected after processing: {name}")
-
-            self.node_map[n.name] = n
-
     def refresh(self):
         self._index_nodes()
         self.match_map = {}
@@ -429,8 +368,50 @@ class SmrtTree:
                 self.match_map.setdefault(node.pure, []).append(node)
         return self.match_map[name]
 
+    def rename_leaves_from_mapping(self, recon_map: 'Map', suffix_name_map: Dict[str, Set[str]]) -> None:
+        
+        rev_map = recon_map.rev # map_name -> List[names]
+
+        for suffix, target_set in suffix_name_map.items():
+            for target in target_set:
+                node_name_to_modify = rev_map.get(target, [])
+                for node_name in node_name_to_modify:
+                    n = self.get_node(node_name)
+                    if n.is_leaf():
+                        n.name = f"{n.name}|{suffix}"
+                        # node.pure stays the same, as it's used for matching and should not be suffixed
+                    # No need to modify internal nodes - Reconcile only works on lvs
+
+        # Must refresh after name modification
+        self.refresh()
+    
+    def _rename_node_no_reindex(self, old_name: str, new_name: str) -> None:
+        node = self.get_node(old_name)
+        node.name = new_name
+        self.purify_name(node, new_name)
+
+    def rename_node(self, old_name: str, new_name: str) -> None:
+        node = self.get_node(old_name)
+        self._rename_node_no_reindex(old_name, new_name)
+
+        # Update safely, by invalidating incorrect fields
+        del self.node_map[old_name]
+        self.node_map[new_name] = node
+        self.match_map = {}
+        self.flat_tree = None
+
     @staticmethod
-    def graft_subtree(tree: TreeNode, target: TreeNode, graft: TreeNode, name: str = None) -> TreeNode:
+    def purify_name(node: TreeNode, name: str):
+        pure = name.replace("*", "").split('|')[0]
+        if not hasattr(node, 'pure'):
+            node.add_feature('pure', pure)
+        else:
+            node.pure = pure
+        if not node.is_leaf() and not node.pure.endswith('>'):
+            node.pure += '>'
+    
+    @staticmethod
+    def graft_subtree(tree: TreeNode, target: TreeNode, graft: TreeNode, name: str) -> TreeNode:
         """
         Grafts `graft` on the branch leading to `p_node`.
         Modifies the tree in place, but return is needed because it might create a new root
@@ -441,132 +422,14 @@ class SmrtTree:
             new_root.add_child(target.detach())
             new_root.add_child(graft)
             tree = new_root
-            if name:
-                new_root.add_feature("pure", name.replace("*", ""))
+            SmrtTree.purify_name(new_root, name)
         else:
             new_internal = TreeNode(name=name)
             p_parent.add_child(new_internal)
             new_internal.add_child(target.detach())
             new_internal.add_child(graft)
-            if name:
-                new_internal.add_feature("pure", name.replace("*", ""))
+            SmrtTree.purify_name(new_internal, name)
         return tree
-    
-    def rename_marked_nodes(self, target_nodes: List[Set[TreeNode]], suffixes: List[str]) -> List[Set[str]]:
-        """
-        Suffix is added to the name of all nodes in target_nodes.
-        This is used to mark the Hx lineages after grafting.
-        """
-        marked_names = []
-        for inner_targets, suffix in zip(target_nodes, suffixes):
-            marked_set = set()
-            for node in inner_targets:
-                old_name = node.name
-                marked_set.add(old_name)
-
-                if old_name == '<P>':
-                    # P nodes of different iterations shouldn't have the same pure name! (hence no separator '|')
-                    self.rename_node('<P>', f'<P{suffix}>')
-
-                else:
-                    # Generate New Name
-                    # Leaves: "Species" -> "Species|1.0"
-                    # Internals: "<1>" -> "<1|1.0>"
-                    # Replace existing '*' with the new suffix
-                    # Handle cases if | is already present - we want to replace it.
-                    
-                    '''if '|' in old_name:
-                        old_sf = old_name.split('|')[1].split('*')[0]
-                        new_name = old_name.replace(f'|{old_sf}*', f"|{suffix}")
-                    else:
-                        new_name = old_name.replace('*', f"|{suffix}")'''
-                    
-                    # REPLACE WITH:
-                    new_name = old_name.replace('*', f"|{suffix}")
-
-                    # Apply Rename using Wrapper (handles node_map updates)
-                    self.rename_node(old_name, new_name)
-
-            marked_names.append(marked_set)
-
-        # Must refresh after name modification
-        self.refresh()
-        return marked_names
-
-    def rename_leaves_based_on_map_targets(self, map: 'Map', targets: List[Set[str]], suffixes: List[str]) -> None:#targets: List[str], suffix: str) -> None:
-        
-        rev_map = map.rev # map_name -> List[names]
-
-        for inner_targets, suffix in zip(targets, suffixes):
-            for target in inner_targets:
-                node_name_to_modify = rev_map.get(target, [])
-                for node_name in node_name_to_modify:
-                    n = self.get_node(node_name)
-                    if n.is_leaf():
-
-                        '''
-                        if '|' in n.name: n.name = n.name.split('|')[0]
-                        n.name = f"{n.name}|{suffix}"'''
-
-                        # REPLACE WITH:
-                        n.name = f"{n.name}|{suffix}"
-
-                        # node.pure stays the same, as it's used for matching and should not be suffixed
-                    # No need to modify internal nodes - Reconcile only works on lvs
-
-        '''
-        t = self.ete_tree
-        # Iterate leaves
-        for l in t.iter_leaves():
-            # Find to where this leaf is mapped in the map
-            # map.cor[leaf_name] returns List[node_names]
-            # We take the first mapping (usually only one for optimal recon)
-            target_name = map.cor[l.name][0]
-            if target_name in targets:
-                if '|' in l.name: l.name = l.name.split('|')[0]
-                l.name = f"{l.name}|{suffix}"
-                # l.pure stays the same!
-                '''
-
-        # Must refresh after name modification
-        self.refresh()
-    
-    def rename_node(self, old_name: str, new_name: str, tagged=False) -> None:
-        """
-        New name should be in pure form,
-        Old name is the current unique name in the tree, and should be tagged if tagged=True.
-        If old_name not found, does nothing.
-        """
-        node = self.get_node(old_name)
-        if not node:
-            return
-        
-        tag = ""
-        if tagged:
-            tag = new_name[-1]
-            if tag == '>':
-                tag = new_name[-2:-1]
-        if tag.isalnum():
-            raise ValueError(f"Tagged rename requires a non-alphanumeric tag at the end of the new name. Got '{tag}' in '{new_name}'.")
-
-        node.name = new_name[:-1]+tag+'>' if new_name.endswith(">") else new_name+tag
-
-        if not hasattr(node, 'pure'):
-            node.add_feature('pure', new_name.split('|')[0])
-            if not node.is_leaf() and not node.pure.endswith('>'):
-                node.pure += '>'
-        else:
-            node.pure = new_name.split('|')[0]
-            if not node.is_leaf() and not node.pure.endswith('>'):
-                node.pure += '>'
-        # doesn't work because p!=p
-
-        # Update node_map
-        del self.node_map[old_name]
-        self.node_map[new_name] = node
-        # Clear caches
-        self.match_map = {}
-        self.flat_tree = None
     
     @staticmethod
     def copy_lineage(subtree: TreeNode, tag: str = '') -> TreeNode:
@@ -582,69 +445,44 @@ class SmrtTree:
                 n.name = n.name.replace(">", f"{tag}>")
         return subtree
 
-    def to_mul_tree(self, h_node_label: str, p_node_label: str) -> Optional[Tuple['SmrtTree', TreeNode, TreeNode]]:
-        # [Existing to_mul_tree code remains identical]
-        # ... copy, graft logic ...
-        # Just ensure the returned SmrtTree is fresh
-        new_tree_obj = self.ete_tree.copy()
-        
-        h_matches = new_tree_obj.search_nodes(name=h_node_label)
-        p_matches = new_tree_obj.search_nodes(name=p_node_label)
-        
-        if not h_matches or not p_matches: return None, None, None
-        h1_node = h_matches[0]
-        p_node = p_matches[0]
-
-        if p_node in h1_node.iter_descendants(): return None, None, None
-
-        h2_subtree = SmrtTree.copy_lineage(h1_node, '*')
-
-        new_tree_obj = SmrtTree.graft_subtree(new_tree_obj, p_node, h2_subtree, '<P>')
-
-        new_smrt = SmrtTree(tree_obj=new_tree_obj)
-        return new_smrt, h1_node, h2_subtree # Note: returns objects in the new tree context
-
-
-
-    def to_mul_tree_multi(self, h1_name: str, hx_names: List[str]) -> Optional[Tuple['SmrtTree', TreeNode, List[TreeNode]]]:
+    def to_multi_mul_tree(self, h1_name: str, hx_names: List[str]) -> Optional[Tuple['SmrtTree', TreeNode, List[TreeNode]]]:
         """
         Grafts multiple H-lineages (H2, H3...) onto the H1 branch.
         Used for 'Model' mode to capture all nested copies at once.
         """
         new_tree_obj = self.ete_tree.copy()
         
-        # 1. Find H1 (The Stock)
+        # Find H1 (The Stock)
         h1_matches = new_tree_obj.search_nodes(name=h1_name)
         if not h1_matches: return None, None, []
         h1_node = h1_matches[0]
 
-        # 2. Process Hx targets (The Scions)
+        # Process Hx targets (The Scions)
         hx_nodes_final = []
         
-        # We use a tag generator: *, **, ***, ...
+        # Tag generator: *, **, ***, ...
         tags = ["*" * i for i in range(1, len(hx_names) + 1)]
 
-        for i, (h_name, tag) in enumerate(zip(hx_names, tags), start=2):
+        for h_name, tag in zip(hx_names, tags):
             # We must search by name in the *current* state of new_tree_obj
             # (Note: grafting changes the tree structure, but names persist)
             p_matches = new_tree_obj.search_nodes(name=h_name)
-            if not p_matches: continue
+            if not p_matches: raise ValueError(f"Target node '{h_name}' not found in the tree for grafting.") # was continue, but shouldn't it err?!
             p_node = p_matches[0]
 
             # Nesting check: Cannot graft a parent into a child
             if p_node in h1_node.iter_descendants(): continue
 
-            # Create the copy
-            # Note: We copy from H1 (the source of the introgression)
+            # Create the copy from H1 (the source of the introgression)
             h_copy = SmrtTree.copy_lineage(h1_node, tag)
 
-            # Graft
-            # We use a unique internal name for the graft point to avoid confusion
-            graft_name = f"<P{i}>"
+            # Graft with a unique internal name for the graft point
+            graft_name = f"<P{tag}>"
             new_tree_obj = SmrtTree.graft_subtree(new_tree_obj, p_node, h_copy, graft_name)
             
             hx_nodes_final.append(h_copy)
 
+        # Wrap the modified tree in a new SmrtTree object to re-index and refresh
         new_smrt = SmrtTree(tree_obj=new_tree_obj)
         
         # We must re-find H1 because the root might have changed during grafting
@@ -652,8 +490,18 @@ class SmrtTree:
         
         return new_smrt, h1_final, hx_nodes_final
 
-
     # --- I/O and Pickling ---
+
+    def write_forms(self, output_dir: Path):
+
+        out_silt = output_dir / "final_single_label_form.tre"
+        out_mult = output_dir / "final_multree.tre"
+        
+        with open(out_silt, 'w') as f:
+            f.write(self.ete_tree.write(format=8))
+
+        with open(out_mult, 'w') as f:
+            f.write(self.to_mult_str(internals=False))
 
     def to_mult_str(self, internals: bool=True) -> str:
         name_to_pure = {n.name: n.pure for n in self.ete_tree.traverse()}
@@ -714,6 +562,12 @@ class SmrtTree:
         
         return base_str[:-1] + root_name + ";"
 
+    def to_rt(self) -> ReticulateTree:
+        tree_copy = self.ete_tree.copy()
+        for n in tree_copy.traverse():
+            n.name = n.pure
+        return ReticulateTree(tree_copy)
+
     def get_node_order(self) -> List[str]:
         """
         Returns nodes in legacy GRAMPA order: 
@@ -734,16 +588,39 @@ class SmrtTree:
             
         #return self._node_order
 
-    def get_sis(self, node: Tree) -> Optional[Tree]:
-        """Returns the sister node of the given node"""
-        if node.is_root():
+    @staticmethod
+    def get_sis(node: Optional[Tree]) -> Optional[Tree]:
+        """Returns the sister node of the given node, or None if root."""
+        if not node or node.is_root():
             return None
-        parent = node.up
-        children = parent.get_children()
-        if len(children) != 2:
+        sisters = node.get_sisters()
+        if len(sisters) != 1:
             raise ValueError("Tree structure invalid for sister retrieval.")
-        sister = children[0] if children[1] == node else children[1]
-        return sister
+        return sisters[0]
+
+    def get_targets(self, primary: Union[str, Tree]) -> List[Tree]:
+        '''
+        Returns the list of all target nodes matching the pure name of a primary target.
+        '''
+        # if primary is a string, find the node first
+        if isinstance(primary, str):
+            primary = self.get_node(primary)
+
+        prim_name = primary.name
+        if '|' in prim_name:
+            pure_name = prim_name.split('|')[0]
+            if not primary.is_leaf():
+                pure_name += '>'
+        else:
+            pure_name = prim_name
+
+        if pure_name != primary.pure:
+            raise ValueError(f"Primary target's pure attribute '{primary.pure}' does not match expected pure name '{pure_name}'.")
+        
+        return self.match(pure_name)
+    
+    def copy(self) -> 'SmrtTree':
+        return SmrtTree(tree_obj=self.ete_tree.copy())
 
     def __getstate__(self):
         return self.ete_tree
@@ -883,6 +760,93 @@ class MulTree:
         if self.h1_node is None: return None
         return self.mt.get_sis(self.h1_node)
     
+    # A routine to init from a history event
+    @classmethod
+    def from_history_event(cls, event: Dict[str, Any]) -> 'MulTree':
+        tree = Tree(event['best_mt'], format=1)
+        tree_wrapper = SmrtTree(tree_obj=tree)
+        h_name = event['h_name']
+        return cls(
+            mt=tree_wrapper,
+            h_clade=event['h_leaves'],
+            h1_node=tree_wrapper.get_node(h_name),
+            hx_nodes=cls._get_starred_hx_nodes(tree_wrapper, event['h_locs'], h_name)
+        )
+
+    @staticmethod
+    def _get_starred_hx_nodes(tree_wrapper: SmrtTree, h_locs: List[str], h_name: str) -> List[TreeNode]:
+        hx_nodes = []
+        for i in range(1, len(h_locs)):
+            stars = '*' * i
+            if h_name.endswith('>'):
+                to_match = f"{h_name[:-1]}{stars}>"
+            else:
+                to_match = f"{h_name}{stars}"
+            h_node = tree_wrapper.get_node(to_match)
+            assert h_node == tree_wrapper.get_sis(tree_wrapper.get_node(h_locs[i])), f"Expected {to_match} to be sister of {h_locs[i]}"
+            hx_nodes.append(h_node)
+        return hx_nodes
+
+    def rename_marked_nodes(self, depth: int, copy_offset: int=0, skip_p_tag: bool=False) -> Dict[str, Set[str]]:
+        """
+        A suffix is added to the name of all *nodes* in a set of the mapping.
+        This is used to mark the Hx lineages after grafting.
+            Leaves:     Species*        -> Species|1.0
+                        Species|1.0**   -> Species|1.0|2.1
+            Internals:  <1*>            -> <1|1.0>
+                        <1|1.0*>        -> <1|1.0|2.0>
+            P nodes:    <P**>           -> <Pi|i.1> (e.g. <P1|1.1>)
+                        <P1|1.1*>       -> <P1|1.1|2.0>
+        Returns: A mapping from suffix to the set of original *names* that were suffixed.
+        """
+        # Note: in the current implementation, the sets are disjoint
+        # If this is no longer true, we should first build a renaming map,
+        # then, apply it in a second pass to avoid conflicts.
+
+        suffix_name_map = defaultdict(set)
+        for k, hx_node in enumerate(self.hx_nodes, 1):
+
+            parent = hx_node.up
+            x = parent.name.count('*')
+            stars = '*' * x
+            assert x == k, f"Expected {k} stars in parent name {parent.name} for hx_node {hx_node.name}, but found {x}."
+            assert parent.name.startswith(f"<P*"), f"Expected parent name of the form <P[*]>, but got {parent.name}"
+
+            # Generate suffixes for the multiple Hx case
+            # H2 gets i.1, H3 gets i.2, etc.
+            # This means that all modes have the same suffixing scheme
+            suffix = f"{depth}.{copy_offset+x}"
+
+            marked_set = set()
+
+            # Mark the <P> node
+            old_name = parent.name
+            marked_set.add(old_name)
+            # P nodes of different iterations can't have the same pure name!
+            # But, they also must have the same [i] if coming from the same iteration!
+            parent.pure = f"<P{depth}>" # No need to append or prepend, because <P[*]> is a fresh P node always!
+            if skip_p_tag:
+                parent.name = parent.pure
+            else:
+                parent.name = parent.pure[:-1] + f"|{suffix}>"
+
+            # Mark all other nodes in this H lineage copy
+            # Includes hx_node and descendants
+            for node in hx_node.traverse('postorder'):
+                old_name = node.name
+                marked_set.add(old_name)
+
+                new_name = old_name.replace(stars, f"|{suffix}")
+
+                # Apply Rename using Wrapper (handles node_map updates)
+                self.mt._rename_node_no_reindex(old_name, new_name)
+
+            suffix_name_map[suffix] = marked_set
+
+        # Must refresh after name modification
+        self.mt.refresh()
+        return suffix_name_map
+  
     # --- Sister Clade Logic ---
     # The static methods below only run on MTs / STs, that's why they are in MulTree and not SmrtTree, to avoid confusion about applicability.
     # For speed and pickling reasons, they are static and operate on the SmrtTree wrapper and use node names for lookups, rather than TreeNode objects which may become stale after grafting.

@@ -592,35 +592,6 @@ class MulTreeManager:
             
         return valid_count
 
-    def _find_all_targets(self, primary_h2: str) -> List[str]:
-        """
-        For 'Model' mode: Finds all nodes in the ST that belong to the same lineage as primary_h2.
-        Useful when ST is already a MUL-tree (e.g. Iteration > 0).
-        """
-        # 1. Identify the 'Pure' lineage name
-        # If input is 'Species|1.0', pure is 'Species'. 
-        # If input is 'Species', pure is 'Species'.
-        if '|' in primary_h2:
-            pure_name = primary_h2.split('|')[0]
-        else:
-            pure_name = primary_h2
-            
-        pure_name = pure_name.replace('*', '')
-
-        # 2. Find all matches in the current ST
-        matches = self.st.match(pure_name)
-        
-        # 3. Return their unique names
-        # We sort them to ensure deterministic behavior (Primary H2 usually comes first naturally or via sort)
-        target_names = sorted([n.name for n in matches])
-        
-        # Ensure the requested primary_h2 is in the list (it should be if logic is correct)
-        if primary_h2 not in target_names:
-            # Fallback for edge cases where .match() might behave differently on leaves vs internals
-            target_names.append(primary_h2)
-            
-        return target_names
-
 
 
     @staticmethod
@@ -828,7 +799,7 @@ class MulTreeManager:
         return h_nodes
 
     ### multi_H to debug the new builder
-    def build(self, optim: bool = False, nestedness: str ='ignore') -> dict:
+    def build(self, optim: bool = False, nesting: str ='ignore') -> dict:
         mul_trees = {}
         
         # --- GUIDED ITERATIVE INTERCEPT ---
@@ -949,30 +920,30 @@ class MulTreeManager:
                     if is_nested: continue # Skip this pair
 
                     # --- MODEL MODE LOGIC ---
-                    if nestedness == 'model':
+                    if nesting == 'model':
+                        ############
+                        # Important:
+                        # In this nesting mode, we don't to support both the inner-only and the inner-or-sister cases of autocompleting hybrid clades.
+                        # Why? Because both cases are already represented in the implementation below.
+                        # If a nested hybrid's H1 (which we do not check here) is sister to a previous hybrid, it can be inserted both
+                        # above and below itself - this covers both options!
+                        ############
                         if h2 in processed_targets: continue
-                        
-                        all_targets = self._find_all_targets(h2)
+
+                        matches = self.st.get_targets(h2)
+                        # Sort them to ensure deterministic behavior (Primary H2 usually comes first naturally or via sort)
+                        all_targets = sorted([n.name for n in matches])
                         processed_targets.update(all_targets)
                         
-                        mt_wrapper, h1_obj, hx_objs = self.st.to_mul_tree_multi(h1, all_targets)
-                        
-                        if mt_wrapper:
-                            mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, hx_nodes=hx_objs)
-                            mul_num += 1
-
-                    # --- STANDARD LOGIC (Rectify/Ignore) ---
+                        mt_wrapper, h1_obj, hx_objs = self.st.to_multi_mul_tree(h1, all_targets)
+                    # --- SIMPLE LOGIC (Rectify/Strict/Ignore) ---
                     else:
-                        mt_wrapper, h1_obj, h2_obj = self.st.to_mul_tree(h1, h2)
-                        if mt_wrapper:
-                            # Wrap single H2 in list for consistency
-                            mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, hx_nodes=[h2_obj])
-                            mul_num += 1
-                    
-                    """mt_wrapper, h1_obj, h2_obj = self.st.to_mul_tree(h1, h2)
+                        # Wrap single H2 in list for consistency
+                        mt_wrapper, h1_obj, hx_objs = self.st.to_multi_mul_tree(h1, [h2])
+
                     if mt_wrapper:
-                        mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, h2_obj)
-                        mul_num += 1"""
+                        mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, hx_nodes=hx_objs)
+                        mul_num += 1
 
             self.logger.report_step(step, f"Success: {mul_num-1} MUL-trees built")
             

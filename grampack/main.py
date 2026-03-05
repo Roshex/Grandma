@@ -83,7 +83,6 @@ def task_worker(payload: Tuple[Any, Any, str], context: GlobalContext, config: T
         binary_id=binary_id
     )
 
-
     # Create local GlobalContext (e.g., to override verbosity for workers)
     iter_ctx = context.update(verbosity=verbosity)
 
@@ -158,7 +157,7 @@ class Task:
             return None, {}
 
         # 2. Build MUL-Trees
-        self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(self.ctx.optim, self.ctx.nestedness)
+        self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(self.ctx.optim, self.ctx.nesting)
         #if tcf.mode == "build-mts": return None, {}
 
         if len(self.mul_trees) < 2:
@@ -262,25 +261,40 @@ class Engine:
         else:
             random.seed(self.ctx.seed)
 
-    def run(self):
+    def run(self) -> Optional[SmrtTree]:
         final_res = None
         
         # Init FlowManager for any iterative mode
         if self.tcf.mode in ["full", "split", "mixed"] and not self.ctx.norun:
             self.flow_mgr = FlowManager(self.ctx, self.tcf.mode, self.flow_logger)
 
+        final_res = None
         if self.tcf.mode == "mixed":
             final_res = self.run_mixed()
         elif self.tcf.mode == "full":
-            final_res = self.run_full()
+            final_res, _ = self.run_full()
         elif self.tcf.mode == "split":
             final_res = self.run_split()
         else:
-            final_res = Task(self.ctx, self.flow_logger).execute(self.tcf)
-            
-        return final_res
+            step_res, _ = Task(self.ctx, self.flow_logger).execute(self.tcf)
+            # Extract best SmrtTree if applicable
+            if step_res and step_res.mt_idx() is not None:
+                final_res = step_res.mul_trees[step_res.mt_idx()].mt
 
-    def run_mixed(self):
+        rt = None
+        if final_res:
+            final_res.write_forms(self.ctx.root_dir)
+            self.flow_logger.log("Singly- and multi-labelled forms of the final tree written to output directory.", 'i')
+            rt = final_res.to_rt()
+            if self.ctx.debug:
+                # Visualize with reticulate tree's built-in function (requires matplotlib)
+                rt.visualize(filename=self.ctx.root_dir / "final_tree.png", launch=False)
+                self.flow_logger.log(f"Final tree visualization saved.", 'i')
+            self.flow_logger.log("Final tree ASCII representation:\n" + final_res.ete_tree.get_ascii(show_internal=True), 'i')
+            
+        return final_res, rt
+
+    def run_mixed(self) -> SmrtTree:
         """
         Executes Full mode until iteration N, then switches to Split mode.
         """
@@ -291,18 +305,18 @@ class Engine:
         # Run Full Mode up to switch point
         last_st, last_gts = self.run_full(limit_override=full_limit)
         
-        if not last_st:
+        if not last_gts:
             self.flow_logger.log("Full Mode terminated before reaching switch point. Split Mode will not be executed.", 'i')
-            return
+            return last_st
         self.flow_logger.log(f"Switching to Split Mode at iteration {full_limit}.", 'i')
         
         # Prepare the root task for split mode. 
         # The ID is simply the iteration number (e.g., "5"), representing depth 5, index 0 effectively.
         # Split logic expects "Depth.Index": since we ran linear 0..4, the next depth is 5 (and index 0).
         root_id = f"{full_limit}.0"
-        self.run_split(initial_payload=(last_st, last_gts, root_id))
+        return self.run_split(initial_payload=(last_st, last_gts, root_id))
         
-    def run_full(self, limit_override: int = None) -> Tuple[Optional[SmrtTree], Optional[Dict[int, SmrtTree]]]:
+    def run_full(self, limit_override: int = None) -> Tuple[SmrtTree, Optional[Dict[int, SmrtTree]]]:
         """
         Iterative mode. Returns final (st, gts) if limit reached, or (None, None) if finished naturally.
         """
@@ -360,12 +374,14 @@ class Engine:
                     iter_logger = iter_logger,
                 )
 
+                # Save for return even if breaking (e.g. if no events found, get ST)
+                current_st = next_mt.mt
                 if not next_gts:
                     self.flow_logger.log(f"No further events found. Terminating at iteration {i}.", 'i')
                     break
 
                 i += 1
-                current_st, current_gts = next_mt.mt, next_gts
+                current_gts = next_gts
                 
         except KeyboardInterrupt:
             self.flow_logger.log("Interrupted by user.", 'i')
@@ -373,7 +389,7 @@ class Engine:
         if self.ctx.plot: self.flow_mgr.plot()
         
         self.flow_logger.log("Fully Sequential Mode Finished.", 'i')
-        return None, None # Natural finish
+        return current_st, None # Natural finish
 
     def _run_nested_subproblem(self, mem_st: SmrtTree, mem_gts: Dict[int, SmrtTree], h1_str: str, h2_str: str, fix_dir: Path) -> TaskResult:
         """Helper to run a constrained nested fix run."""
@@ -393,7 +409,7 @@ class Engine:
         
         return Task(fix_ctx, logger=None).execute(fix_tcf)
     
-    def run_split(self, initial_payload: Tuple = None):
+    def run_split(self, initial_payload: Tuple = None) -> SmrtTree:
         """
         Binary Split Mode:
         Executes sub-problems in parallel where possible.
@@ -546,11 +562,12 @@ class Engine:
             current_tasks = next_tasks
             depth += 1
 
-        self.flow_mgr.glue_split_results()
+        final_tree = self.flow_mgr.glue_split_results()
 
         if self.ctx.plot: self.flow_mgr.plot()
 
         self.flow_logger.log("Binary Split Mode Finished.", 'i')
+        return final_tree
 
 def main(args_list: Optional[List[str]] = None, return_results: bool = False) -> Optional[dict]:
     """

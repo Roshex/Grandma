@@ -3,6 +3,7 @@ Replaces params.py and global_vars.py. Holds constants and configuration datacla
 Handles the input parsing logic from opt_parse.py and spec_tree.py
 '''
 
+from html import parser
 import re
 import os
 import ast
@@ -32,7 +33,7 @@ class GranMetadata:
     github: str = "https://github.com/Roshex/Grandma"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "3.0.4"
+    version: str = "3.0.5"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -51,7 +52,6 @@ class GlobalContext:
     """
     # System Resources
     num_processes: int = 1
-    max_memory: Optional[int] = None # in bytes, None for unlimited
     verbosity: int = 3
     seed: int = 42
     
@@ -67,10 +67,12 @@ class GlobalContext:
     max_iter: Union[int, float] = 0
     mixed_switch: int = 0
     cutoff: Tuple[str, Optional[Union[int, float]]] = ("auto", None)
-    nestedness: str = "rectify" # ignore_nesting: bool = False -> ignore (False), rectify (True), model (New)
-    nest_in_only: bool = False
-    min_st_lvs: int = 1 # for split mode
-    min_gt_lvs: int = 2 # for split mode
+    # For full mode
+    # replaces ignore_nesting: bool = False -> ignore (False), rectify (True), strict_rectify (New), model (New)
+    nesting: str = "model"
+    # For split mode
+    min_st_lvs: int = 1 
+    min_gt_lvs: int = 2
       
     # Paths that define the "Session"
     root_dir: Path = field(default_factory=lambda: Path(get_default_outdir()))
@@ -91,8 +93,8 @@ class GlobalContext:
         Validates that keys exist to prevent silent errors.
         """
         # Certain fields should not be allowed to be changed
-        forbidden_keys = {"seed", "plot", "norun", "nolog", "orth_opt", "max_iter",
-        "nestedness", "nest_in_only", "mixed_switch", "min_gt_lvs", "min_st_lvs",
+        forbidden_keys = {"seed", "plot", "norun", "nolog", "orth_opt",
+        "max_iter", "nesting", "mixed_switch", "min_gt_lvs", "min_st_lvs",
         "root_dir", "log_file", "history", "start_pt"}
         # Safety check to ensure we aren't inventing new fields
         valid_fields = {f.name for f in fields(self)}
@@ -457,9 +459,6 @@ class InitParser:
         g_general.add_argument("-v", "--verbosity", type=int, default=2, choices=range(5),
             help="Level of verbosity printed to the screen. 0 = none; 1 = run info; 2 = standard; "
                  "3 = debug; 4 = verbose debugging. Default = 2.")
-        g_general.add_argument("--mem", type=str, default="auto",
-            help="Max RAM usage (e.g., '4G', '500M', '80%'). Limits parallel workers if exceeded. Default = 'auto'. "
-                 "Not implemented yet.")
 
         # --- Algorithmic Options ---
         g_algo = self.parser.add_argument_group("Algorithmic Options")
@@ -485,14 +484,12 @@ class InitParser:
         g_algo.add_argument("--min_gt_lvs", type=int, default=2,
             help="Minimum gene trees leaves per tree for a gene tree to be considered valid. Specifically relevant for "
                  "the split mode. Default: 2.")
-        g_algo.add_argument('--nestedness', type=str, choices=['ignore', 'i', 'rectify', 'r', 'model', 'm'], default='rectify',
+        g_algo.add_argument('--nesting', type=str, choices=['ignore', 'i', 'rectify', 'r', 'model', 'm', 'strict_rectify', 's'], default='model',
             help="Behavior for nested hybridization events treatment during the full and mixed modes. "
-                 "(i)gnore: Do nothing [ignore nesting]. "
-                 "(r)ectify: Autocorrect nested events between iterations [default]. "
-                 "(m)odel: Model nested copies during MT creation [computationally expensive].")
-        g_algo.add_argument('--nest-in-only', dest='nest_in_only', action='store_true',
-            help="If set, only consider internally nested events when tracing missing subgenomes. Default is to "
-            "consider a sister relationship as nested, too. Only relevant if --nestedness is set to 'rectify' or 'model'.")
+                 "(i)gnore: Do nothing, ignore nesting scenarios. "
+                 "(r)ectify: Autocorrect nested events between iterations, including via sister relationships [default]. "
+                 "(s)trict_rectify: Rectify, but only consider internally nested events when tracing missing subgenomes. "
+                 "(m)odel: Model nested copies during MT creation. Computationally heaviest, but most exact.")
         
         g_algo.add_argument('--optim', dest='optim', action='store_true',
             help="If set, will run alternative algorithms for [1.] MT construction and [2.] reconciliation: " 
@@ -529,6 +526,8 @@ class InitParser:
 
         # --- Output Options ---
         g_output = self.parser.add_argument_group("Output Options")
+        g_output.add_argument("--generate", type=str, metavar="JSON_CONFIG",
+            help="Path to JSON configuration file. Enters Generation Mode (ignores other flags).")
         g_output.add_argument("--maps", nargs='?', const=1, default=0, type=int,
             help="If set, the detailed output file will contain node mappings for each gene tree to the lowest "
                  "scoring MUL-tree. Specify number to retreive for multiple lowest MTs (default if present: 1, all: -1).")
@@ -625,43 +624,13 @@ class InitParser:
         return m, mixed_switch
 
     @staticmethod
-    def resolve_nestedness(val: str) -> str:
+    def resolve_nesting(val: str) -> str:
         if val in ['ignore', 'i']: return 'ignore'
         if val in ['rectify', 'r']: return 'rectify'
+        if val in ['strict_rectify', 's']: return 'strict_rectify'
         if val in ['model', 'm']: return 'model'
         return 'rectify'
         
-    @staticmethod
-    def _parse_mem(mem_str: str) -> Optional[int]:
-        """
-        Parses strings like '4G', '500M', '80%' into bytes.
-        Returns None if input is invalid or 'auto'.
-        """
-        if not mem_str or mem_str.lower() == "auto":
-            return None
-            
-        mem_str = mem_str.upper().strip()
-        
-        # Handle Percentage (e.g., "80%")
-        if "%" in mem_str:
-            try:
-                import psutil
-                pct = float(mem_str.replace("%", "")) / 100.0
-                total = psutil.virtual_memory().total
-                return int(total * pct)
-            except ImportError:
-                return None
-
-        # Handle Units
-        units = {'G': 1024**3, 'M': 1024**2, 'K': 1024, 'B': 1}
-        match = re.match(r"^(\d+(?:\.\d+)?)([GMKB])?$", mem_str)
-        if match:
-            val = float(match.group(1))
-            unit = match.group(2) or 'B'
-            return int(val * units[unit])
-            
-        return None
-
     def plot_and_exit(self):
         # plot hardcoded data here for convinience of testing
 
@@ -943,7 +912,7 @@ class InitParser:
         Parses arguments and returns strictly typed configuration objects.
         """
         args = self.parser.parse_args(args_)
-
+        
         #self.plot_and_exit()
         
         # --- Setup Environment and Banner ---
@@ -953,6 +922,30 @@ class InitParser:
         
         log_file = out_dir / f"{args.prefix}.log"
         self.logger = GranLogger(log_file=log_file, verbosity=args.verbosity, no_log=args.nolog, debug=args.debug)
+
+        # --- GENERATION MODE INTERCEPT ---
+        if args.generate:
+            from .generator import DatasetGenerator
+            
+            if not args.spec_input:
+                # We reuse the -s flag for the base species tree
+                self.logger.log("Generation mode requires a base species tree template via -s.", 'e')
+                
+            if not os.path.exists(args.generate):
+                self.logger.log(f"Generator requires a valid JSON configuration file. Not found: {args.generate}", 'e')
+            
+            generator = DatasetGenerator(args, out_dir, self.logger)
+            
+            try:
+                generator.run()
+                print("Generation complete.")
+            except Exception as e:
+                print(f"Generation failed: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            import sys  
+            sys.exit(0)
 
         self.logger.log_software_banner(GranMetadata())
         self.logger.log("=" * 73, 'i')
@@ -982,7 +975,7 @@ class InitParser:
         }
         mode, mixed_switch = self.resolve_mode_logic(args.mode, legacy_flags)"""
 
-        nestedness = self.resolve_nestedness(args.nestedness)
+        nesting = self.resolve_nesting(args.nesting)
 
         # Handle folder deletion and history loading BEFORE the engine starts
         start = args.start if args.start == 'auto' else int(args.start)
@@ -1038,7 +1031,6 @@ class InitParser:
         # --- Build Global Context ---
         ctx = GlobalContext(
             num_processes = n_procs,
-            max_memory    = self._parse_mem(args.mem),
             verbosity     = args.verbosity,
             seed          = args.seed,
             plot          = args.plot,
@@ -1050,9 +1042,7 @@ class InitParser:
             max_iter      = check_loop_length(args.iter, i, None, history, self.logger),
             mixed_switch  = mixed_switch,
             cutoff        = self.parse_cutoff(args.cutoff),
-            #ignore_nesting= args.ignore_nesting,
-            nestedness    = nestedness,
-            nest_in_only  = args.nest_in_only,
+            nesting       = nesting,
             min_gt_lvs    = args.min_gt_lvs,
             min_st_lvs    = args.min_st_lvs,
             root_dir      = out_dir,

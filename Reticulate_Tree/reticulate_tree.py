@@ -592,7 +592,117 @@ class ReticulateTree:
     def __str__(self):
         return self.tree_str
     
-    def visualize(self, filename=None, uid_labeled=False):
+    def visualize(self, filename=None, uid_labeled=False, launch=True):
+
+
+        G = self.dag
+        depths = self.compute_depths(G)
+        max_depth = max(depths.values()) if depths else 0
+
+        # Group nodes by layer
+        layers = defaultdict(list)
+        for node, d in depths.items():
+            layers[d].append(node)
+
+        # ---------------------------------------------------------
+        # BREADTH SORTING (Barycenter Heuristic for Crossing Min.)
+        # ---------------------------------------------------------
+        # 1. Assign initial arbitrary X coordinates
+        x_coords = {}
+        for d, nodes in layers.items():
+            for i, n in enumerate(nodes):
+                x_coords[n] = i
+
+        # 2. Sweep top-down and bottom-up to untangle edges
+        for _ in range(5):  # 5 sweeps is usually enough to converge
+            # Top-down sweep
+            for d in range(1, max_depth + 1):
+                if d not in layers: continue
+                def parent_avg_x(n):
+                    preds = list(G.predecessors(n))
+                    if not preds: return x_coords[n]
+                    return sum(x_coords[p] for p in preds) / len(preds)
+                
+                layers[d].sort(key=parent_avg_x)
+                for i, n in enumerate(layers[d]):
+                    x_coords[n] = i
+                    
+            # Bottom-up sweep
+            for d in range(max_depth - 1, -1, -1):
+                if d not in layers: continue
+                def child_avg_x(n):
+                    succs = list(G.successors(n))
+                    if not succs: return x_coords[n]
+                    return sum(x_coords[c] for c in succs) / len(succs)
+                
+                layers[d].sort(key=child_avg_x)
+                for i, n in enumerate(layers[d]):
+                    x_coords[n] = i
+
+        # 3. Final Coordinate Assignment (Center the layers)
+        pos = {}
+        for d, nodes in layers.items():
+            width = len(nodes)
+            offset = (width - 1) / 2.0
+            for i, n in enumerate(nodes):
+                # X is centered, Y is inverted so the root (depth 0) is at the top
+                pos[n] = (i - offset, -d)
+
+        # ---------------------------------------------------------
+        # DRAWING
+        # ---------------------------------------------------------
+        node_colors = []
+        node_shapes = {}
+        for node in G.nodes():
+            if self.is_reticulation_node(G, node):
+                node_shapes[node] = 'D'
+                node_colors.append('orange')
+            elif G.out_degree(node) == 0:
+                node_shapes[node] = 'o'
+                node_colors.append('lightgreen')
+            else:
+                node_shapes[node] = 'o'
+                node_colors.append('lightblue')
+
+        # Draw Edges FIRST (zorder=1) with a slight curve to avoid node collision
+        nx.draw_networkx_edges(
+            G, pos, 
+            arrows=True, 
+            connectionstyle="arc3,rad=0.1", # Curve edges
+            node_size=1000,                 # Stop arrows exactly at node border
+            #zorder=1                        # Keep underneath nodes
+        )
+
+        # Draw Nodes SECOND (zorder=2) so they sit perfectly on top
+        for shape in set(node_shapes.values()):
+            shaped_nodes = [n for n in G.nodes if node_shapes[n] == shape]
+            nx.draw_networkx_nodes(
+                G, pos, nodelist=shaped_nodes,
+                node_shape=shape,
+                node_color=[node_colors[list(G.nodes).index(n)] for n in shaped_nodes],
+                node_size=1000,
+                #zorder=2
+            )
+
+        # Labels
+        labels = {}
+        for n, d in G.nodes(data=True):
+            label = d.get('label', None)
+            labels[n] = str(n) if uid_labeled and label == '' else label
+            
+        nx.draw_networkx_labels(G, pos, labels=labels, font_size=10)#, zorder=3)
+
+        plt.axis('off')
+        plt.tight_layout()
+        if filename:
+            plt.savefig(filename, dpi=690)
+            print(f'Graph saved to {filename}')
+        if launch:
+            plt.show()
+        else:
+            plt.close()
+
+    def visualize2(self, filename=None, uid_labeled=False, launch=True):
         G = self.dag
         depths = self.compute_depths(G)
 
@@ -639,7 +749,10 @@ class ReticulateTree:
         if filename:
             plt.savefig(filename, dpi=690)
             print(f'Graph saved to {filename}')
-        plt.show()
+        if launch:
+            plt.show()
+        else:
+            plt.close()
 
     def interact(self, filename, uid_labeled=False, launch=True):
         '''
