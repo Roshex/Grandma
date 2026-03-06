@@ -21,10 +21,13 @@ class NameRegistry:
         self._int_to_str: List[str] = []
     
     def get_id(self, name: str) -> int:
-        if name not in self._str_to_int:
-            self._str_to_int[name] = len(self._int_to_str)
+        try:
+            return self._str_to_int[name]
+        except KeyError:
+            idx = len(self._int_to_str)
+            self._str_to_int[name] = idx
             self._int_to_str.append(name)
-        return self._str_to_int[name]
+            return idx
     
     def get_ids(self, names: List[str]) -> List[int]:
         return [self.get_id(name) for name in names]
@@ -69,6 +72,7 @@ class FlatTree:
     euler_tour: array.array   # Sequence of nodes visited in DFS
     depths: array.array       # Depth of nodes in Euler Tour
     first_visit: array.array  # Index in euler_tour where node u is first seen
+    node_depths: array.array
     
     # --- Fields with defaults must come LAST ---
     name_id_to_node_id: Dict[int, int] = field(default_factory=dict)
@@ -190,6 +194,7 @@ class TreeLinearizer:
         euler_nodes = array.array('i')
         euler_depths = array.array('i')
         first_visit = array.array('i', [-1] * num_nodes)
+        node_depths = array.array('i', [0] * num_nodes)
         
         # Optimized Stack: (node_id, depth, child_ptr_start, child_ptr_end)
         # Storing 'end' in the stack avoids array lookups inside the loop
@@ -217,6 +222,7 @@ class TreeLinearizer:
                 first_visit[v] = len(euler_nodes)
                 euler_nodes.append(v)
                 euler_depths.append(d + 1)
+                node_depths[v] = d + 1
             else:
                 # Backtrack
                 stack.pop()
@@ -255,6 +261,7 @@ class TreeLinearizer:
             euler_tour=euler_nodes,
             depths=euler_depths,
             first_visit=first_visit,
+            node_depths=node_depths,
             # Defaults last
             name_id_to_node_id=name_id_to_node_id,
             node_id_to_name_id=node_id_to_name_id,
@@ -334,8 +341,7 @@ class SmrtTree:
             self.node_map[node.name] = node
 
         for node in self.ete_tree.traverse("postorder"):
-            if not hasattr(node, 'pure'):
-                node.add_feature('pure', node.name.replace("*", ""))
+            self.add_pure(node)
 
     def refresh(self):
         self._index_nodes()
@@ -388,7 +394,6 @@ class SmrtTree:
     def _rename_node_no_reindex(self, old_name: str, new_name: str) -> None:
         node = self.get_node(old_name)
         node.name = new_name
-        self.purify_name(node, new_name)
 
     def rename_node(self, old_name: str, new_name: str) -> None:
         node = self.get_node(old_name)
@@ -401,14 +406,16 @@ class SmrtTree:
         self.flat_tree = None
 
     @staticmethod
-    def purify_name(node: TreeNode, name: str):
-        pure = name.replace("*", "").split('|')[0]
+    def add_pure(node: TreeNode):
+        """
+        Adds a 'pure' attribute to new nodes.
+        Does not modify existing pure attributes - only <P> nodes should modify pure names, and do it manually.
+        """
         if not hasattr(node, 'pure'):
+            pure = node.name.replace("*", "").split('|')[0]
+            if not node.is_leaf() and not pure.endswith('>'):
+                pure += '>'
             node.add_feature('pure', pure)
-        else:
-            node.pure = pure
-        if not node.is_leaf() and not node.pure.endswith('>'):
-            node.pure += '>'
     
     @staticmethod
     def graft_subtree(tree: TreeNode, target: TreeNode, graft: TreeNode, name: str) -> TreeNode:
@@ -422,13 +429,11 @@ class SmrtTree:
             new_root.add_child(target.detach())
             new_root.add_child(graft)
             tree = new_root
-            SmrtTree.purify_name(new_root, name)
         else:
             new_internal = TreeNode(name=name)
             p_parent.add_child(new_internal)
             new_internal.add_child(target.detach())
             new_internal.add_child(graft)
-            SmrtTree.purify_name(new_internal, name)
         return tree
     
     @staticmethod

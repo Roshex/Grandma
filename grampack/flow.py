@@ -601,7 +601,7 @@ class FlowManager:
         h1_in_outer = outer_st_obj.search_nodes(name=h1_node.name)[0]
         hx_in_outer = [outer_st_obj.search_nodes(name=hx_node.name)[0] for hx_node in hx_nodes]
         self.logger.log(f"Removing hybrid clade ({h1_in_outer.name} and {', '.join(n.name for n in hx_in_outer)}) from Outer ST.", 'd')
-        outer_st_obj, tree_not_empty = self._trim_outer(outer_st_obj, [h1_in_outer] + hx_in_outer)
+        outer_st_obj, tree_not_empty = self._trim_tree_lineages(outer_st_obj, [h1_in_outer] + hx_in_outer)
 
         self._debug_tree("Inner Species Tree (Hybrid Clade):", inner_st_obj)
         self._debug_tree(f"Outer Species Tree (Backbone){' is empty' if not tree_not_empty else ''}:", outer_st_obj)
@@ -616,16 +616,16 @@ class FlowManager:
         return next_tasks, gt_split_dict
 
     @staticmethod
-    def _trim_outer(tree_to_trim: Tree, h_nodes_to_trim: List[TreeNode]) -> Tuple[Tree, List[Optional[str]]]:
+    def _trim_tree_lineages(tree_to_trim: Tree, nodes_to_trim: List[TreeNode]) -> Tuple[Tree, List[Optional[str]]]:
         """
-        Safely removes both hybrid clades from the Outer Species Tree.
+        Safely removes clades from the tree, generally used for the Outer Species Tree.
         Returns: (trimmed_tree, trimmed_names)
         trimmed_names: List of names of the parents of the removed H nodes. Empty indicates an empty tree.
         trimmed_tree is modified in place! Must be returned for the special root case!
         """
         # Safely remove H nodes from Outer ST: detach leaf, then delete the resulting knuckle node
         trimmed_names = []
-        for n in h_nodes_to_trim:
+        for n in nodes_to_trim:
             n_up = n.up # Save parent before detaching
             if n_up is None:
                 return Tree(), [] # Special case: if H node is root, we return an empty tree to indicate no valid outer tree
@@ -778,7 +778,7 @@ class FlowManager:
                 results[task_id] = None
                 continue
 
-            # --- STEP 1: Dive to children (Post-order traversal) ---
+            # --- Dive to children (Post-order traversal) ---
             # Outer child: (depth+1, idx*2)
             # Inner child: (depth+1, idx*2 + 1)
             depth, idx = task_id
@@ -803,10 +803,11 @@ class FlowManager:
             if outer_id in results: del results[outer_id]
             if inner_id in results: del results[inner_id]
 
-            self.logger.log(f"Glue {task_id}: Subproblems returned.", 'd')
+            self.logger.log(f"Glue {task_id}: Subproblems retrieved.", 'd')
 
-            # Load "Base State" for this node in the recursion tree of gluing, from the history event.
-            # Uses 'best_mt' with format=1
+            # --- Load Current Tree and Graft Locations for Terminal Subproblem ---
+
+            # Uses the 'best_mt' with format=1
             current_mt = MulTree.from_history_event(event)
 
             # Account for autopolyploidy
@@ -836,6 +837,7 @@ class FlowManager:
                 self.logger.log(f"Glue {task_id}: No Inner results for task. Retrieved from Current tree using H loc: {locs[0]}.", 'd')
                 current_mt.rename_marked_nodes(uid, skip_p_tag=True)
 
+            # inner_tree_wrapper = SmrtTree(tree_obj=inner_tree) # Not needed since we index at the end
             self._debug_tree(f"Inner Result Tree for Task {task_id}:", inner_tree, other_attr=['H', 'pure'])
 
             trimmed_names = []
@@ -846,15 +848,15 @@ class FlowManager:
                     sister = current_mt.mt.get_sis(node)
                     nodes_to_detach.append(sister)
                 outer_tree = current_mt.mt.ete_tree # Modified in place, but no need to copy - not used later
-                outer_tree, trimmed_names = self._trim_outer(outer_tree, nodes_to_detach)
+                outer_tree, trimmed_names = self._trim_tree_lineages(outer_tree, nodes_to_detach)
                 self.logger.log(f"Glue {task_id}: No Outer results for task. Retrieved from Current tree by removing {trimmed_names} nodes & {[n.name for n in nodes_to_detach]} H locs.", 'd')
 
+            outer_tree_wrapper = SmrtTree(tree_obj=outer_tree) # Re-index and re-wrap after trimming, to ensure .match() works correctly with the modified topology
             self._debug_tree(f"Outer Result Tree for Task {task_id}:", outer_tree, other_attr=['H', 'pure'])
 
-            outer_tree_wrapper = SmrtTree(tree_obj=outer_tree) # Index
-            # inner_tree_wrapper = SmrtTree(tree_obj=inner_tree) # Not needed since we index at the end
+            # --- Location Expansion and Grafting Logic ---
 
-            # Expand graft locations
+            # Expand locations
             expanded_locs = {}
             redupl_loc = {}
             for i, loc in enumerate(locs):
@@ -870,7 +872,7 @@ class FlowManager:
 
             self._merge_sister_locs(expanded_locs, outer_tree, task_id)
 
-            # --- Grafting and renaming logic ---
+            # Graft with correct tagging
             flag = False
             for loc, targets in expanded_locs.items():
                 self.logger.log(f"Glue {task_id}: Grafting Inner tree to Outer tree at targets for {loc}: {[t.name for t in targets]}.", 'd')
@@ -890,7 +892,7 @@ class FlowManager:
                         # This is an internal node for sure
                         new_name = parent_tag[:-1] + suffix + '>'
 
-                        # Copy the graft and apply the tag suffix immediately
+                        # Copy the graft and apply the tag suffix
                         graft = SmrtTree.copy_lineage(inner_tree, suffix)
 
                         # Graft subtree into the outer tree
@@ -905,7 +907,7 @@ class FlowManager:
                         self.logger.log(f"Glue {task_id}: Location {loc} matched previous <P[*]> node. Grafting will be repeated there.", 'd')
                     redupl_loc[loc] = False
 
-            SmrtTree(tree_obj=outer_tree)
+            SmrtTree(tree_obj=outer_tree) # Purify names
             self._debug_tree(f"Post-Graft Tree for Task {task_id}:", outer_tree, other_attr=['H', 'pure'])
 
             results[task_id] = outer_tree

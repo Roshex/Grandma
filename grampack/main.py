@@ -282,7 +282,6 @@ class Engine:
                 final_res = step_res.mul_trees[step_res.mt_idx()].mt
                 self.flow_mgr.update_history(0, 0, step_res)
 
-        history = self.flow_mgr.history if self.flow_mgr else None
         if final_res:
             final_res.write_forms(self.ctx.root_dir)
             self.flow_logger.log("Singly- and multi-labelled forms of the final tree written to output directory.", 'i')
@@ -295,7 +294,7 @@ class Engine:
 
         return_obj = {
             'final_tree': final_res,
-            'history': history,
+            'history': self.ctx.history,
             'maps': None # to be supported later
         }
             

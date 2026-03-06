@@ -10,6 +10,8 @@ from .config import TaskConfig
 from .logger import GranLogger
 from .models import SmrtTree, MulTree, GroupData, Map, ReconResult, TaskResult, FlatTree, NameRegistry
 
+DEFAULT_TARGET = [0]
+
 def _worker_reconcile_single(
     mul_item: Tuple[int, FlatTree],
     flat_gts: Dict[int, FlatTree],
@@ -191,10 +193,10 @@ class Reconciler:
                 if retmap: node_dups[u] = 1
             elif retmap:
                 node_dups[u] = 0
-            
-            d_lca = st.depths[st.first_visit[m_lca]]
-            d_c1 = st.depths[st.first_visit[m1]]
-            d_c2 = st.depths[st.first_visit[m2]]
+
+            d_lca = st.node_depths[m_lca]
+            d_c1 = st.node_depths[m1]
+            d_c2 = st.node_depths[m2]    
             
             loss1 = (d_c1 - d_lca - 1) + is_dup 
             loss2 = (d_c2 - d_lca - 1) + is_dup
@@ -214,7 +216,7 @@ class Reconciler:
         root_id = gt.postorder[-1]
         if root_id in lca_maps:
             map_root = lca_maps[root_id]
-            root_depth = st.depths[st.first_visit[map_root]]
+            root_depth = st.node_depths[map_root]
             if root_depth > 0:
                 score += (loss_cost * root_depth)
                 if retmap: node_losses[root_id] += root_depth
@@ -323,9 +325,9 @@ class Reconciler:
                 is_dup = 1
                 score += dup_cost
             
-            d_lca = st_flat.depths[st_flat.first_visit[m_lca]]
-            d_c1 = st_flat.depths[st_flat.first_visit[m1]]
-            d_c2 = st_flat.depths[st_flat.first_visit[m2]]
+            d_lca = st_flat.node_depths[m_lca]
+            d_c1 = st_flat.node_depths[m1]
+            d_c2 = st_flat.node_depths[m2]
             
             loss1 = (d_c1 - d_lca - 1) + is_dup 
             loss2 = (d_c2 - d_lca - 1) + is_dup
@@ -337,7 +339,7 @@ class Reconciler:
         root_id = gt_flat.postorder[-1]
         if not dirty_mask[root_id] and root_id in lca_maps:
             map_root = lca_maps[root_id]
-            root_depth = st_flat.depths[st_flat.first_visit[map_root]]
+            root_depth = st_flat.node_depths[map_root]
             if root_depth > 0: score += (loss_cost * root_depth)
              
         return score
@@ -371,9 +373,9 @@ class Reconciler:
                 is_dup = 1
                 current_score += dup_cost
             
-            d_lca = st_flat.depths[st_flat.first_visit[m_lca]]
-            d_c1 = st_flat.depths[st_flat.first_visit[m1]]
-            d_c2 = st_flat.depths[st_flat.first_visit[m2]]
+            d_lca = st_flat.node_depths[m_lca]
+            d_c1 = st_flat.node_depths[m1]
+            d_c2 = st_flat.node_depths[m2]
             
             loss1 = (d_c1 - d_lca - 1) + is_dup 
             loss2 = (d_c2 - d_lca - 1) + is_dup
@@ -384,9 +386,9 @@ class Reconciler:
         # Root penalty (if root is dirty)
         root_id = gt_flat.postorder[-1]
         if dirty_mask[root_id]:
-             map_root = lca_maps[root_id]
-             root_depth = st_flat.depths[st_flat.first_visit[map_root]]
-             if root_depth > 0: current_score += (loss_cost * root_depth)
+            map_root = lca_maps[root_id]
+            root_depth = st_flat.node_depths[map_root]
+            if root_depth > 0: current_score += (loss_cost * root_depth)
              
         return current_score
 
@@ -413,7 +415,7 @@ class Reconciler:
             sp_name = gt_name.split("_")[-1]
             sp_base_id = registry.get_id(sp_name)'''
             
-            available_targets = target_map.get(sp_base_id, [0])
+            available_targets = target_map.get(sp_base_id, DEFAULT_TARGET)
             ambig_ranges.append(range(len(available_targets)))
 
             for nid in grp_ids: 
@@ -428,7 +430,7 @@ class Reconciler:
         dirty_postorder, dirty_mask = Reconciler.identify_dirty_nodes(gt_flat, dirty_leaves)
 
         # Base Map (Initialize ALL leaves)
-        base_leaf_targets = {}
+        base_leaf_targets = [None] * gt_flat.num_nodes
         lca_maps = {}
         
         for i in range(gt_flat.num_nodes):
@@ -439,7 +441,7 @@ class Reconciler:
                 sp_base_name = registry.get_name(sp_name_id).split("_")[-1]
                 sp_base_id = registry.get_id(sp_base_name)'''
                 
-                targets = target_map.get(sp_base_id, [0])
+                targets = target_map.get(sp_base_id, DEFAULT_TARGET)
                 base_leaf_targets[i] = targets
                 
                 # Apply initialization fix for "Clean" nodes
@@ -523,7 +525,7 @@ class Reconciler:
             # nodes and cleans their names before requesting an ID from the registry.
             sample_node = grp_ids[0]
             sp_base_id = gt_flat.node_to_name_id[sample_node]
-            available_targets = target_map.get(sp_base_id, [0])
+            available_targets = target_map.get(sp_base_id, DEFAULT_TARGET)
             ambig_ranges.append(range(len(available_targets)))
 
             for nid in grp_ids: instructions[nid] = (0, idx)
@@ -531,14 +533,14 @@ class Reconciler:
         for grp_ids, t_idx in fixed_groups:
             for nid in grp_ids: 
                 instructions[nid] = (1, t_idx)
-
-        # Base Map
-        base_leaf_targets = {}
+            
+        # Base Map - List of Tuples
+        base_leaf_targets = []
         for i in range(gt_flat.num_nodes):
             if gt_flat.children_start[i] == gt_flat.children_start[i+1]:
                 sp_base_id = gt_flat.node_to_name_id[i]
-                targets = target_map.get(sp_base_id, [0])
-                base_leaf_targets[i] = targets
+                targets = target_map.get(sp_base_id, DEFAULT_TARGET)
+                base_leaf_targets.append((i, targets))
 
         # --- Permutation Loop ---
         best_score = 999999
@@ -546,10 +548,10 @@ class Reconciler:
 
         for combo in itertools.product(*ambig_ranges):
             current_map = {}
-            for u, targets in base_leaf_targets.items():
-                if u in instructions:
-                    type_code, val = instructions[u]
-                    choice = combo[val] if type_code == 0 else val
+            # Iterate and update ONLY the ambiguous nodes
+            for u, targets in base_leaf_targets:
+                if u in instructions and instructions[u][0] == 0: # Ambig Group
+                    choice = combo[instructions[u][1]]
                     if choice >= len(targets): choice = 0 
                     current_map[u] = targets[choice]
                 else:
@@ -606,7 +608,6 @@ class Reconciler:
         if self.n_procs > 1:
             with mp.Pool(processes=self.n_procs) as pool:
                 flat_tasks = [(k, v.mt.flat_tree) for k, v in tasks]
-                #for idx, score in pool.imap_unordered(worker_func, flat_tasks):
                 iterator = pool.imap_unordered(worker_func, flat_tasks)
                 for idx, score, gt_res in tqdm(iterator, total=len(tasks), desc="Scoring   ", unit="st", disable=self.logger.disable_tqdm):
                     all_scores[idx] = score

@@ -8,6 +8,7 @@ import multiprocessing as mp
 from tqdm import tqdm
 from pathlib import Path
 from itertools import chain
+from functools import partial
 from typing import Tuple, List, Optional, Dict, Union
 
 from .config import TaskConfig
@@ -106,6 +107,8 @@ class TreeLoader:
     """
     Handles loading, verification, and optional repais of Species and Gene trees.
     """
+    _SANITIZE_TRANS = str.maketrans('_.', '--') # Replace any chars in '_.' with '-'
+
     @staticmethod
     def spec_tree(tcf: TaskConfig, logger: GranLogger) -> SmrtTree:
 
@@ -494,11 +497,8 @@ class TreeLoader:
                     node.name = None
 
     @staticmethod
-    def _sanitize_tip(s: str, old: List[str] = ['_', '.'], new: str = '-') -> str:
-        # Replace any chars in old with new
-        for char in old:
-            s = s.replace(char, new)
-        return s
+    def _sanitize_tip(s: str) -> str:
+        return s.translate(TreeLoader._SANITIZE_TRANS)
 
 class MulTreeManager:
     def __init__(self, config: TaskConfig, st: SmrtTree, logger: GranLogger) -> Optional[Dict[str, int]]:
@@ -1066,30 +1066,18 @@ def _collapse_worker(payload: Tuple[int, MulTree]) -> Tuple[int, Dict[int, Group
     return m_idx, current_mt_groups
 
 # --- Worker for parallel filtering ---
-def _check_and_write_worker(payload: Tuple[int, MulTree, Path, List[int], int, bool]) -> Tuple[int, str, Dict[int, List[int]]]:
+def _check_and_write_worker(payload: Tuple[int, str, str, str], sorted_gene_ids: List[int] = None, group_cap: int = 8) -> Tuple[int, str, Dict[int, List[int]]]:
     """
-    Worker to process a single MUL-tree's checknums logic and create formatted output string.
-    Payload: (m_idx, m_data, pickle_path, sorted_gene_ids, group_cap, is_mul_input)
+    Worker to process a single MUL-tree's checknums logic.
+    Payload: (m_idx, mt_str, h_info, pickle_path)
     Returns: (m_idx, formatted_string_buffer, failures_dict)
     """
-    m_idx, m_data, pickle_path, sorted_gene_ids, group_cap, is_mul_input = payload
+    m_idx, mt_str, h_info, pickle_path = payload
     
     buffer = []
     local_failures = {} # g_idx -> list of m_idxs (just [m_idx])
 
-    # Format Tree String
-    mt_str = m_data.mt.to_marked_str(m_data.h1_node)
-
-    h_info = ""
-    if not is_mul_input:
-        h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
-        hx_sisters = m_data.hx_sisters
-        if hx_sisters:
-            hx_str = "\t".join([f'H{i+2} Node:{hx.name}' for i, hx in enumerate(hx_sisters)])
-        else:
-            hx_str = "Hx Nodes:NA"
-        h_info = f"\tH1 Node:{h1_name}\t{hx_str}"
-    
+    # Formatting tree string is done upstream
     buffer.append(f"# MT-{m_idx}:{mt_str}{h_info}\n")
 
     # 2. Process Pickle Data
@@ -1261,7 +1249,6 @@ class GeneTreeManager:
     def filter_and_check(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]) -> Dict[int, int]:
         """
         Writes checknums file and filters trees exceeding group cap.
-        [UPDATED] Uses multiprocessing to prepare string buffers.
         """
         step = "Filtering gene trees over group cap"
         self.logger.report_step(step, "In progress...")
@@ -1280,20 +1267,31 @@ class GeneTreeManager:
             m_data = mul_trees[m_idx]
             pickle_path = self.tcf.pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
             
-            # Payload: (m_idx, m_data, pickle_path, gene_ids, cap, is_mul_input)
-            tasks.append((
-                m_idx, m_data, str(pickle_path), 
-                sorted_gene_ids, self.tcf.group_cap, self.tcf.is_mul_input
-            ))
+            # String Formatting
+            mt_str = m_data.mt.to_marked_str(m_data.h1_node)
+            h_info = ""
+            if not self.tcf.is_mul_input:
+                h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
+                hx_sisters = m_data.hx_sisters
+                if hx_sisters:
+                    hx_str = "\t".join([f'H{i+2} Node:{hx.name}' for i, hx in enumerate(hx_sisters)])
+                else:
+                    hx_str = "Hx Nodes:NA"
+                h_info = f"\tH1 Node:{h1_name}\t{hx_str}"
+            
+            tasks.append((m_idx, mt_str, h_info, str(pickle_path)))
         
         # Results container: Map m_idx -> string buffer
         results_map = {}
 
-        # Execution
+        # Bind repetitive arguments to avoid sending them per-task
+        worker_func = partial(_check_and_write_worker, sorted_gene_ids=sorted_gene_ids, group_cap=self.tcf.group_cap)
+
         if tasks:
             if self.n_procs > 1:
                 with mp.Pool(processes=self.n_procs) as pool:
-                    for res in tqdm(pool.imap_unordered(_check_and_write_worker, tasks), total=len(tasks), desc="Checking  ", unit="mt", disable=self.logger.disable_tqdm):
+                    iterator = pool.imap_unordered(worker_func, tasks)
+                    for res in tqdm(iterator, total=len(tasks), desc="Checking  ", unit="mt", disable=self.logger.disable_tqdm):
                         m_idx, buf, fails = res
                         results_map[m_idx] = buf
                         # Merge failures
@@ -1302,7 +1300,7 @@ class GeneTreeManager:
                             gt_failures[g_idx].extend(failures)
             else:
                 for task in tqdm(tasks, desc="Checking  ", unit="mt", disable=self.logger.disable_tqdm):
-                    m_idx, buf, fails = _check_and_write_worker(task)
+                    m_idx, buf, fails = worker_func(task)
                     results_map[m_idx] = buf
                     for g_idx, failures in fails.items():
                         if g_idx not in gt_failures: gt_failures[g_idx] = []

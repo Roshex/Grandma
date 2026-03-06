@@ -76,7 +76,7 @@ if __name__ == "__main__":
             #time_tool(f"{run_str_new} {o_new}_nm/ --nestedness model", "new") # --debug --plot
             #time_tool(f"{run_str_new} {o_new}_op/ --optim", "new")
             #time_tool(f"{run_str_new} {o_new}_np/ --optim --nestedness model", "new") # --debug --plot
-            time_tool(f"{run_str_new} {o_new}_splt/ -m split --start auto -x {x} --maps 6 --min_gt_lvs 1", "new") #--plot --start 1 -i 2 --repair
+            time_tool(f"{run_str_new} {o_new}_spltnew/ -m split --start auto -x {x} --maps 6 --min_gt_lvs 1", "new") #--plot --start 1 -i 2 --repair
             
             #time_tool(f"{run_str_new} {o_new}/ --generate {g} -m split", "new")
             
