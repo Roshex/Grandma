@@ -25,7 +25,7 @@ if __name__ == "__main__":
 #            ("no_w", "genetrees.txt", "spectree.tre"),
 #            ("w", "genetrees.txt", "spectree.tre"),
 ##             ("w_ils", "genetrees.txt", "spectree.tre"),
-             ("diaz", "grampa_trees.tre", "species.tre"),
+##             ("diaz", "grampa_trees.tre", "species.tre"),
 ##             ("k_back", "backbone.txt", "astral.tre"),
 ##             ("bend", "grampa_trees.tre", "species.tre"),
 ##             ("kall", "kall.nw", "kall.treefile"),
@@ -33,7 +33,7 @@ if __name__ == "__main__":
 #            ("w_sn_H", "genetrees.txt", "spectree.tre"),
         ],
         'generator': [
-#             ("ex", "to_generate.json", "spectree.tre"),
+             ("ex", "to_generate.json", "spectree.tre"),
         ],
 
         'empirical': [
@@ -76,15 +76,10 @@ if __name__ == "__main__":
             #time_tool(f"{run_str_new} {o_new}_nm/ --nestedness model", "new") # --debug --plot
             #time_tool(f"{run_str_new} {o_new}_op/ --optim", "new")
             #time_tool(f"{run_str_new} {o_new}_np/ --optim --nestedness model", "new") # --debug --plot
-            time_tool(f"{run_str_new} {o_new}_spltnew/ -m split --start auto -x {x} --maps 6 --min_gt_lvs 1", "new") #--plot --start 1 -i 2 --repair
+            #time_tool(f"{run_str_new} {o_new}_spltnew/ -m split --start auto -x {x} --maps 6 --min_gt_lvs 1", "new") #--plot --start 1 -i 2 --repair
             
-            #time_tool(f"{run_str_new} {o_new}/ --generate {g} -m split", "new")
+            time_tool(f"{run_str_new} {o_new}/ --generate {g}", "new")
             
-            #time_tool(f"{run_str_new} {o_new}_full_r/ -m full --nesting r", "new")
-            #time_tool(f"{run_str_new} {o_new}_full_m/ -m full --nesting m", "new")
-            #time_tool(f"{run_str_new} {o_new}_full_s/ -m full --nesting s", "new")
-            #time_tool(f"{run_str_new} {o_new}_full_i/ -m full --nesting i", "new")
-
             #time_tool(f"{run_str_old} {o_old}_v0 --maps -v 0", "old")
             #time_tool(f"{run_str_old} {o_old}_v1 --maps -v 1", "old")
             #time_tool(f"{run_str_old} {o_old}_v2 --maps -v 2", "old")

@@ -48,6 +48,8 @@ class DatasetGenerator:
             self.dup_err = rates.get("dup_err", 0.1)
             self.loss_err = rates.get("loss_err", 0.1)
 
+        self.executions = self.config.get("executions", [""])
+
     def run(self):
         datasets = self.config.get("datasets", {})
         if self.is_generate:
@@ -64,6 +66,7 @@ class DatasetGenerator:
         if self.is_execute:
 
             import sys
+            import shlex
             import subprocess
 
             self.logger.log(f"\n# --- Starting Batch Execution on {len(ds_dirs)} Datasets ---\n#", 'i')
@@ -75,7 +78,7 @@ class DatasetGenerator:
             
             skip_next = False
             # Flags we must remove so we can override them
-            override_flags = {'-s', '--species-tree', '-g', '--gene-trees', '-o', '--output-dir', '--generate'}
+            override_flags = {'-s', '--species-tree', '-g', '--gene-trees', '-o', '--output-dir', '--generate', '-m', '--mode', '--nesting'}
             
             for arg in sys.argv[1:]:
                 if skip_next:
@@ -87,31 +90,44 @@ class DatasetGenerator:
                     continue
                 
                 if arg in override_flags:
-                    # If it's --generate, we skip its value (the config file)
-                    # If it's -s/-g/-o, we skip its value
                     skip_next = True 
                     continue
                 
                 base_cmd.append(arg)
 
-            # 2. Loop and Execute
+            # 2. Loop Datasets and Executions
             for ds_dir in ds_dirs:
                 self.logger.log(f">> Running GRANDMA on {ds_dir.name}...", 'i')
                 
-                cmd = base_cmd.copy()
-                # Inject specific paths for this dataset
-                cmd.extend(['-s', str(ds_dir / "species_tree.tre")])
-                cmd.extend(['-g', str(ds_dir / "gene_trees.tre")])
-                cmd.extend(['-o', str(ds_dir / "output")])
-                self.logger.log(f"  Command: {' '.join(cmd)}", 'i')
-                
-                try:
-                    # Run in subprocess to ensure clean memory/state for every run
-                    subprocess.check_call(cmd)
-                except subprocess.CalledProcessError as e:
-                    self.logger.log(f"Failed to run on {ds_dir.name}. Error code: {e.returncode}", 'w')
-                except Exception as e:
-                    self.logger.log(f"Critical error executing {ds_dir.name}: {e}", 'w')
+                for exec_args_str in self.executions:
+                    cmd = base_cmd.copy()
+                    
+                    # Parse the string into safe CLI arguments
+                    exec_args = shlex.split(exec_args_str) if exec_args_str else []
+                    
+                    # Build a clean directory name from the arguments (e.g. "-m full --nesting r" -> "out_m_full_nesting_r")
+                    if exec_args:
+                        clean_parts = [p.strip("-") for p in exec_args]
+                        mode_str = f"out_{'_'.join(clean_parts)}"
+                    else:
+                        mode_str = "out_default"
+                    
+                    # Inject paths and execution args
+                    cmd.extend(['-s', str(ds_dir / "species_tree.tre")])
+                    cmd.extend(['-g', str(ds_dir / "gene_trees.tre")])
+                    cmd.extend(['-o', str(ds_dir / mode_str)])
+                    cmd.extend(exec_args)
+                    
+                    self.logger.log(f"  Command: {' '.join(cmd)}", 'i')
+                    
+                    try:
+                        # Run in subprocess to ensure clean memory/state for every run
+                        subprocess.check_call(cmd)
+                    except subprocess.CalledProcessError as e:
+                        self.logger.log(f"Failed to run on {ds_dir.name} with args '{exec_args_str}'. Error code: {e.returncode}", 'w')
+                    except Exception as e:
+                        self.logger.log(f"Critical error executing {ds_dir.name} with args '{exec_args_str}': {e}", 'w')
+                        
             self.logger.log(f"\n--- Batch Execution Completed ---\n", 'i')
 
     def _generate_dataset(self, name: str, events: List[Tuple[str, str]]):

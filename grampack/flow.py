@@ -860,11 +860,12 @@ class FlowManager:
             expanded_locs = {}
             redupl_loc = {}
             for i, loc in enumerate(locs):
-                if not loc.startswith('<P*'):
+                if not loc.startswith('<P*') and loc != parent_tag:
                     matches = outer_tree_wrapper.match(loc)
                     expanded_locs[loc] = matches
                 else:
-                    redupl_loc[locs[i+1]] = True
+                    k = (i+1) % len(locs) # Get the next index in a circular manner
+                    redupl_loc[locs[k]] = True
 
             if not expanded_locs:
                 self.logger.log(f"Glue {task_id}: Graft locations {locs} not found in Outer tree topology.", 'e')
