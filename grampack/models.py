@@ -623,6 +623,18 @@ class SmrtTree:
             raise ValueError(f"Primary target's pure attribute '{primary.pure}' does not match expected pure name '{pure_name}'.")
         
         return self.match(pure_name)
+
+    @property
+    def desc_pure_cache(self) -> Dict[Tree, Set[str]]:
+        pure_desc_cache = {}
+        for node in self.ete_tree.traverse("postorder"):
+            desc_set: Set[str] = set()
+            for child in node.children:
+                desc_set.add(child.pure)
+                # Union with child's descendants
+                desc_set.update(pure_desc_cache.get(child, set()))
+            pure_desc_cache[node] = desc_set
+        return pure_desc_cache
     
     def copy(self) -> 'SmrtTree':
         return SmrtTree(tree_obj=self.ete_tree.copy())

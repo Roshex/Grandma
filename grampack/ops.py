@@ -9,7 +9,7 @@ from tqdm import tqdm
 from pathlib import Path
 from itertools import chain
 from functools import partial
-from typing import Tuple, List, Optional, Dict, Union
+from typing import Tuple, List, Optional, Dict, Union, Callable, Set
 
 from .config import TaskConfig
 from .logger import GranLogger
@@ -169,8 +169,8 @@ class TreeLoader:
 
         # Input Validation
         if tcf.gts is None:
-            if tcf.mode == 'build-mts':
-                logger.report_step(step, "Skipped: 'build-mts' mode")
+            if tcf.mode in ('build-mts', 'count-mts', 'label-sp'):
+                logger.report_step(step, f"Skipped: '{tcf.mode}' mode")
                 return {}
             else:
                 logger.log(f"Gene trees input is missing. Required in all modes except 'build-mts' (here: '{tcf.mode}' mode).", 'e')
@@ -501,98 +501,13 @@ class TreeLoader:
         return s.translate(TreeLoader._SANITIZE_TRANS)
 
 class MulTreeManager:
-    def __init__(self, config: TaskConfig, st: SmrtTree, logger: GranLogger) -> Optional[Dict[str, int]]:
+    __slots__ = ['tcf', 'st', 'logger', 'ploidies']
+
+    def __init__(self, config: TaskConfig, st: SmrtTree, logger: GranLogger) -> None:
         self.tcf = config
         self.st = st
         self.logger = logger
-        self.ploidies = self._parse_ploidy_file(self.tcf.ploidies, logger)
-
-        # DFS Cache for optimizations (Lazy loaded)
-        self.dfs_order = None
-        self.subtree_range = None
-        self.st_adj = None
-
-    def _linearize_tree(self):
-        """
-        Performs DFS to map topological relationships to integer ranges.
-        O(N) Pre-computation.
-        """
-        if self.dfs_order: return # Already done
-
-        # 1. Build Adjacency for traversal
-        # SmrtTree/Ete3 structure: node.children is list of objects
-        root = self.st.ete_tree
-        
-        self.dfs_order = {}      # obj -> int
-        self.subtree_range = {}  # obj -> (min, max)
-        
-        timer = 0
-        # Stack: (node, state) 0=Enter, 1=Exit
-        work_stack = [(root, 0)]
-        
-        while work_stack:
-            node, state = work_stack.pop()
-            
-            if state == 0:
-                # Entry
-                timer += 1
-                self.dfs_order[node] = timer
-                # Push exit
-                work_stack.append((node, 1))
-                # Push children
-                for child in node.children:
-                    work_stack.append((child, 0))
-            else:
-                # Exit
-                start = self.dfs_order[node]
-                self.subtree_range[node] = (start, timer)
-
-    def countMULTrees_Optimized(self, h1_nodes: List[str], h2_nodes: List[str]) -> int:
-        """
-        O(H1 * log H2) Counting using DFS Ranges.
-        """
-        # Ensure linearization
-        self._linearize_tree()
-        
-        # Map strings back to objects
-        h1_objs = [self.st.get_node(n) for n in h1_nodes if self.st.get_node(n)]
-        h2_objs = [self.st.get_node(n) for n in h2_nodes if self.st.get_node(n)]
-        
-        # Sort H2 DFS indices (O(M log M))
-        h2_indices = []
-        for h2 in h2_objs:
-            if h2 in self.dfs_order:
-                h2_indices.append(self.dfs_order[h2])
-        h2_indices.sort()
-        
-        total_h2 = len(h2_indices)
-        valid_count = 0
-        
-        for h1 in h1_objs:
-            if h1.is_leaf():
-                # Leaf has empty clade (in terms of internal nesting check)
-                valid_count += total_h2
-                continue
-            
-            if h1 not in self.subtree_range: continue
-            
-            L, R = self.subtree_range[h1]
-
-            # [FIX] Strict Inequality (bisect_right of L)
-            # Naive iter_descendants() excludes self. 
-            # To match naive, we want strictly descendants: (L, R]
-            
-            # Find first element > L (Excludes self)
-            start_idx = bisect.bisect_right(h2_indices, L) 
-            # Find first element > R
-            end_idx = bisect.bisect_right(h2_indices, R)
-
-            nested_count = end_idx - start_idx
-            valid_count += (total_h2 - nested_count)
-            
-        return valid_count
-
-
+        self.ploidies: Dict[str, int] = self._parse_ploidy_file(self.tcf.ploidies, logger)
 
     @staticmethod
     def _parse_ploidy_file(ploidies: Optional[Union[Path, str, Dict[str, int]]], logger: GranLogger) -> Dict[str, int]:
@@ -603,27 +518,26 @@ class MulTreeManager:
             return {}
         step = "Reading ploidy file"
         logger.report_step(step, "In progress...")
-        ploidies = CommonOps._load_single_content(ploidies, "ploidies", logger, key="e")
-        ploid_dict = {}
+        ploidy_content = CommonOps._load_single_content(ploidies, "ploidies", logger, key="e")
+        ploidy_dict: Dict[str, int] = {}
         try:
-            lines = ploidies.splitlines()
-            for line in lines:
+            for line in ploidy_content.splitlines():
                 parts = line.strip().split()
                 if len(parts) == 2:
                     species, ploidy = parts
-                    ploid_dict[species] = int(ploidy)
+                    ploidy_dict[species] = int(ploidy)
         except Exception as e:
             logger.log(f"reading ploidy file: {e}", 'e')
-        if not ploid_dict:
+        if not ploidy_dict:
             logger.log("Ploidy file is empty or invalid.", 'w')
-        logger.report_step(step, f"Success: Loaded ploidies for {len(ploid_dict)} species")
-        return ploid_dict
+        logger.report_step(step, f"Success: Loaded ploidies for {len(ploidy_dict)} species")
+        return ploidy_dict
 
-    ### Beta
-    def _count_effective_lineages(self) -> Dict[str, Tuple[int, int]]:
+    @staticmethod
+    def _count_effective_lineages(tree: Tree) -> Dict[str, Tuple[int, int]]:
         """
         Counts effective lineages for each species in the current ST.
-        Returns a dict: {species: (number_of_pure_groups, max_size_of_pure_group)}
+        Populates self.ploidy_stats: {species: (number_of_pure_groups, max_size_of_pure_group)}
         Logic:
         1. Pure Groups: A clade where all descendants are the same species.
         2. Polytomies: Siblings of the same pure species at a mixed node are aggregated 
@@ -631,23 +545,20 @@ class MulTreeManager:
         3. Nested Pure Groups: Only the maximal pure group is counted (e.g., ((x,x),x) is 1 group of size 3).
         """
         # Data structure: species -> [count, max_size]
-        counts = {}
+        counts: Dict[str, List[int]] = {}
         
-        def update_counts(species, size):
+        def update_counts(species: str, size: int) -> None:
             if species not in counts:
                 counts[species] = [0, 0]
             counts[species][0] += 1
             counts[species][1] = max(counts[species][1], size)
 
-        def get_state(node):
+        def get_state(node: Tree) -> Optional[Tuple[str, int]]:
             """
             Returns (species, size) if the node represents a pure clade.
             Returns None if the node is mixed.
             """
             if node.is_leaf():
-                # Extract species name (remove '*' if present from previous MUL-tree ops)
-                '''sp = node.name.replace("*", "")
-                return (sp, 1)'''
                 return (node.pure, 1)
 
             # Get states of all children
@@ -670,7 +581,7 @@ class MulTreeManager:
             
             # If mixed (or children have different species), finalize the pure children
             # Aggregate by species to handle polytomies like (x, x, y)
-            current_level_groups = {} # species -> total_size
+            current_level_groups: Dict[str, int] = {} # species -> total_size
             
             for state in child_states:
                 if state is not None:
@@ -684,7 +595,7 @@ class MulTreeManager:
             return None
 
         # Start traversal from root
-        root_state = get_state(self.st.ete_tree)
+        root_state = get_state(tree)
 
         # Edge case: If the entire tree is pure (e.g., ((x,x),x)), 
         # get_state returns a value for root that hasn't been recorded yet.
@@ -694,57 +605,65 @@ class MulTreeManager:
         # Convert lists to tuples for return type consistency
         return {k: tuple(v) for k, v in counts.items()}
         
-    ### Beta
-    def _apply_ploidy_constraints(self, h1_candidates: List[str], bin_id: Optional[int] = None) -> List[str]:
+    def _apply_ploidy_constraints(self, h1_candidates: List[str], bin_id: Optional[int], is_strict: bool = False) -> Tuple[List[str], Dict[str, float]]:
         """
-        Filters H1 candidates based on the ploidy file loaded at init.
-        Only H1 is filtered because H1 is the lineage being duplicated.
+        Filters H1 candidates and calculates how many NEW copies each can tolerate.
+        Centralizes all ploidy math for Simple, Full, Split, and Mixed modes.
+        Contains both the complex 'effective lineage' logic and the strict 'exact match count' logic.
+        Only H1 is filtered because H1 is the lineage being duplicated, but the allowance is calculated for H2/x for when grafting.
         """
-        filtered_h1 = []
-        check_fn = None
+        filtered_h1: List[str] = []
+        h1_allowances: Dict[str, float] = {}
 
-        # 1. Get current counts: {species: (num_groups, max_size)}
-        if not bin_id:
-            current_stats = self._count_effective_lineages()
-
-            check_fn = lambda current, limit: current >= limit # In this mode: num_of_groups >= limit: # or max_size*2 > limit: ??
+        # 2. Determine Current Statistics based on Stricter Option vs Default
+        # Assumes a flag like self.tcf.strict_ploidy exists (defaults to False if not present)
+        is_strict = getattr(self.tcf, 'strict_ploidy', False)
+        
+        if is_strict:
+            # STRICT MODE: Count exactly how many disjoint pure matches currently exist in the tree
+            ploidy_stats = {}
+            for sp in self.ploidies.keys():
+                # Find a representative leaf to get the targets
+                rep_leaf = next((l for l in self.st.ete_tree.get_leaves() if l.pure == sp), None)
+                if rep_leaf:
+                    ploidy_stats[sp] = (len(self.st.get_targets(rep_leaf)), 1)
+                else:
+                    ploidy_stats[sp] = (0, 0)
         else:
-            # Number of 1s in the binary representation indicates how many copies of this lineage will exist after gluing.
-            max_size = bin_id.bit_count()
-            # Eg, if the count is 2, this tree paricipated in 2 "inner" subproblems
-            # Meaning, it should have 2**2 = 4 copies already (if glued)
-            # Meaning, next iteration could create 2**3 = 8 copies - this is the number we should check!
-            max_size = 2**(max_size+1)
-            # Pure may not be needed here; for safety
-            current_stats = {l.pure: (max_size, None) for l in self.st.ete_tree.get_leaves()}
+            # DEFAULT MODE: Complex topological aggregation
+            ploidy_stats = self.count_effective_lineages(self.st.ete_tree)
 
-            check_fn = lambda future, limit: future > limit # In this mode, it's very clear when we need to check
+        # Determine the depth multiplier (1 for Full/Mixed baseline, 2^N for inner splits)
+        multiplier = 1
+        if bin_id is not None:
+            # Number of 1s in the binary representation indicates how many copies of this lineage will exist
+            # after gluing, e.g., if the count is 2, this tree paricipated in 2 "inner" subproblems.
+            # Thus, it should have 2**2 = 4 copies (if glued) of what is **in the tree** (may be more than 1 in mixed mode, etc).
+            multiplier = 2 ** bin_id.bit_count()
         
         for node_name in h1_candidates:
             node = self.st.get_node(node_name)
-            if not node: continue
             
-            clade_species = {l.name.replace("*", "") for l in node.iter_leaves()}
+            clade_species = {l.replace("*", "").split('|')[0] for l in node.get_leaf_names()}
+            min_allowance = float('inf')
             
-            is_valid = True
             for sp in clade_species:
-                # Ploidy Limit Logic:
-                # Interpretation: The dict value (e.g., x:2) is the Max Number of Groups allowed.
-                # If current_stats[sp] (group count) >= Limit, we cannot add another group.
+                limit = self.ploidies.get(sp, 999) # Default to infinite if not in file           
+                current_count, max_group_size = self.ploidy_stats.get(sp, (0,0))
                 
-                limit = self.ploidies.get(sp, 999) # Default to infinite if not in file
+                # Math: (Current + Allowed) * Multiplier <= Limit
+                # Therefore: Allowed <= (Limit // Multiplier) - Current
+                allowed = (limit // multiplier) - current_count
                 
-                num_of_groups, max_size = current_stats.get(sp, (0,0))
-                
-                if check_fn(num_of_groups, limit):
-                    is_valid = False
-                    break
+                if allowed < min_allowance:
+                    min_allowance = allowed
             
-            if is_valid:
+            # If allowance is < 1, this H1 cannot participate in ANY grafts. Filter it out.
+            if min_allowance >= 1:
                 filtered_h1.append(node_name)
+                h1_allowances[node_name] = float(min_allowance)
 
-        # H2 candidates are not filtered by ploidy count, as H2 is the *target* of insertion, not the source of duplication.
-        return filtered_h1
+        return filtered_h1, h1_allowances
 
     def _resolve_h_inputs(self, raw_input: str, h_type: str) -> List[str]:
         """
@@ -766,9 +685,9 @@ class MulTreeManager:
         else:
             clade_lists = [raw_input.split(",")]
 
-        h_nodes = []
+        h_nodes: List[str] = []
         for clade in clade_lists:
-            cleaned_clade = []
+            cleaned_clade: List[str] = []
             for item in clade:
                 name_to_check = f"<{item}>" if item.isdigit() else item
                 if not self.st.get_node(name_to_check):
@@ -798,22 +717,77 @@ class MulTreeManager:
                     
         return h_nodes
 
-    ### multi_H to debug the new builder
-    def build(self, optim: bool = False, nesting: str ='ignore') -> dict:
-        mul_trees = {}
+    @staticmethod
+    def _is_redundant_graft(matches: List[Tree], h1_st_node: Tree) -> bool:
+        for target in matches:
+            sisters = target.get_sisters()
+            if len(sisters)==1 and sisters[0].pure == h1_st_node.pure:
+                return True
+        return False
+
+    def _compile_h2_targets(self, h1_st_node: Tree, h2_resolved: List[str], nesting: str, n1_pure_descendants: Set[str], allowance: float) -> List[List[Tree]]:
+        """
+        Evaluates all H2 candidates for a given H1 and returns a list of valid match groups.
+        Each item is a list of ETE3 nodes that should be grafted onto simultaneously.
+        """
+        valid_match_groups: List[List[Tree]] = []
+        processed_targets: Set[str] = set()
+        
+        for h2 in h2_resolved:
+            h2_node = self.st.get_node(h2)
+            
+            # Topological / Semantic Nesting
+            if h2_node.pure in n1_pure_descendants:
+                # For this check to work, .pure must not be None for any node (which is correct, but worth noting)
+                continue
+                
+            # Mode grouping
+            if nesting == 'model':
+                if h2_node.pure in processed_targets:
+                    continue
+                matches = self.st.get_targets(h2_node)
+            else:
+                matches = [h2_node]
+                
+            # EDGE CASE: Prevent redundant grafting "below", e.g., (H1_old, (H1_new, C)). Only allow: (H1_new, (H1_old, C))
+            # If any target's sister is a pure copy of H1, grafting here is topologically
+            # identical to grafting onto the target's parent. Because the parent will ALSO
+            # be evaluated as a target in this loop, skipping this prevents duplicate MUL-trees
+            # and safely protects the internal integrity of previously marked <P> clades.
+            is_redundant = self._is_redundant_graft(matches, h1_st_node)
+            # Compared to normal Grampa we produce (num_nodes-1) less MTs in the first iter too,
+            # because each node that is not the root would be able to be grafted below itself,
+            # but this is not a bug! It can still graft above itself... And the root node is not effected...
+            
+            # Ploidy check and redundancy blocking
+            if is_redundant or len(matches) > allowance:
+                if nesting == 'model': processed_targets.add(h2_node.pure)
+                continue
+                    
+            if nesting == 'model':
+                processed_targets.add(h2_node.pure)
+                
+            valid_match_groups.append(matches)
+            
+        return valid_match_groups
+
+    def build(self, nesting: str ='ignore') -> Tuple[Dict[int, MulTree], List[str], List[str], Dict[str, int]]:
+        mul_trees: Dict[int, MulTree] = {}
+
+        # --- ADD SPECIES TREE (INDEX 0) ---
+        # Index 0 is species tree itself regardless of mode
+        if self.tcf.mode != "no-st":
+            mul_trees[0] = MulTree(mt=self.st)
         
         # --- GUIDED ITERATIVE INTERCEPT ---
         if hasattr(self.tcf, 'predefined_rets') and self.tcf.predefined_rets:
             step = "Building Predefined MUL-trees"
             self.logger.report_step(step, "In progress...")
             
-            mul_trees[0] = MulTree(mt=self.st) # Index 0 is always the ST
             mul_num = 1
 
-            prerets = list(self.tcf.predefined_rets.values())
-            # Flatten the lists
-            prerets = [pair for sublist in prerets for pair in sublist]
-            print("Predefined reticulations for this iteration:", prerets)
+            prerets = [pair for sublist in self.tcf.predefined_rets.values() for pair in sublist]
+            self.logger.log(f"Predefined reticulations for this iteration: {prerets}", 'd')
             
             for h1_str, h2_str in prerets:
                 # Resolve the raw strings against the current ST context (which may now contain <P2> tags from previous iters)
@@ -824,7 +798,7 @@ class MulTreeManager:
                 
                 h1, h2 = h1_res[0], h2_res[0]
                 h1_st_node = self.st.get_node(h1)
-                h_clade = [l.name for l in h1_st_node.iter_leaves()]
+                h_clade = h1_st_node.get_leaf_names() # Optimized leaf extraction
                 
                 mt_wrapper, h1_obj, h2_obj = self.st.to_mul_tree(h1, h2)
                 if mt_wrapper:
@@ -834,191 +808,127 @@ class MulTreeManager:
             self.logger.report_step(step, f"Success: {mul_num-1} Predefined MUL-trees built")
             return mul_trees, [], [], self.ploidies
 
-        if self.tcf.mode != "st-only":
-            step = "Parsing hybrid clades"
-            self.logger.report_step(step, "In progress...")
-            h1_resolved = self._resolve_h_inputs(self.tcf.h1_nodes, "h1")
-            h2_resolved = self._resolve_h_inputs(self.tcf.h2_nodes, "h2")
-            self.logger.report_step(step, "Success: got H nodes")
-
-            if self.ploidies:
-                step = "Applying ploidy constraints"
-                self.logger.report_step(step, "In progress...")
-                h1_resolved = self._apply_ploidy_constraints(h1_resolved, bin_id = self.tcf.binary_id)
-                self.logger.log(f"After ploidy filtering, {len(h1_resolved)} H1 candidates remain: {h1_resolved}", 'd')
-                self.logger.report_step(step, "Success: identified compatible H nodes")
-
-            step = "Counting MUL-trees to generate"
-            self.logger.report_step(step, "In progress...")
-            
-            if optim:
-                num_mul_trees = self.countMULTrees_Optimized(h1_resolved, h2_resolved)
-            else:
-            
-                num_mul_trees = 0
-                for n1_name in h1_resolved:
-                    n1_node = self.st.get_node(n1_name)
-                    if n1_node.is_leaf():
-                        n1_clade_names = set()
-                    else:
-                        n1_clade_names = {n.name for n in n1_node.iter_descendants()}
-                    
-                    ni = 0
-                    for n2_name in h2_resolved:
-                        if n2_name not in n1_clade_names:
-                            ni += 1
-                    num_mul_trees += ni
-                
-            self.logger.report_step(step, f"Success: {num_mul_trees} total MUL-trees")
-        else:
-            h1_resolved = []
-            h2_resolved = []
-
-        # Index 0 is species tree itself regardless of mode
-        mul_trees[0] = MulTree(mt=self.st)
+        # --- EARLY RETURN FOR ST-ONLY ---
+        if self.tcf.mode == "st-only":
+            return mul_trees, [], [], self.ploidies
         
-        if self.tcf.mode != "st-only":
-            step = "Building MUL-trees"
+        step = "Parsing hybrid clades"
+        self.logger.report_step(step, "In progress...")
+        h1_resolved = self._resolve_h_inputs(self.tcf.h1_nodes, "h1")
+        h2_resolved = self._resolve_h_inputs(self.tcf.h2_nodes, "h2")
+        self.logger.report_step(step, "Success: got H nodes")
+
+        if self.ploidies:
+            step = "Applying ploidy constraints"
             self.logger.report_step(step, "In progress...")
+            h1_resolved, h1_allowances = self._apply_ploidy_constraints(h1_resolved, bin_id = self.tcf.binary_id)
+            self.logger.log(f"After ploidy filtering, {len(h1_resolved)} H1 candidates remain: {h1_resolved}", 'd')
+            self.logger.report_step(step, "Success: identified compatible H nodes")
+        else:
+            h1_allowances: Dict[str, float] = {h: float('inf') for h in h1_resolved}
+
+        # --- O(N) Bottom-Up Semantic Cache ---
+        # Pre-calculate pure descendants for O(1) lookup
+        # This catches BOTH standard topological descendants 
+        # AND any previously grafted hybrid copies of those descendants!
+        # Used for both counting and building blocks...
+        # The issue was that the target could be a **subset** of H1's clade, e.g., H1=(A,B,C), H2=(A,B).
+        # Then we need to recursively "autocorrect" H1 into insertions of H1 inside itself -- this would be a bug!!!
+        # Even if in old -m we catch this, it is still a bug in the -r mode, and in -m, in that the Hx list is corrupted (e.g., [**, ****], missing 1 & 3 stars).
+        # Is it enough to simply block this behavior? Yes!
+        # Why? Becasue biologically, what we try to do is have H1=(A,B,C), and H2_prev=(A,B,C)=H1*
+        # This is checked in the prev iteration, and back then, we already checked if duplicating (A,B,C) is more parsimonious than (A,B)!
+        # There is no scenario where we would want to insert only a subset of a hybrid clade, inside itself, **partially**.
+        # Later iterations can still doublicate (A,B) inside (A,B,C) if parsimonious!
+        # Additionally, we must be careful to still allow duplicating (A,B,C) itself, but each local copy.
+        # Hence we use iter_descendants() to not include self, or even better, a DFS cache to get strictly descendants in a single pass:
+        pure_desc_cache: Dict[Tree, Set[str]] = self.st.desc_pure_cache
+
+        # --- PRE-CALCULATION & COUNTING STEP ---
+        # Pre-calculate valid pairings and use this for both counting and building steps
+        # This ensures consistency and avoids redundant calculations
+        
+        step = "Counting MUL-trees" if self.tcf.mode == "count-mts" else "Counting MUL-trees to generate"
+        self.logger.report_step(step, "In progress...")
+        
+        num_mul_trees = 0
+        valid_pairings: Dict[str, List[List[Tree]]] = {}
+        for h1 in h1_resolved:
+            h1_st_node = self.st.get_node(h1)
+            n1_pure_descendants = pure_desc_cache.get(h1_st_node, set())
             
-            mul_num = 1
-            for h1 in h1_resolved:
-                h1_st_node = self.st.get_node(h1)
-                h_clade = [l.name for l in h1_st_node.iter_leaves()]
-
-                # Pre-calculate set for naive check to speed up (sets are O(1))
-                # Only needed if NOT optim
-                if not optim and not h1_st_node.is_leaf():
-                    n1_descendants = {n.name for n in h1_st_node.iter_descendants()}
-                else:
-                    n1_descendants = set()
-
-                processed_targets = set()
-
-                for h2 in h2_resolved:
-                    
-                    is_nested = False
-                    
-                    if optim:
-                        # DFS Logic
-                        n1_node = self.st.get_node(h1)
-                        if not n1_node.is_leaf():
-                            if n1_node in self.subtree_range:
-                                L, R = self.subtree_range[n1_node]
-                                h2_node = self.st.get_node(h2)
-                                if h2_node in self.dfs_order:
-                                    idx = self.dfs_order[h2_node]
-                                    # [FIX] Strict L < idx (Exclude self from nested definition to match naive)
-                                    if L < idx <= R:
-                                        is_nested = True
-                    else:
-                        # [FIX] RESTORE NAIVE LOGIC
-                        # If optim is OFF, we MUST still check!
-                        if h2 in n1_descendants:
-                            is_nested = True
-                            
-                    if is_nested: continue # Skip this pair
-
-                    # --- MODEL MODE LOGIC ---
-                    if nesting == 'model':
-                        ############
-                        # Important:
-                        # In this nesting mode, we don't to support both the inner-only and the inner-or-sister cases of autocompleting hybrid clades.
-                        # Why? Because both cases are already represented in the implementation below.
-                        # If a nested hybrid's H1 (which we do not check here) is sister to a previous hybrid, it can be inserted both
-                        # above and below itself - this covers both options!
-                        ############
-                        if h2 in processed_targets: continue
-
-                        matches = self.st.get_targets(h2)
-                        # Sort them to ensure deterministic behavior (Primary H2 usually comes first naturally or via sort)
-                        all_targets = sorted([n.name for n in matches])
-                        processed_targets.update(all_targets)
+            # Get the definitive list of valid target groupings
+            match_groups = self._compile_h2_targets(h1_st_node, h2_resolved, nesting, n1_pure_descendants, h1_allowances[h1])
+            valid_pairings[h1] = match_groups
+            num_mul_trees += len(match_groups)
+            
+        self.logger.report_step(step, f"Success: {num_mul_trees} total MUL-trees")
                         
-                        mt_wrapper, h1_obj, hx_objs = self.st.to_multi_mul_tree(h1, all_targets)
-                    # --- SIMPLE LOGIC (Rectify/Strict/Ignore) ---
-                    else:
-                        # Wrap single H2 in list for consistency
-                        mt_wrapper, h1_obj, hx_objs = self.st.to_multi_mul_tree(h1, [h2])
+        if self.tcf.mode == "count-mts":
+            self.report_mt_count(self.st.ete_tree, h1_resolved, h2_resolved, num_mul_trees)
+            return {}, [], [], {} # Returns empty dict to signal main.py to exit
+ 
+        # --- BUILDING STEP ---
+        step = "Building MUL-trees"
+        self.logger.report_step(step, "In progress...")
+        
+        mul_num = 1
+        for h1 in h1_resolved:
+            h1_st_node = self.st.get_node(h1)
+            h_clade = h1_st_node.get_leaf_names()
+            
+            # We just iterate over the pre-calculated, validated groups!
+            for matches in valid_pairings[h1]:
+                all_targets = sorted([n.name for n in matches])
+                
+                # to_multi_mul_tree handles BOTH Simple and Model modes seamlessly!
+                # (If simple, all_targets just has 1 item)
+                mt_wrapper, h1_obj, hx_objs = self.st.to_multi_mul_tree(h1, all_targets)
 
-                    if mt_wrapper:
-                        mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, hx_nodes=hx_objs)
-                        mul_num += 1
+                if mt_wrapper:
+                    mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, hx_nodes=hx_objs)
+                    mul_num += 1
+        
+        self.logger.report_step(step, f"Success: {mul_num-1} MUL-trees built")
 
-            self.logger.report_step(step, f"Success: {mul_num-1} MUL-trees built")
+        if self.tcf.mode == "build-mts":
+            self.report_mt_build(mul_trees)
+            return {}, [], [], {} # Returns empty dict to signal main.py to exit
+
+        if not mul_trees:
+            self.logger.log("No valid MUL-trees could be generated with the given constraints.", 'w')
+        if len(mul_trees) < (1 if self.tcf.mode in {"no-st", "st-only"} else 2):
+            self.logger.log("Too few MUL-trees built. Check your H1/H2 and ploidy constraints.", 'w')
             
         return mul_trees, h1_resolved, h2_resolved, self.ploidies
 
-    # --- Legacy Support ---
-
-    def report_num_trees(self):
-        """Replicates the --numtrees output from legacy mul_tree.py"""
-        
-        # 1. Parse H inputs (logic borrowed from build())
-        h1_resolved = self._resolve_h_inputs(self.tcf.h1_nodes, "h1")
-        h2_resolved = self._resolve_h_inputs(self.tcf.h2_nodes, "h2")
-        
-        # 2. Count Logic (Legacy implementation)
-        # Note: We use the already loaded self.st which is a SmrtTree
-        st_ete = self.st.ete_tree
-        nt = len([n for n in st_ete.traverse()])
+    def report_mt_count(self, st_ete: Tree, h1_resolved: List[str], h2_resolved: List[str], num_mul_trees: int) -> None:
+        """Prints a report of the MUL-tree count, replicating legacy mul_tree.py output."""
+        n = sum(1 for _ in st_ete.traverse())
         n_tips = len(st_ete.get_leaves())
-        
-        num_mul_trees = 0
-        for n1 in h1_resolved:
-            n1_node = self.st.get_node(n1)
-            # Get clade for containment check
-            if n1_node.is_leaf():
-                n1_clade_names = set()
-            else:
-                n1_clade_names = {n.name for n in n1_node.iter_descendants()}
+        self.logger.log("", 'i')
+        self.logger.log("MUL-tree Count Report:", 'i')
+        self.logger.log(f"Total nodes in species tree: {n}", 'i')
+        self.logger.log(f"Total tips in species tree.: {n_tips}", 'i')
+        self.logger.log(f"H1 nodes...................: {','.join(h1_resolved)}", 'i')
+        self.logger.log(f"H2 nodes...................: {','.join(h2_resolved)}", 'i')
+        self.logger.log(f"Possible MUL-trees.........: {num_mul_trees}", 'i')
+        self.logger.log("", 'i')
 
-            ni = 0
-            for n2 in h2_resolved:
-                if n2 not in n1_clade_names:
-                    ni += 1
-            num_mul_trees += ni
-
-        # 3. Print Block
-        # Using print directly as this is a specific CLI report tool
-        print()
-        print(f"Total nodes in species tree: {nt}")
-        print(f"Total tips in species tree.: {n_tips}")
-        print(f"H1 nodes...................: {','.join(h1_resolved)}")
-        print(f"H2 nodes...................: {','.join(h2_resolved)}")
-        print(f"Possible MUL-trees.........: {num_mul_trees}")
-        print()
-
-    def report_build_multrees(self):
-        """Replicates --buildmultrees output loop."""
-        # Reuse existing build() logic
-        mul_trees, h1_res, h2_res, _ = self.build()
-        
-        # Legacy prints headers to log/screen depending on verbosity
-        # GRANDMA has unified logging. We log as 'i' (Info/High Priority).
-        
-        # Headers: mul.tree, h1.node, h2.node, labeled.tree
-        headers = ["mul.tree", "h1.node", "h2.node", "labeled.tree"]
-        self.logger.log("\t".join(headers), 'i')
-        
-        for idx in sorted(mul_trees.keys()):
-            if idx == 0: continue # Legacy buildmultrees skips the ST (Index 0)
-            
-            mt_data = mul_trees[idx]
-            
-            # Format tree string (add + to hybrid clade)
-            tree_str = mt_data.mt.to_str(internals=True)
-            for spec in mt_data.h_clade:
-                # Regex: spec not followed by *
-                import re
-                tree_str = re.sub(f"{spec}(?!\\*)", f"{spec}+", tree_str)
-                tree_str = tree_str.replace("+*", "*")
-            
+    def report_mt_build(self, mul_trees: Dict[int, MulTree]) -> None:
+        """Prints a report of the built MUL-trees, replicating legacy mul_tree.py output."""
+        self.logger.log("", 'i')
+        self.logger.log("MUL-tree Build Report:", 'i')
+        self.logger.log("\t".join(["mul.tree", "h1.node", "h2.node", "labeled.tree"]), 'i')
+        for mul_num, mt_data in mul_trees.items():
+            # Skip the base species tree like in the legacy code
+            if mul_num == 0: 
+                continue
+            tree_str = mt_data.mt.to_marked_str(mt_data.h1_node)
             h1_name = mt_data.h1_node.name if mt_data.h1_node else "NA"
-            h2_name = mt_data.h2_node.name if mt_data.h2_node else "NA"
-            
-            line = f"{idx}\t{h1_name}\t{h2_name}\t{tree_str}"
-            self.logger.log(line, 'i')
+            h2_name = ",".join(n.name for n in mt_data.hx_nodes) if mt_data.hx_nodes else "NA"
+            self.logger.log(f"{mul_num}\t{h1_name}\t{h2_name}\t{tree_str}", 'i')
+        self.logger.log("", 'i')
 
 # --- Multiprocessing Workers ---
 

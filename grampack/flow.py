@@ -699,15 +699,14 @@ class FlowManager:
         self.logger = backup_logger
         return next_tasks
 
-    def glue_split_results(self) -> SmrtTree:
+    def glue_split_results(self, root_id: Tuple[int, int] = (0, 0)) -> SmrtTree:
         """
         Recombines results by recursively diving to the innermost subproblems.
         """
         step = "Recombining Split Results (Recursive)"
         self.logger.report_step(step, "In progress...", start=True)
 
-        # Start the chain from the root task (0,0)
-        final_tree = self._iterative_glue((0,0))
+        final_tree = self._iterative_glue(root_id)
         ft_wrapper = SmrtTree(tree_obj=final_tree)
 
         self.logger.log(f"Final Merged Tree: {final_tree.write(format=9)}", 'i')

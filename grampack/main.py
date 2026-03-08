@@ -71,7 +71,7 @@ def task_worker(payload: Tuple[Any, Any, str], context: GlobalContext, config: T
 
     # Temp fix
     if config.mode == "split":
-        binary_id = int(task_id.split(".")[1]) if "." in task_id else 0
+        binary_id = ( int(task_id.split(".")[1]) if "." in task_id else 0 ) - context.mixed_switch
     else:
         binary_id = None
 
@@ -148,20 +148,12 @@ class Task:
         # Re-init component with current task
         self.mul_mgr = MulTreeManager(tcf, self.spec_tree, self.logger)
 
-        if tcf.mode == "count-mts":
-            self.mul_mgr.report_num_trees()
-            return None, {}
+        # 2. Build MUL-Trees (Delegates all legacy mode intercepts natively)
+        self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(self.ctx.nesting)
 
-        if tcf.mode == "build-mts":
-            self.mul_mgr.report_build_multrees()
-            return None, {}
-
-        # 2. Build MUL-Trees
-        self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(self.ctx.optim, self.ctx.nesting)
-        #if tcf.mode == "build-mts": return None, {}
-
-        if len(self.mul_trees) < 2:
-            self.logger.log("No valid MUL-trees could be built. Terminating.", 'w')
+        # If build() returns an empty dict, it means a terminal mode (count-mts or build-mts)
+        # successfully finished or a warning was logged. Exit smoothly.
+        if not self.mul_trees:
             return None, {}
 
         # 3. Load Gene Trees
@@ -446,9 +438,11 @@ class Engine:
             ### TBD:
             ### at the end of this gluing needs to only apply until the switchpoint, and then do a different glue!
             ### Also, we might want to fast-forward the history if we are resuming deep, but TBD on how to track that with the mixed start.
+            root_task_id = (int(k) for k in initial_payload[2].split("."))
         else:
             # Standard Start
             # Initialize Task Queue to the root problem
+            root_task_id = (0, 0)
             root_task = (perm_tcf.st, perm_tcf.gts, "0")
             current_tasks = [root_task]
             # Fast-Forward (Resume) Logic
@@ -568,7 +562,7 @@ class Engine:
             current_tasks = next_tasks
             depth += 1
 
-        final_tree = self.flow_mgr.glue_split_results()
+        final_tree = self.flow_mgr.glue_split_results(root_id=root_task_id)
 
         if self.ctx.plot: self.flow_mgr.plot()
 

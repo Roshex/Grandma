@@ -2,10 +2,11 @@
 Replaces reconcore.py printing logic to ensure identical output format.
 '''
 
+import os
 import sys
 import time
 import datetime
-import os
+import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,7 +23,7 @@ except ImportError:
 
 class GranLogger:
     def __init__(self, log_file: Path, verbosity: int = 4, debug: bool = False, no_log: bool = False,
-                 parent_logger: 'GranLogger' = None, clear_log: bool = True):
+                 parent_logger: 'GranLogger' = None, clear_log: bool = True, catch_exceptions: bool = True):
         self.log_file = log_file
         self.verbosity = verbosity    # Controls screen output (0-4)
         self.debug = debug       # Controls if 'd' messages go to file
@@ -41,6 +42,9 @@ class GranLogger:
         if clear_log:
             with open(self.log_file, 'w') as f:
                 f.write("")
+
+        if catch_exceptions and not no_log and log_file:
+            self.catch_all_exceptions()
 
     @property
     def disable_tqdm(self) -> bool:
@@ -89,13 +93,18 @@ class GranLogger:
             log_to_file = False
 
         if log_to_file:
-            # Append to log file
-            with open(self.log_file, "a") as f:
-                f.write(formatted_msg + "\n")
-            
             # Propagate to Parent (File only)
             if self.parent_logger:
                 self.parent_logger.log(msg, key, to_screen=False, kill_on_error=False)
+
+            try:
+                # Append to log file
+                with open(self.log_file, "a") as f:
+                    f.write(formatted_msg + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception:
+                pass # Fail silently if the logger itself crashes, so it doesn't mask the original error
 
         # Screen Output & Buffering
         if to_screen and self.verbosity >= level:
@@ -111,6 +120,27 @@ class GranLogger:
 
     # check the original code for when it was screen printing!
     # combine level and key but make required
+
+    def catch_all_exceptions(self):
+        """
+        Overrides the global Python exception hook to route all unhandled 
+        crashes through this logger's 'e' state before exiting.
+        """
+        def handle_exception(exc_type, exc_value, exc_traceback):
+            # Let Ctrl+C (KeyboardInterrupt) kill the program normally without logging a massive error
+            if issubclass(exc_type, KeyboardInterrupt):
+                sys.__excepthook__(exc_type, exc_value, exc_traceback)
+                return
+
+            # Extract the full traceback as a formatted string
+            tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+            tb_string = "".join(tb_lines)
+
+            # Log the crash using your custom file-flushing 'e' state
+            self.log(f"UNEXPECTED FATAL EXCEPTION:\n{tb_string}", 'e')
+
+        # Bind the custom handler to Python's global hook
+        sys.excepthook = handle_exception
 
     def spaced(self, s, width):
         return str(s) + " " * (width - len(str(s)))
