@@ -83,15 +83,15 @@ class FlatTree:
         """O(1) LCA query using Sparse Table RMQ."""
         if u == v: return u
         
-        # 1. Find range in Euler tour
+        # Find range in Euler tour
         first = self.first_visit[u]
         last = self.first_visit[v]
         if first > last:
             first, last = last, first
             
-        # 2. Query RMQ for index with min depth
+        # Query RMQ for index with min depth
         span = last - first + 1
-        k = int(math.log2(span))
+        k = span.bit_length() - 1 # same as int(math.log2(span)) for any span > 0, and much faster
         
         # Compare depths of the two candidates covering the range
         idx1 = self.rmq_table[k][first]
@@ -889,12 +889,13 @@ class MulTree:
         Applicable only to the species tree, so labels are expected to be the raw leaf names (e.g. "Species" or "Species*") without GeneID.
         """
         if not node_obj or not node_obj.up: return []
-        sisters = [ch for ch in node_obj.up.children if ch != node_obj]
-        labels = []
-        for sis in sisters:
-            # Must be l.name (not l.pure) to preserve the '*' for disjoint checks!
-            labels.extend([l.name for l in sis.iter_leaves()])
-        return labels
+        # Must be l.name (not l.pure) to preserve the '*' for disjoint checks!
+        # So we can optimize by using get_leaf_names() which returns the names of leaves without traversing nodes.
+        return [
+            l_name 
+            for sis in node_obj.up.children if sis != node_obj 
+            for l_name in sis.get_leaf_names()
+        ]
 
     def get_sister_clades(self) -> Tuple[Set[str], List[Set[str]]]:
         """
@@ -951,11 +952,11 @@ class Map:
     def rev(self) -> Dict[str, List[str]]:
         if self._rev is None: # Still not built (i.e., empty dict)
             # Bypass frozen constraint for lazy loading
-            rev_map = {}
+            rev_map = defaultdict(list)
             for gt_node, sp_nodes in self.cor.items():
                 for sp in sp_nodes:
-                    rev_map.setdefault(sp, []).append(gt_node)
-            object.__setattr__(self, '_rev', rev_map)
+                    rev_map[sp].append(gt_node)
+            object.__setattr__(self, '_rev', dict(rev_map))
         return self._rev
     
     def __getitem__(self, key: str) -> List[str]:

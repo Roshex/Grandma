@@ -72,6 +72,9 @@ class GlobalContext:
     # For split mode
     min_st_lvs: int = 1 
     min_gt_lvs: int = 2
+    # For mt selection
+    strict_max: bool = False
+    allow_redun: bool = False
       
     # Paths that define the "Session"
     root_dir: Path = field(default_factory=lambda: Path(get_default_outdir()))
@@ -489,6 +492,14 @@ class InitParser:
                  "(r)ectify: Autocorrect nested events between iterations, including via sister relationships [default]. "
                  "(s)trict_rectify: Rectify, but only consider internally nested events when tracing missing subgenomes. "
                  "(m)odel: Model nested copies during MT creation. Computationally heaviest, but most exact.")
+        g_algo.add_argument('--strict_constraint', dest='strict_constraint', action='store_true',
+            help="If set, ploidy constraints will apply strictly to number of copies of a species, rather than to "
+                 "number of their monophyletic clades.")
+        g_algo.add_argument('--allow_redunant_mts', dest='allow_redundant_mts', action='store_true',
+            help="If set, the program will not filter out redundant MUL-trees where taxa are grafted below themselves (i.e., having "
+                 "identical groupings and scores with those grafted above themselves). This may be useful for debugging and for exact "
+                 "reproduction of legacy-GRAMPA output, but is not recommended for general use due to increased runtime and algorithmic " 
+                 "incompatibility with full/mixed modes.")
         
         g_algo.add_argument('--optim', dest='optim', action='store_true',
             help="If set, will run alternative algorithms for [1.] MT construction and [2.] reconciliation: " 
@@ -1044,6 +1055,8 @@ class InitParser:
             nesting       = nesting,
             min_gt_lvs    = args.min_gt_lvs,
             min_st_lvs    = args.min_st_lvs,
+            strict_max    = args.strict_constraint,
+            allow_redun   = args.allow_redundant_mts,
             root_dir      = out_dir,
             log_file      = log_file,
             history       = history,

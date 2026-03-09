@@ -9,7 +9,7 @@ from tqdm import tqdm
 from pathlib import Path
 from itertools import chain
 from functools import partial
-from typing import Tuple, List, Optional, Dict, Union, Callable, Set
+from typing import Tuple, List, Optional, Dict, Union, Set
 
 from .config import TaskConfig
 from .logger import GranLogger
@@ -40,7 +40,8 @@ class CommonOps:
         if not isinstance(p, (Path, str)):
             return "invalid", []
         
-        if isinstance(p, str) and not os.path.exists(p):
+        # Universal tree characters that Windows paths explicitly forbid
+        if isinstance(p, str) and any(c in p for c in ('(', ')', ';')):
             return "raw", []
 
         p = Path(p)
@@ -252,7 +253,7 @@ class TreeLoader:
         # Note: ETE3 handles rooting differently, but strict bifurcating tree property holds:
         # Leaves = N, Internal = N-1.
         leaves = len(t.get_leaves())
-        internal = len([n for n in t.traverse() if not n.is_leaf()])
+        internal = sum(not n.is_leaf() for n in t.traverse())
         if internal != (leaves - 1):
             # This usually happens if the root has only 2 children? 
             # Actually for rooted bifurcating: N leaves -> N-1 internal (including root).
@@ -718,14 +719,16 @@ class MulTreeManager:
         return h_nodes
 
     @staticmethod
-    def _is_redundant_graft(matches: List[Tree], h1_st_node: Tree) -> bool:
-        for target in matches:
-            sisters = target.get_sisters()
-            if len(sisters)==1 and sisters[0].pure == h1_st_node.pure:
-                return True
+    def _is_redundant_graft(matches: List[Tree], h1_st_node: Tree, allow_redundant: bool) -> bool:
+        if not allow_redundant:
+            for target in matches:
+                sisters = target.get_sisters()
+                if len(sisters)==1 and sisters[0].pure == h1_st_node.pure:
+                    return True
         return False
 
-    def _compile_h2_targets(self, h1_st_node: Tree, h2_resolved: List[str], nesting: str, n1_pure_descendants: Set[str], allowance: float) -> List[List[Tree]]:
+    def _compile_h2_targets(self, h1_st_node: Tree, h2_resolved: List[str], nesting: str, n1_pure_descendants: Set[str],
+                            allowance: float, allow_redundant: bool = False) -> List[List[Tree]]:
         """
         Evaluates all H2 candidates for a given H1 and returns a list of valid match groups.
         Each item is a list of ETE3 nodes that should be grafted onto simultaneously.
@@ -754,10 +757,11 @@ class MulTreeManager:
             # identical to grafting onto the target's parent. Because the parent will ALSO
             # be evaluated as a target in this loop, skipping this prevents duplicate MUL-trees
             # and safely protects the internal integrity of previously marked <P> clades.
-            is_redundant = self._is_redundant_graft(matches, h1_st_node)
+            is_redundant = self._is_redundant_graft(matches, h1_st_node, allow_redundant)
             # Compared to normal Grampa we produce (num_nodes-1) less MTs in the first iter too,
             # because each node that is not the root would be able to be grafted below itself,
             # but this is not a bug! It can still graft above itself... And the root node is not effected...
+            # Allow_redundant (false by default) is for recreating this **wrong** behavior if desired or for testing.
             
             # Ploidy check and redundancy blocking
             if is_redundant or len(matches) > allowance:
@@ -821,7 +825,7 @@ class MulTreeManager:
         if self.ploidies:
             step = "Applying ploidy constraints"
             self.logger.report_step(step, "In progress...")
-            h1_resolved, h1_allowances = self._apply_ploidy_constraints(h1_resolved, bin_id = self.tcf.binary_id)
+            h1_resolved, h1_allowances = self._apply_ploidy_constraints(h1_resolved, self.tcf.binary_id, self.tcf.strict_max)
             self.logger.log(f"After ploidy filtering, {len(h1_resolved)} H1 candidates remain: {h1_resolved}", 'd')
             self.logger.report_step(step, "Success: identified compatible H nodes")
         else:
@@ -858,7 +862,8 @@ class MulTreeManager:
             n1_pure_descendants = pure_desc_cache.get(h1_st_node, set())
             
             # Get the definitive list of valid target groupings
-            match_groups = self._compile_h2_targets(h1_st_node, h2_resolved, nesting, n1_pure_descendants, h1_allowances[h1])
+            match_groups = self._compile_h2_targets(h1_st_node, h2_resolved, nesting, n1_pure_descendants,
+                                                    h1_allowances[h1], self.tcf.allow_redun)
             valid_pairings[h1] = match_groups
             num_mul_trees += len(match_groups)
             
