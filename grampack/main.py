@@ -149,7 +149,7 @@ class Task:
         self.mul_mgr = MulTreeManager(tcf, self.spec_tree, self.logger)
 
         # 2. Build MUL-Trees (Delegates all legacy mode intercepts natively)
-        self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(self.ctx.nesting)
+        self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(self.ctx.nesting, self.ctx.strict_max, self.ctx.allow_redun)
 
         # If build() returns an empty dict, it means a terminal mode (count-mts or build-mts)
         # successfully finished or a warning was logged. Exit smoothly.

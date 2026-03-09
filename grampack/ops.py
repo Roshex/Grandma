@@ -606,7 +606,7 @@ class MulTreeManager:
         # Convert lists to tuples for return type consistency
         return {k: tuple(v) for k, v in counts.items()}
         
-    def _apply_ploidy_constraints(self, h1_candidates: List[str], bin_id: Optional[int], is_strict: bool = False) -> Tuple[List[str], Dict[str, float]]:
+    def _apply_ploidy_constraints(self, h1_candidates: List[str], bin_id: Optional[int], strict_constraint: bool) -> Tuple[List[str], Dict[str, float]]:
         """
         Filters H1 candidates and calculates how many NEW copies each can tolerate.
         Centralizes all ploidy math for Simple, Full, Split, and Mixed modes.
@@ -616,11 +616,8 @@ class MulTreeManager:
         filtered_h1: List[str] = []
         h1_allowances: Dict[str, float] = {}
 
-        # 2. Determine Current Statistics based on Stricter Option vs Default
-        # Assumes a flag like self.tcf.strict_ploidy exists (defaults to False if not present)
-        is_strict = getattr(self.tcf, 'strict_ploidy', False)
-        
-        if is_strict:
+        # Determine Current Statistics based on Stricter Option vs Default
+        if strict_constraint:
             # STRICT MODE: Count exactly how many disjoint pure matches currently exist in the tree
             ploidy_stats = {}
             for sp in self.ploidies.keys():
@@ -728,7 +725,7 @@ class MulTreeManager:
         return False
 
     def _compile_h2_targets(self, h1_st_node: Tree, h2_resolved: List[str], nesting: str, n1_pure_descendants: Set[str],
-                            allowance: float, allow_redundant: bool = False) -> List[List[Tree]]:
+                            allowance: float, allow_redundant_mts: bool) -> List[List[Tree]]:
         """
         Evaluates all H2 candidates for a given H1 and returns a list of valid match groups.
         Each item is a list of ETE3 nodes that should be grafted onto simultaneously.
@@ -757,7 +754,7 @@ class MulTreeManager:
             # identical to grafting onto the target's parent. Because the parent will ALSO
             # be evaluated as a target in this loop, skipping this prevents duplicate MUL-trees
             # and safely protects the internal integrity of previously marked <P> clades.
-            is_redundant = self._is_redundant_graft(matches, h1_st_node, allow_redundant)
+            is_redundant = self._is_redundant_graft(matches, h1_st_node, allow_redundant_mts)
             # Compared to normal Grampa we produce (num_nodes-1) less MTs in the first iter too,
             # because each node that is not the root would be able to be grafted below itself,
             # but this is not a bug! It can still graft above itself... And the root node is not effected...
@@ -775,7 +772,10 @@ class MulTreeManager:
             
         return valid_match_groups
 
-    def build(self, nesting: str ='ignore') -> Tuple[Dict[int, MulTree], List[str], List[str], Dict[str, int]]:
+    def build(self,
+              nesting: str='model',
+              strict_constraint: bool=False,
+              allow_redundant_mts: bool=False) -> Tuple[Dict[int, MulTree], List[str], List[str], Dict[str, int]]:
         mul_trees: Dict[int, MulTree] = {}
 
         # --- ADD SPECIES TREE (INDEX 0) ---
@@ -825,7 +825,7 @@ class MulTreeManager:
         if self.ploidies:
             step = "Applying ploidy constraints"
             self.logger.report_step(step, "In progress...")
-            h1_resolved, h1_allowances = self._apply_ploidy_constraints(h1_resolved, self.tcf.binary_id, self.tcf.strict_max)
+            h1_resolved, h1_allowances = self._apply_ploidy_constraints(h1_resolved, self.tcf.binary_id, strict_constraint)
             self.logger.log(f"After ploidy filtering, {len(h1_resolved)} H1 candidates remain: {h1_resolved}", 'd')
             self.logger.report_step(step, "Success: identified compatible H nodes")
         else:
@@ -862,8 +862,7 @@ class MulTreeManager:
             n1_pure_descendants = pure_desc_cache.get(h1_st_node, set())
             
             # Get the definitive list of valid target groupings
-            match_groups = self._compile_h2_targets(h1_st_node, h2_resolved, nesting, n1_pure_descendants,
-                                                    h1_allowances[h1], self.tcf.allow_redun)
+            match_groups = self._compile_h2_targets(h1_st_node, h2_resolved, nesting, n1_pure_descendants, h1_allowances[h1], allow_redundant_mts)
             valid_pairings[h1] = match_groups
             num_mul_trees += len(match_groups)
             
