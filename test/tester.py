@@ -69,7 +69,7 @@ if __name__ == "__main__":
             o_old = path_manual / 'o_old'
             o_new = path_manual / 'o_new'
 
-            run_str_new = f"python {new_tool} -g {g} -s {s} --debug --plot -v 3 -p 10 -o"
+            run_str_new = f"python {new_tool} -g {g} -s {s} --plot -v 3 -p 10 -o"# --debug
             run_str_old = f"python {old_tool} -g {g} -s {s} --overwrite -o"
 
             #time_tool(f"{run_str_new} {o_new}/", "new") # --debug --plot -w 1 50
@@ -78,7 +78,7 @@ if __name__ == "__main__":
             #time_tool(f"{run_str_new} {o_new}_np/ --optim --nestedness model", "new") # --debug --plot
             #time_tool(f"{run_str_new} {o_new}_spltnew/ -m split --start auto -x {x} --maps 6 --min_gt_lvs 1", "new") #--plot --start 1 -i 2 --repair
             
-            time_tool(f"{run_str_new} {o_new}/ --generate {g}", "new")
+            time_tool(f"{run_str_new} {o_new}/ --generate {g} --bench", "new")
             
             #time_tool(f"{run_str_old} {o_old}_v0 --maps -v 0", "old")
             #time_tool(f"{run_str_old} {o_old}_v1 --maps -v 1", "old")

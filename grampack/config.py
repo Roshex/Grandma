@@ -15,7 +15,7 @@ from typing import Optional, Tuple, Dict, Any, Union, List
 from dataclasses import dataclass, field, replace, fields
 
 from .logger import GranLogger
-from .models import SmrtTree, Map, HistoryType
+from .models import SmrtTree, HistoryType
 
 import datetime
 
@@ -32,7 +32,7 @@ class GranMetadata:
     github: str = "https://github.com/Roshex/Grandma"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "3.0.6"
+    version: str = "3.0.7"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -51,15 +51,19 @@ class GlobalContext:
     """
     # System Resources
     num_processes: int = 1
-    verbosity: int = 3
     seed: int = 42
+    optim: bool = False
     
-    # Global Flags
+    # Output & Logging Controls
+    verbosity: int = 3
+    pickles: str = "archive" # 'keep', 'clean', 'archive'
+    maps: bool = False
     plot: bool = False
     norun: bool = False
     nolog: bool = False
+    bench: bool = False
     debug: bool = False
-    optim: bool = False
+    sample: int = 2
 
     # Global Flow/Algorithm Options
     orth_opt: bool = False
@@ -95,9 +99,9 @@ class GlobalContext:
         Validates that keys exist to prevent silent errors.
         """
         # Certain fields should not be allowed to be changed
-        forbidden_keys = {"seed", "plot", "norun", "nolog", "orth_opt",
-        "max_iter", "nesting", "mixed_switch", "min_gt_lvs", "min_st_lvs",
-        "root_dir", "log_file", "history", "start_pt"}
+        forbidden_keys = {"seed", "pickles", "maps", "plot", "norun", "nolog", 
+        "bench", "orth_opt", "max_iter", "nesting", "mixed_switch",
+        "min_gt_lvs", "min_st_lvs", "root_dir", "log_file", "history", "start_pt"}
         # Safety check to ensure we aren't inventing new fields
         valid_fields = {f.name for f in fields(self)}
         for key in changes:
@@ -135,7 +139,6 @@ class TaskConfig:
     predefined_rets: Dict[int, List[Tuple[str, str]]] = field(default_factory=dict)
     group_cap: int = 8
     weights: Tuple[int, int] = (1, 1) # (w_dup, w_loss)
-    to_map: int = 0 # False, True, int for max maps to keep, -1 for all
     max_select: int = 1 # max mts to select for processing per Run (non-overlapping H clades & scoring above ST)
 
     # Legacy Flags
@@ -157,7 +160,7 @@ class TaskConfig:
         Validates that keys exist to prevent silent errors.
         """
         # Certain fields should not be allowed to be changed
-        forbidden_keys = {'group_cap', 'to_map', 'max_select', 'run_prefix'}
+        forbidden_keys = {'group_cap', 'max_select', 'run_prefix'}
         # Safety check to ensure we aren't inventing new fields
         valid_fields = {f.name for f in fields(self)}
         for key in changes:
@@ -461,6 +464,8 @@ class InitParser:
         g_general.add_argument("-v", "--verbosity", type=int, default=2, choices=range(5),
             help="Level of verbosity printed to the screen. 0 = none; 1 = run info; 2 = standard; "
                  "3 = debug; 4 = verbose debugging. Default = 2.")
+        g_general.add_argument("--generate", type=str, metavar="JSON_CONFIG",
+            help="Path to JSON configuration file. Enters Generation Mode (ignores other flags).")
 
         # --- Algorithmic Options ---
         g_algo = self.parser.add_argument_group("Algorithmic Options")
@@ -478,8 +483,8 @@ class InitParser:
         g_algo.add_argument("-w", "--weights", type=int, nargs=2, default=[1, 1],
             help="Space-separated integer weights for the parsimony score calculation: 'w_dup w_loss'. Default = '1 1'.")
         g_algo.add_argument("-n", "--max_select", type=int, default=1,
-            help="Maximum MUL-trees to select per run for parallel inference heuristics. Default: 1, i.e., only the best "
-                 "scoring MT is considered per iteration.")
+            help="Maximum MUL-trees to select per run for postprocessing and detailed outputs. Default: 1, i.e., only the best "
+                 "scoring MT is considered per iteration (Default: 1, All_until_input_st_inclusive: 0, ALL: any negative int).")
         g_algo.add_argument("--min_st_lvs", type=int, default=1,
             help="Minimum species tree leaves for a species tree to be considered valid. Specifically relevant for the "
                  "split mode. Default: 1.")
@@ -518,7 +523,6 @@ class InitParser:
                  "count-mts: Count possible MUL-trees only. "
                  "build-mts: Build MUL-trees only. "
                  "check-nums: Count groups only. "
-                 "no-recon: Build MTs & count groups. "
                  "no-st: Skip reconciliation to input. "
                  "st-only: Reconciliation to input only.")
         g_flow.add_argument('-i', '--iter', type=int, default=0,
@@ -536,23 +540,30 @@ class InitParser:
 
         # --- Output Options ---
         g_output = self.parser.add_argument_group("Output Options")
-        g_output.add_argument("--generate", type=str, metavar="JSON_CONFIG",
-            help="Path to JSON configuration file. Enters Generation Mode (ignores other flags).")
-        g_output.add_argument("--maps", nargs='?', const=1, default=0, type=int,
-            help="If set, the detailed output file will contain node mappings for each gene tree to the lowest "
-                 "scoring MUL-tree. Specify number to retreive for multiple lowest MTs (default if present: 1, all: -1).")
-        g_output.add_argument('--plot', action='store_true',
-            help="Plot taxon count, MP score, and normalized score over iterations. Relevant only for iterative modes.")
-        g_output.add_argument('--debug', action='store_true',
-            help="Enable debug mode for additional outputs to the log file (whereas --v 3 only prints debug messages to screen).")
         g_output.add_argument("--overwrite", action="store_true",
             help="If set, overwrite existing files in the output directory. Default: exit if files exist.")
+        g_output.add_argument("--pickles", type=str, choices=['keep', 'k', 'clean', 'c', 'archive', 'a'], default='archive',
+            help="Action to take on the pickle directory after an inference step: "
+                 "(k)eep: leave files untouched for fast resuming. "
+                 "(c)lean: delete the directory (Warning: prevents resuming). "
+                 "(a)rchive: compresses the entire directory into a single .tar.gz file (Default; auto-resumed).")
+        g_output.add_argument("--maps", action='store_true',
+            help="If set, the detailed output file will contain node mappings for each gene tree to each of the lowest "
+                 "scoring MUL-tree in the file.")
+        g_output.add_argument('--plot', action='store_true',
+            help="Plot taxon count, MP score, and normalized score over iterations. Relevant only for iterative modes.")
         g_output.add_argument("--norun", action="store_true",
             help="If set, only print the run info and exit.")
         g_output.add_argument("--nolog", action="store_true",
             help="If set, do not write a log file.")
+        g_output.add_argument("--bench", action="store_true",
+            help="If set, write a benchmark tsv file with runtime for each step. Only applicable if --norun is not set.")
+        g_output.add_argument('--debug', action='store_true',
+            help="Enable debug mode for additional outputs to the log file (whereas --v 3 only prints debug messages to screen).")
         g_output.add_argument('--seed', type=int, default=42,
             help="Random seed for sampling and reproducibility. Default = 42.")
+        g_output.add_argument('--sample', type=int, default=2,
+            help="Number of samples to sample from large iterables. Default = 2.")
 
         # --- Legacy Flags ---
         g_legacy = self.parser.add_argument_group("Legacy Support")
@@ -593,45 +604,68 @@ class InitParser:
                 self.logger.log(f'Invalid absolute cutoff: {val}', 'e')
         self.logger.log(f'Invalid cutoff format: "{val}". Use "auto", "rel:<float>", or "abs:<int>".', 'e')
 
-    def resolve_mode_logic(self, mode, label_sp, count_mts, build_mts, check_nums, st_only, no_st) -> Tuple[str, int]:
+    def resolve_mode_logic(self, mode: str, lgflags: Dict[str, bool]) -> Tuple[str, int]:
         """
         Consolidates modern --mode and legacy flags into a single mode string.
         Returns resolved mode and mixed switch value.
         """
+        # Sum boolean values safely
+        num_set_legacy = sum(bool(v) for v in lgflags.values())
+        
+        if num_set_legacy > 1:
+            self.logger.log("Multiple legacy flags set! One will be chosen according to precedence.", 'w')
 
-        mixed_switch = 3 # default switch point
+        # Priority 1: Direct --mode selection (if not single)
+        if mode != "single" and num_set_legacy:
+            self.logger.log("Flag --mode overrides legacy flags!", 'w')
+
+        # Parse Complex / Modern Modes
         if mode.startswith("mixed"):
+            mixed_switch = 3 # default switch point in mixed mode
             if '-' in mode:
                 try:
-                    _, mixed_switch = mode.split('-')
-                    mixed_switch = int(mixed_switch)
+                    _, mixed_switch_str = mode.split('-')
+                    mixed_switch = int(mixed_switch_str)
                     assert mixed_switch > 0
                 except (ValueError, AssertionError):
                     self.logger.log(f"Invalid mixed mode format: {mode}. Expected 'mixed' or 'mixed-<int>', where <int> is strictly positive.", 'e')
             mode = "mixed"
-
-        m = "default"
-        if label_sp: m = "label-sp"
-        elif count_mts: m = "count-mts"
-        elif build_mts: m = "build-mts"
-        elif check_nums: m = "check-nums"
-        elif st_only: m = "st-only"
-        elif no_st: m = "no-st"
-
-        if build_mts and check_nums: m = "no-recon"
-        elif sum([label_sp, count_mts, build_mts, check_nums, st_only, no_st]) > 1:
-            self.logger.log("Multiple legacy flags set! One will be chosen according to precedence.", 'w')
-
-        # Priority 1: Direct --mode selection (if not single)
-        if mode != "single" and mode != m:
-            self.logger.log("--mode flag overrides legacy flags!", 'w')
-            return mode, mixed_switch
-        
-        # Priority 2: If mode is single and no legacy flags are set
-        if m == "default":
-            return "single", mixed_switch
+        else:
+            mixed_switch = 0 # for bin_id in normal split mode
             
-        return m, mixed_switch
+            # Map valid legacy aliases from the --mode string into the dictionary
+            if mode in {"label-sp", "label_sp", "labeltree"}:
+                lgflags['label-sp'] = True
+            elif mode in {"count-mts", "count_mts", "numtrees"}:
+                lgflags['count-mts'] = True
+            elif mode in {"build-mts", "build_mts", "buildmultrees"}:
+                lgflags['build-mts'] = True
+            elif mode in {"check-nums", "check_nums", "checknums"}:
+                lgflags['check-nums'] = True
+            elif mode in {"st-only", "st_only"}:
+                lgflags['st-only'] = True
+            elif mode in {"no-st", "no_st"}:
+                lgflags['no-st'] = True
+            elif mode not in {"single", "split", "full"}:
+                self.logger.log(f"Unknown mode '{mode}': using fallback to 'single' or a set legacy flag.", 'w')
+                mode = "single"
+
+        # Standardize the final output string based on precedence
+        if mode in {"mixed", "split", "full"}:
+            # Major computational modes override all legacy booleans
+            pass 
+        else:
+            # Resolve legacy modes in strict order from "earliest exit" to "longest execution"
+            precedence_order = ['label-sp', 'count-mts', 'build-mts', 'check-nums', 'st-only', 'no-st']
+            for flag in precedence_order:
+                if lgflags.get(flag):
+                    mode = flag
+                    break
+            # No-break clause of the for-else loop: if no legacy flags are set True, default to "single"
+            else:
+                mode = "single"
+                
+        return mode, mixed_switch
 
     @staticmethod
     def resolve_nesting(val: str) -> str:
@@ -958,7 +992,6 @@ class InitParser:
             sys.exit(0)
 
         self.logger.log_software_banner(GranMetadata())
-        self.logger.log("=" * 73, 'i')
 
         ####
         # Logging strategy:
@@ -969,21 +1002,12 @@ class InitParser:
         ###
 
         # --- Resolve Argument Logistics ---
-        mode, mixed_switch = self.resolve_mode_logic(
-            args.mode,
-            args.labeltree,
-            args.numtrees,
-            args.buildmultrees,
-            args.checknums,
-            args.st_only,
-            args.no_st
-        )
-        """legacy_flags = {
-            'label_sp': args.labeltree, 'count_mts': args.numtrees,
-            'build_mts': args.buildmultrees, 'check_nums': args.checknums,
-            'st_only': args.st_only, 'no_st': args.no_st
+        legacy_mode_flags = {
+            'label-sp': args.labeltree, 'count-mts': args.numtrees,
+            'build-mts': args.buildmultrees, 'check-nums': args.checknums,
+            'st-only': args.st_only, 'no-st': args.no_st
         }
-        mode, mixed_switch = self.resolve_mode_logic(args.mode, legacy_flags)"""
+        mode, mixed_switch = self.resolve_mode_logic(args.mode, legacy_mode_flags)
 
         nesting = self.resolve_nesting(args.nesting)
 
@@ -1042,11 +1066,15 @@ class InitParser:
         ctx = GlobalContext(
             num_processes = n_procs,
             verbosity     = args.verbosity,
-            seed          = args.seed,
+            pickles       = args.pickles,
+            maps          = args.maps,
             plot          = args.plot,
             norun         = args.norun,
             nolog         = args.nolog,
+            bench         = args.bench,
             debug         = args.debug,
+            seed          = args.seed,
+            sample        = args.sample,
             optim         = args.optim,
             orth_opt      = args.orthologies,
             max_iter      = check_loop_length(args.iter, i, None, history, self.logger),
@@ -1077,8 +1105,7 @@ class InitParser:
             ploidies      = args.ploidy,
             group_cap     = args.cap,
             weights       = tuple(args.weights),
-            to_map        = args.maps,
-            max_select    = max(args.max_select, 1),
+            max_select    = args.max_select,
             is_mul_input  = args.is_mul_input,
         )
 

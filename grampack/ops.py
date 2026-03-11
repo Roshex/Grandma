@@ -1,12 +1,12 @@
 import os
 import re
 import sys
-import bisect
 import pickle
 import tempfile
 import multiprocessing as mp
 from tqdm import tqdm
 from pathlib import Path
+from shutil import rmtree, make_archive, unpack_archive
 from itertools import chain
 from functools import partial
 from typing import Tuple, List, Optional, Dict, Union, Set
@@ -103,7 +103,7 @@ class CommonOps:
             logger.log(f"{desc} file '{input}' not found.", key)
         else:
             logger.log(f"Invalid input type for {desc}.", key)
-
+                
 class TreeLoader:
     """
     Handles loading, verification, and optional repais of Species and Gene trees.
@@ -111,7 +111,7 @@ class TreeLoader:
     _SANITIZE_TRANS = str.maketrans('_.', '--') # Replace any chars in '_.' with '-'
 
     @staticmethod
-    def spec_tree(tcf: TaskConfig, logger: GranLogger) -> SmrtTree:
+    def spec_tree(tcf: TaskConfig, logger: GranLogger) -> Optional[SmrtTree]:
 
         if isinstance(tcf.st, SmrtTree):
             # Do nothing, already loaded
@@ -154,7 +154,14 @@ class TreeLoader:
             CommonOps.write_handoff_files(tcf.output_dir, st=t)
 
         logger.report_step(step, "Success: species tree read")
-        return SmrtTree(tree_obj=t)
+        st_wrapper = SmrtTree(tree_obj=t)
+
+        if tcf.mode == "label-sp":
+            logger.log(f"The input species tree with internal nodes labeled:", 'i')
+            logger.log(f"{st_wrapper.to_str(internals=True)}", 'i', prefix='')
+            logger.log(f"Label-sp Mode terminates before parsing the species tree: exiting...", 'i')
+            return None
+        return st_wrapper
 
     @staticmethod
     def gene_trees(tcf: TaskConfig, logger: GranLogger) -> Optional[Dict[int, SmrtTree]]:
@@ -606,7 +613,7 @@ class MulTreeManager:
         # Convert lists to tuples for return type consistency
         return {k: tuple(v) for k, v in counts.items()}
         
-    def _apply_ploidy_constraints(self, h1_candidates: List[str], bin_id: Optional[int], strict_constraint: bool) -> Tuple[List[str], Dict[str, float]]:
+    def _apply_ploidy_constraints(self, h1_candidates: List[str], bin_id: Optional[int], is_strict: bool) -> Tuple[List[str], Dict[str, float]]:
         """
         Filters H1 candidates and calculates how many NEW copies each can tolerate.
         Centralizes all ploidy math for Simple, Full, Split, and Mixed modes.
@@ -617,7 +624,7 @@ class MulTreeManager:
         h1_allowances: Dict[str, float] = {}
 
         # Determine Current Statistics based on Stricter Option vs Default
-        if strict_constraint:
+        if is_strict:
             # STRICT MODE: Count exactly how many disjoint pure matches currently exist in the tree
             ploidy_stats = {}
             for sp in self.ploidies.keys():
@@ -725,7 +732,7 @@ class MulTreeManager:
         return False
 
     def _compile_h2_targets(self, h1_st_node: Tree, h2_resolved: List[str], nesting: str, n1_pure_descendants: Set[str],
-                            allowance: float, allow_redundant_mts: bool) -> List[List[Tree]]:
+                            allowance: float, allow_redundant: bool) -> List[List[Tree]]:
         """
         Evaluates all H2 candidates for a given H1 and returns a list of valid match groups.
         Each item is a list of ETE3 nodes that should be grafted onto simultaneously.
@@ -754,7 +761,7 @@ class MulTreeManager:
             # identical to grafting onto the target's parent. Because the parent will ALSO
             # be evaluated as a target in this loop, skipping this prevents duplicate MUL-trees
             # and safely protects the internal integrity of previously marked <P> clades.
-            is_redundant = self._is_redundant_graft(matches, h1_st_node, allow_redundant_mts)
+            is_redundant = self._is_redundant_graft(matches, h1_st_node, allow_redundant)
             # Compared to normal Grampa we produce (num_nodes-1) less MTs in the first iter too,
             # because each node that is not the root would be able to be grafted below itself,
             # but this is not a bug! It can still graft above itself... And the root node is not effected...
@@ -814,21 +821,23 @@ class MulTreeManager:
 
         # --- EARLY RETURN FOR ST-ONLY ---
         if self.tcf.mode == "st-only":
+            self.logger.log("INFO   : ST-only mode skips hybrid parsing and MUL-tree generation", 'i')
             return mul_trees, [], [], self.ploidies
         
         step = "Parsing hybrid clades"
         self.logger.report_step(step, "In progress...")
-        h1_resolved = self._resolve_h_inputs(self.tcf.h1_nodes, "h1")
+        h1_resolved_original = self._resolve_h_inputs(self.tcf.h1_nodes, "h1")
         h2_resolved = self._resolve_h_inputs(self.tcf.h2_nodes, "h2")
         self.logger.report_step(step, "Success: got H nodes")
 
         if self.ploidies:
             step = "Applying ploidy constraints"
             self.logger.report_step(step, "In progress...")
-            h1_resolved, h1_allowances = self._apply_ploidy_constraints(h1_resolved, self.tcf.binary_id, strict_constraint)
+            h1_resolved, h1_allowances = self._apply_ploidy_constraints(h1_resolved_original, self.tcf.binary_id, strict_constraint)
             self.logger.log(f"After ploidy filtering, {len(h1_resolved)} H1 candidates remain: {h1_resolved}", 'd')
             self.logger.report_step(step, "Success: identified compatible H nodes")
         else:
+            h1_resolved = h1_resolved_original.copy()
             h1_allowances: Dict[str, float] = {h: float('inf') for h in h1_resolved}
 
         # --- O(N) Bottom-Up Semantic Cache ---
@@ -869,7 +878,7 @@ class MulTreeManager:
         self.logger.report_step(step, f"Success: {num_mul_trees} total MUL-trees")
                         
         if self.tcf.mode == "count-mts":
-            self.report_mt_count(self.st.ete_tree, h1_resolved, h2_resolved, num_mul_trees)
+            self.report_mt_count(self.st.ete_tree, h1_resolved_original, h2_resolved, num_mul_trees, nesting, bool(self.ploidies), allow_redundant_mts)
             return {}, [], [], {} # Returns empty dict to signal main.py to exit
  
         # --- BUILDING STEP ---
@@ -896,7 +905,7 @@ class MulTreeManager:
         self.logger.report_step(step, f"Success: {mul_num-1} MUL-trees built")
 
         if self.tcf.mode == "build-mts":
-            self.report_mt_build(mul_trees)
+            self.report_mt_build(mul_trees, nesting)
             return {}, [], [], {} # Returns empty dict to signal main.py to exit
 
         if not mul_trees:
@@ -906,33 +915,47 @@ class MulTreeManager:
             
         return mul_trees, h1_resolved, h2_resolved, self.ploidies
 
-    def report_mt_count(self, st_ete: Tree, h1_resolved: List[str], h2_resolved: List[str], num_mul_trees: int) -> None:
+    def report_mt_count(self, st_ete: Tree, h1_resolved: List[str], h2_resolved: List[str], num_mul_trees: int,
+                        nesting: str, has_ploidies: bool, allow_redundant_mts: bool) -> None:
         """Prints a report of the MUL-tree count, replicating legacy mul_tree.py output."""
-        n = sum(1 for _ in st_ete.traverse())
         n_tips = len(st_ete.get_leaves())
-        self.logger.log("", 'i')
-        self.logger.log("MUL-tree Count Report:", 'i')
-        self.logger.log(f"Total nodes in species tree: {n}", 'i')
+        n_nodes = n_tips*2 - 1 # Assumes full bifurcation (a valid species tree)
+        # Max possible calculation
+        name_to_node = {n.name: n for n in st_ete.traverse()}
+        h2_set = set(h2_resolved)
+        max_possible = 0
+        for h1_name in h1_resolved:
+            h1_node = name_to_node.get(h1_name)
+            # Find descendants of H1
+            desc_names = {d.name for d in h1_node.get_descendants()}
+            # Valid H2s are the total H2s MINUS the H2s that are descendants of this H1
+            invalid_h2s = desc_names.intersection(h2_set)
+            max_possible += len(h2_resolved) - len(invalid_h2s)
+
+        self.logger.log("MUL-tree Count Report: exiting after", 'i')
+        self.logger.log(f"Total nodes in species tree: {n_nodes}", 'i')
         self.logger.log(f"Total tips in species tree.: {n_tips}", 'i')
         self.logger.log(f"H1 nodes...................: {','.join(h1_resolved)}", 'i')
         self.logger.log(f"H2 nodes...................: {','.join(h2_resolved)}", 'i')
-        self.logger.log(f"Possible MUL-trees.........: {num_mul_trees}", 'i')
-        self.logger.log("", 'i')
+        self.logger.log(f"Possible MUL-trees.........: {max_possible}", 'i')
+        self.logger.log(f"Modeling Nested constraints: {'On' if nesting == 'model' else 'Off'}", 'i')
+        self.logger.log(f"Ploidy constraints.........: {'On' if has_ploidies else 'Off'}", 'i')
+        self.logger.log(f"Redundancy filter..........: {'Off' if allow_redundant_mts else 'On'}", 'i')
+        self.logger.log(f"Actual MUL-trees...........: {num_mul_trees}", 'i')
 
-    def report_mt_build(self, mul_trees: Dict[int, MulTree]) -> None:
+    def report_mt_build(self, mul_trees: Dict[int, MulTree], nesting: str) -> None:
         """Prints a report of the built MUL-trees, replicating legacy mul_tree.py output."""
-        self.logger.log("", 'i')
-        self.logger.log("MUL-tree Build Report:", 'i')
-        self.logger.log("\t".join(["mul.tree", "h1.node", "h2.node", "labeled.tree"]), 'i')
+        self.logger.log("MUL-tree Build Report: exiting after", 'i')
+        hx_colname = "hx.node" if nesting == "model" else "h2.node"
+        self.logger.log("\t".join(["mul.tree", "h1.node", hx_colname, "labeled.tree"]), 'i', prefix='')
         for mul_num, mt_data in mul_trees.items():
             # Skip the base species tree like in the legacy code
             if mul_num == 0: 
                 continue
-            tree_str = mt_data.mt.to_marked_str(mt_data.h1_node)
-            h1_name = mt_data.h1_node.name if mt_data.h1_node else "NA"
-            h2_name = ",".join(n.name for n in mt_data.hx_nodes) if mt_data.hx_nodes else "NA"
-            self.logger.log(f"{mul_num}\t{h1_name}\t{h2_name}\t{tree_str}", 'i')
-        self.logger.log("", 'i')
+            tree_str = mt_data.to_marked_str()
+            h1_name = mt_data.h1_node.name
+            hx_sisters = ",".join(n.name for n in mt_data.hx_sisters)
+            self.logger.log(f"{mul_num}\t{h1_name}\t{hx_sisters}\t{tree_str}", 'i', prefix='')
 
 # --- Multiprocessing Workers ---
 
@@ -1025,17 +1048,23 @@ def _check_and_write_worker(payload: Tuple[int, str, str, str], sorted_gene_ids:
     return m_idx, "".join(buffer), local_failures
 
 class GeneTreeManager:
-    def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1):
+    def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1, pickle_action: str = 'archive'):
         self.tcf = config
         self.logger = logger
         self.n_procs = num_processes
-        
-    def cull(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry):
+        self.pickle_action = pickle_action
+
+    def cull(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry) -> bool:
         if self.tcf.mode != "st-only":
             self.collapse_groups(mul_trees, gene_trees, registry)
         original_count = max(gene_trees.keys()) + 1 if gene_trees else 0
         gt_failures = self.filter_and_check(mul_trees, gene_trees)
         self.write_filtered_trees(gene_trees, gt_failures, original_count)
+        if self.tcf.mode != "check-nums":
+            return True
+        self.logger.log("Check-nums Mode terminates before reconciliation: exiting...", 'i')
+        self.handle_pickles()
+        return False
 
     def _check_registry_safety(self, registry_path: Path, registry: NameRegistry) -> bool:
         """Registry Persistence Logic"""
@@ -1055,11 +1084,63 @@ class GeneTreeManager:
         # (they contain IDs that map to the old registry) -> overwrite them.
         return not registry_loaded
 
+    def handle_pickles(self) -> None:
+        """Handles post-iteration pickle cleanup or compression."""
+        pickle_dir = self.tcf.pickle_dir
+        action = self.pickle_action
+        if not pickle_dir.exists() or action.startswith('k'): # keep
+            return
+
+        if action.startswith('c'): # clean
+            step = "Cleaning up pickle directory"
+            self.logger.report_step(step, "In progress...")
+            try:
+                rmtree(pickle_dir)
+                self.logger.report_step(step, "Success")
+            except Exception as e:
+                self.logger.log(f"Failed to clean pickle directory: {e}", 'w')
+
+        elif action.startswith('a'): # archive
+            step = "Archiving pickle directory"
+            self.logger.report_step(step, "In progress...")
+            try:
+                # shutil.make_archive creates 'pkls.tar.gz' 
+                archive_base_path = str(pickle_dir) 
+                make_archive(
+                    base_name=archive_base_path, 
+                    format='gztar', 
+                    root_dir=pickle_dir.parent, 
+                    base_dir=pickle_dir.name
+                )
+                # Delete the uncompressed directory to free up the space and inodes
+                rmtree(pickle_dir)
+                self.logger.report_step(step, f"Success: created {pickle_dir.name}.tar.gz")
+            except Exception as e:
+                self.logger.log(f"Failed to archive pickle directory: {e}", 'w')
+
+        else:
+            self.logger.log(f"Unknown pickle handling action: '{action}'", 'w')
+
+    def unpack_archive(self, pickle_dir: Path) -> None:
+        archive_path = Path(str(pickle_dir) + '.tar.gz')
+        if not pickle_dir.exists() and archive_path.exists() and not self.tcf.overwrite:
+            step_unpack = "Unpacking pickle archive"
+            self.logger.report_step(step_unpack, "In progress...")
+            try:
+                unpack_archive(archive_path, extract_dir=pickle_dir.parent)
+                self.logger.report_step(step_unpack, "Success")
+            except Exception as e:
+                self.logger.log(f"Failed to unpack archive: {e}", 'w')
+
     def collapse_groups(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry):
         """
         Computes groups for all MUL-trees using registry-optimized logic and DUMPS to pickle immediately.
         Does NOT retain data in memory.
         """
+        pickle_dir = self.tcf.pickle_dir
+        self.unpack_archive(pickle_dir) # Handle archived pickles if needed
+        pickle_dir.mkdir(parents=True, exist_ok=True)
+     
         step = "Collapsing gene tree groupings"
         self.logger.report_step(step, "In progress...")
 
@@ -1076,12 +1157,9 @@ class GeneTreeManager:
             for name in all_names:
                 registry.get_id(name)
         
-        pickle_dir = self.tcf.pickle_dir
-        pickle_dir.mkdir(parents=True, exist_ok=True)
-
         registry_path = pickle_dir / f"{self.tcf.run_prefix}_registry.pickle"
         force_regenerate = self._check_registry_safety(registry_path, registry)
-     
+
         # Prepare Tasks (skip 0)
         # Only process if pickle doesn't exist or forced
         tasks = []
@@ -1122,8 +1200,8 @@ class GeneTreeManager:
                     # Init Workers pointing to file
                     # This works on ALL OSs
                     with mp.Pool(processes=self.n_procs, initializer=_init_collapse_worker, initargs=(temp_file_path,)) as pool:
-                        for res in tqdm(pool.imap_unordered(_collapse_worker, tasks), total=len(tasks), desc="Collapsing", unit="mt", 
-                                      disable=self.logger.disable_tqdm):
+                        for res in tqdm(pool.imap_unordered(_collapse_worker, tasks), total=len(tasks), desc="# Collapsing", unit="mt", 
+                                      disable=self.logger.disable_tqdm, ncols=177):
                             save_result(res)
                             
                 finally:
@@ -1143,7 +1221,7 @@ class GeneTreeManager:
                 _worker_registry = registry
                 
                 # We don't need init function, just call worker directly
-                for item in tqdm(tasks, desc="Collapsing", unit="mt", disable=self.logger.disable_tqdm):
+                for item in tqdm(tasks, desc="# Collapsing", unit="mt", disable=self.logger.disable_tqdm, ncols=177):
                     res = _collapse_worker(item)
                     save_result(res)
                 
@@ -1158,7 +1236,7 @@ class GeneTreeManager:
         except Exception as e:
             self.logger.log(f"saving registry pickle: {e}", 'e')
             
-        self.logger.report_step(step, "Success")
+        self.logger.report_step(step, "Success", full_update=True)
 
     def filter_and_check(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]) -> Dict[int, int]:
         """
@@ -1182,7 +1260,7 @@ class GeneTreeManager:
             pickle_path = self.tcf.pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
             
             # String Formatting
-            mt_str = m_data.mt.to_marked_str(m_data.h1_node)
+            mt_str = m_data.to_marked_str()
             h_info = ""
             if not self.tcf.is_mul_input:
                 h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
@@ -1205,7 +1283,7 @@ class GeneTreeManager:
             if self.n_procs > 1:
                 with mp.Pool(processes=self.n_procs) as pool:
                     iterator = pool.imap_unordered(worker_func, tasks)
-                    for res in tqdm(iterator, total=len(tasks), desc="Checking  ", unit="mt", disable=self.logger.disable_tqdm):
+                    for res in tqdm(iterator, total=len(tasks), desc="# Filtering ", unit="mt", disable=self.logger.disable_tqdm, ncols=177):
                         m_idx, buf, fails = res
                         results_map[m_idx] = buf
                         # Merge failures
@@ -1213,7 +1291,7 @@ class GeneTreeManager:
                             if g_idx not in gt_failures: gt_failures[g_idx] = []
                             gt_failures[g_idx].extend(failures)
             else:
-                for task in tqdm(tasks, desc="Checking  ", unit="mt", disable=self.logger.disable_tqdm):
+                for task in tqdm(tasks, desc="# Filtering ", unit="mt", disable=self.logger.disable_tqdm, ncols=177):
                     m_idx, buf, fails = worker_func(task)
                     results_map[m_idx] = buf
                     for g_idx, failures in fails.items():
@@ -1227,7 +1305,7 @@ class GeneTreeManager:
                 if m_idx in results_map:
                     f.write(results_map[m_idx])
 
-        self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap")
+        self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap", full_update=True)
         
         for g_idx in sorted(gt_failures.keys()):
             if g_idx in gene_trees:

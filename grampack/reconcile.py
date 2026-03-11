@@ -64,10 +64,11 @@ def _worker_reconcile_single(
     return mul_idx, total_score, gt_results
 
 class Reconciler:
-    def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1, optim: bool = False):
+    def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1, to_map: bool = False, optim: bool = False):
         self.tcf = config
         self.logger = logger
         self.n_procs = num_processes
+        self.to_map = to_map
         self.optim = optim
     
     @staticmethod
@@ -609,30 +610,38 @@ class Reconciler:
             with mp.Pool(processes=self.n_procs) as pool:
                 flat_tasks = [(k, v.mt.flat_tree) for k, v in tasks]
                 iterator = pool.imap_unordered(worker_func, flat_tasks)
-                for idx, score, gt_res in tqdm(iterator, total=len(tasks), desc="Scoring   ", unit="st", disable=self.logger.disable_tqdm):
+                for idx, score, gt_res in tqdm(iterator, total=len(tasks), desc="# Scoring   ", unit="st", disable=self.logger.disable_tqdm, ncols=177):
                     all_scores[idx] = score
                     if retmap:
                         detailed_res[idx] = gt_res
         else:
             #for k, v in tasks:
-            for k, v in tqdm(tasks, total=len(tasks), desc="Scoring   ", unit="st", disable=self.logger.disable_tqdm):
+            for k, v in tqdm(tasks, total=len(tasks), desc="# Scoring   ", unit="st", disable=self.logger.disable_tqdm, ncols=177):
                 item = (k, v.mt.flat_tree)
                 idx, score, gt_res = worker_func(item)
                 all_scores[idx] = score
                 if retmap:
                     detailed_res[idx] = gt_res
 
-        self.logger.report_step(step, "Success")
+        self.logger.report_step(step, "Success", full_update=True)
         return sorted(all_scores.items(), key=lambda x: x[1]), detailed_res
     
     def get_lowest_maps(self, sorted_scores: List[Tuple[int, int]], n_lowest: int, 
                         mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree],
-                        registry: NameRegistry) -> Dict[int, Dict[int, ReconResult]]:
+                        registry: NameRegistry, enforce_input_tree: bool = False) -> Dict[int, Dict[int, ReconResult]]:
         
         step = "Getting maps for lowest scoring MTs"
         self.logger.report_step(step, "In progress...")
-        detailed_res = {} 
+
+        if enforce_input_tree:
+            # Find the ranking of the input tree (MUL-tree 0) and adjust limit to include it if necessary
+            # May be None in no-st Mode, but we handle it earlier just in case
+            input_rank = next((i for i, (idx, _) in enumerate(sorted_scores) if idx == 0), None)
+            if input_rank is not None:
+                limit = max(limit, input_rank + 1)
         limit = min(len(sorted_scores), n_lowest)
+
+        detailed_res = {} 
         dup_cost, loss_cost = self.tcf.weights
         
         # Ensure flat structures exist (should be cached from recon_all)
@@ -665,7 +674,7 @@ class Reconciler:
             
             detailed_res[idx] = gt_results
             
-        self.logger.report_step(step, "Success")
+        self.logger.report_step(step, f"Success: got {limit}/{len(mul_trees)} maps")
         return detailed_res
         
     def run(self, mul_trees: dict, gene_trees: dict, registry: NameRegistry) -> TaskResult:
@@ -673,50 +682,64 @@ class Reconciler:
         if registry is None: registry = NameRegistry()
 
         num_mts = len(mul_trees)
-        limit = self.tcf.to_map if self.tcf.to_map >= 0 else num_mts
-        # Full mode may require 2 maps at least
-        # Can't select more than available MTs
-        corrected_max_select = min(self.tcf.max_select+1, num_mts)
-        limit = max(limit, corrected_max_select)
+        max_select = self.tcf.max_select
+
+        # -n 0 enforces having the input tree maps in the output
+        enforce_input_tree = (max_select == 0)
+        if self.tcf.mode == 'no-st':
+            true_min = 1
+            if enforce_input_tree:
+                self.logger.log("Warning: Enforce input tree is enabled using -n 0 but mode is 'no-st'. Falling back to -n 1 for reconciliation.", 'w')
+                enforce_input_tree = False
+                max_select = 1
+        else:
+            # Full mode may require 2 maps at least, if top is ST
+            # no-st mode doesn't need this fix
+            true_min = 2
+        min_select = min(true_min, num_mts)
+
+        # Normalize selection to the num_mts range - can't select more than available MTs
+        max_select_norm = max_select if max_select >= 0 and max_select < num_mts else num_mts
+
+        limit = max(max_select_norm, min_select)
+        
+        if enforce_input_tree:
+            # We don't know the ST rank yet, so we must score without maps first
+            high_demand = False
+        else:
+            # High Map Demand Threshold: 10%
+            high_demand = (limit > num_mts * 0.1)
 
         if self.optim:
             self.logger.log("Using optimized reconciliation method.", 'i')
-        
-        # High Map Demand Threshold: 10%
-        high_demand = (limit > num_mts * 0.1)
 
         if high_demand:
-            self.logger.log("High map demand detected. Generating maps directly during scoring.", 'i')
+            self.logger.log(f"High map demand detected ({limit}/{num_mts}). Generating maps directly during scoring.", 'i')
             sorted_scores, detailed_res = self.recon_all(mul_trees, gene_trees, registry, retmap=True)
             
             # Trim the detailed_res down to `limit` to save memory and I/O writing overhead
             # while sorting to keep it consistent with the output format of get_lowest_maps.
             detailed_res = {k: detailed_res[k] for k, _ in sorted_scores[:limit] if k in detailed_res}
-
         else:
             sorted_scores, _ = self.recon_all(mul_trees, gene_trees, registry, retmap=False)
-            detailed_res = self.get_lowest_maps(sorted_scores, limit, mul_trees, gene_trees, registry)
+            detailed_res = self.get_lowest_maps(sorted_scores, limit, mul_trees, gene_trees, registry, enforce_input_tree)
+
+        if len(detailed_res) == 2 and max_select == 1 and 0 not in detailed_res:
+            # Edge Case: If user requested only 1 tree but the input tree (MUL-tree 0) is not in the top 2,
+            # this means we added 1 during min_select in vein, so we must now del the second item in detailed_res
+            # to enforce the user's original request of 1 tree.
+            keys = list(detailed_res.keys())
+            del detailed_res[keys[1]]
 
         # Write outputs
         self.write_detailed(detailed_res, gene_trees)
-        self.write_scores(sorted_scores, mul_trees)
-        self.write_dup_counts(detailed_res, mul_trees)
+        self.write_scores_and_counts(sorted_scores, mul_trees, detailed_res)
 
-        # Get the first k,v pair from detailed_res
-        # This dict will be "sorted"
+        # Instead of keeping ReconResult, keep Maps[0] (Dict[int, Dict[int, Map]] vs Dict[int, Dict[int, ReconResult]] in StepResult)
         detailed_kept = {}
-        is_input_in = 0
         for mul_idx in detailed_res:
-            # Instead of keeping ReconResult, keep Maps[0] (Dict[int, Dict[int, Map]] vs Dict[int, Dict[int, ReconResult]] in StepResult)
             maps_dict = {g_idx: res.maps[0] for g_idx, res in detailed_res[mul_idx].items()}
             detailed_kept[mul_idx] = maps_dict
-            # Check if idx 0 (input tree) is a key in the dict yet
-            if mul_idx == 0:
-                is_input_in = 1
-            if len(detailed_kept) >= self.tcf.max_select + is_input_in:
-                # If input tree is included, allow one extra
-                # otherwise, we might not get enough inferred MTs
-                break
 
         return TaskResult(sorted_scores, mul_trees, detailed_kept, gene_trees)
     
@@ -746,35 +769,39 @@ class Reconciler:
         
         p = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-detailed.txt"
         with open(p, 'w') as f:
-            f.write("mul.tree\tgene.tree\tdups\tlosses\ttotal.score\tmaps\n")
             
-            i, to_map = 0, self.tcf.to_map
+            header = "mul.tree\tgene.tree\tdups\tlosses\ttotal.score"
+            header += "\tmaps\n" if self.to_map != 0 else "\n"
+            f.write(header)
+
             for mul_idx, res_dict in detailed_res.items():
-                if to_map >= 0 and i >= to_map:
-                    break
+
+                f.write(f"# MUL-tree {mul_idx}\n")
                 for gene_idx, res in res_dict.items():
-                    gt_obj = gene_trees[gene_idx]
-                    
+
                     # Handle multiple maps if present
                     if (maps_len := len(res.maps)) > 1:
                         f.write(f"# GT-{gene_idx+1} to MT-{mul_idx}\t{maps_len} maps found!\n")
                         
+                    gt_obj = gene_trees[gene_idx]
                     for map_obj in res.maps:
-                        map_str = gt_obj.to_str(
-                            internals=True,
-                            name_formatter=map_formatter,
-                            maps=map_obj.cor,
-                            dups=map_obj.dups
-                            )
-                        map_str = map_str.replace("<|", "[").replace("|>", "]") # Avoid Newick issues with angle brackets
-                        f.write(f"{mul_idx}\t{gene_idx+1}\t{map_obj.n_dups}\t{map_obj.n_losses}\t{res.score}\t{map_str}\n")
-                i += 1
+                        if self.to_map:
+                            map_str = gt_obj.to_str(
+                                internals=True,
+                                name_formatter=map_formatter,
+                                maps=map_obj.cor,
+                                dups=map_obj.dups
+                                )
+                            map_str = '\t' + map_str.replace("<|", "[").replace("|>", "]") # Avoid Newick issues with angle brackets
+                        else:
+                            map_str = ''
+                        f.write(f"{mul_idx}\t{gene_idx+1}\t{map_obj.n_dups}\t{map_obj.n_losses}\t{res.score}{map_str}\n")
                                  
-        self.logger.report_step(step, "Success")
+        self.logger.report_step(step, f"Success: recorded {len(detailed_res)} MTs{' with maps' if self.to_map else ''}")
 
-    def write_scores(self, sorted_scores: list, mul_trees: dict):
+    def write_scores_and_counts(self, sorted_scores: list, mul_trees: dict, detailed_res: dict):
 
-        step = "Writing main output file"
+        step = "Writing main output files"
         self.logger.report_step(step, "In progress...")
         
         p = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-scores.txt"
@@ -782,18 +809,20 @@ class Reconciler:
             f.write("mul.tree\th1.node\thx.nodes\tscore\tlabeled.tree\n")
             for idx, score in sorted_scores:
                 mul_data = mul_trees[idx]
-                tree_str = mul_data.mt.to_marked_str(mul_data.h1_node)
+                tree_str = mul_data.to_marked_str()
                 h1_name = mul_data.h1_node.name if mul_data.h1_node else "NA"
                 # Handle single or multiple Hx targets
                 hx_names = ",".join([n.name for n in mul_data.hx_sisters]) if mul_data.hx_sisters else "NA"  
                 f.write(f"{idx}\t{h1_name}\t{hx_names}\t{score}\t{tree_str}\n")
 
+        self.write_dup_loss(detailed_res, mul_trees)
+
         self.logger.report_step(step, "Success")
 
-    def write_dup_counts(self, detailed_res: dict, mul_trees: dict):
+    def write_dup_loss(self, detailed_res: dict, mul_trees: dict):
         p_dup = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-dup-counts.txt"
         with open(p_dup, 'w') as f:
-            f.write("mul.tree\tnode\tdups\n")
+            f.write("mul.tree\tnode\tdups\tlosses\n")
             for mul_idx, res_dict in detailed_res.items():
                 mul_data = mul_trees[mul_idx]
                 hybrid_clade = mul_data.h_clade
@@ -801,6 +830,7 @@ class Reconciler:
                 
                 # Pre-fill dictionary with 0s to guarantee NO missing rows
                 main_dups = {node: 0 for node in ordered_nodes}
+                main_losses = main_dups.copy()
                 
                 # Accumulate counts efficiently
                 for g_idx, res in res_dict.items():
@@ -810,9 +840,14 @@ class Reconciler:
                         if count > 0:
                             map_node = cor_maps[gt_node][0]
                             main_dups[map_node] += count
-                                
+                    for gt_node, count in first_map.losses.items():
+                        if count > 0:
+                            map_node = cor_maps[gt_node][0]
+                            main_losses[map_node] += count
+
                 # Write ordered output
                 for node in ordered_nodes:
-                    count = main_dups[node]
+                    dups = main_dups[node]
+                    losses = main_losses[node]
                     out_node = node + "+" if node in hybrid_clade else node
-                    f.write(f"{mul_idx}\t{out_node}\t{count}\n")
+                    f.write(f"{mul_idx}\t{out_node}\t{dups}\t{losses}\n")

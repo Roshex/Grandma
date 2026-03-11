@@ -9,13 +9,14 @@ By utilizing flattened array-based tree structures and $O(1)$ Lowest Common Ance
 ## ✨ Key Features
 
 * **Blazing Fast Reconciliation:** A re-engineered core using Range Minimum Query, Euler tours, and integer sparse tables avoids the massive overhead of regex, string parsing, and naive tree traversals. For topological operations, ETE3 is utilized with dedicated wrappers to bypass standard object traversal bottlenecks.
-* **Iterative Discovery Modes:** Unlike GRAMPA which is limited to inferring a single event, GRANDMA iteratively discovers multiple nested or independent reticulations using its built-in full, split, or mixed search algorithms.
-* **Advanced MUL-Tree Generation:** Go beyond simple diploid hybridization. GRANDMA supports generating MUL-trees with multiple additional clade copies (not just one) and can recursively build them from existing, already-reticulated MUL-trees. Furthermore, GRANDMA now prevents generating redundant MTs, reducing the search space.
-* **Tunable Parsimony Scoring:** Offers finer control over the reconciliation engine by adjusting the specific penalty weights used for calculating the parsimony scores.
+* **Iterative Discovery Modes:** Unlike GRAMPA, which is limited to inferring a single event, GRANDMA iteratively discovers multiple nested or independent reticulations using its built-in full, split, or mixed search algorithms.
+* **Advanced MUL-Tree Generation:** Go beyond simple diploid hybridization. GRANDMA supports generating MUL-trees with multiple additional clade copies (not just one) and can recursively build them from existing, already-reticulated MUL-trees. Furthermore, generation of redundant, topologically identical MTs is now prevented (by default), reducing the search space.
+* **Tunable Parsimony Scoring:** Offers finer control over the reconciliation engine by allowing adjustments to the specific penalty weights used for calculating the parsimony scores.
 * **Biologically Constrained:** Support for a ploidy constraint file. By explicitly defining the maximum allowable genomic copies per species, GRANDMA dynamically prunes the combinatorial search space and prevents biologically impossible reticulations.
 * **High Scalability & Minimal Filtration:** Thanks to its massive performance improvements and memory efficiency, GRANDMA can handle massive genomic datasets natively, and requires little-to-no gene tree culling or filtration ('cap' step).
 * **Network & eNewick Support:** Pass predefined reticulations via eNewick strings (e.g., `((A,(B)#H1),((C,#H1),D));`) to perform Guided Iterative Searches or directly rank hypotheses.
-* **Robust History Tracking & Resumption:** Built for massive cluster environments. GRANDMA continuously logs its iterative history and tree states, allowing you to seamlessly pause, resume, or branch analyses directly from intermediate checkpoints without starting over.
+* **Robust History Tracking & Resumption:** GRANDMA continuously logs its iterative history and tree states, allowing you to seamlessly pause, resume, or branch analyses directly from intermediate checkpoints without starting over.
+* **HPC-Optimized I/O & Checkpointing:** Built for strict cluster environments. By default, GRANDMA compresses its intermediate state files (pickles) into a single `.tar.gz` archive. When resuming an analysis, it automatically detects and unpacks these on the fly. Is also supports running "clean", automatically erasing intermediate files.
 * **Dual Interface:** Run seamlessly from the command line or import it as a Python package for direct integration into Jupyter Notebooks and custom pipelines.
 
 ## 📥 Installation

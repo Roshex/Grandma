@@ -23,14 +23,16 @@ except ImportError:
 
 class GranLogger:
     def __init__(self, log_file: Path, verbosity: int = 4, debug: bool = False, no_log: bool = False,
-                 parent_logger: 'GranLogger' = None, clear_log: bool = True, catch_exceptions: bool = True):
+                 parent_logger: 'GranLogger' = None, clear_log: bool = True, catch_exceptions: bool = True, label: str = ""):
         self.log_file = log_file
         self.verbosity = verbosity    # Controls screen output (0-4)
         self.debug = debug       # Controls if 'd' messages go to file
         self.no_log = no_log          # Controls if ANY messages go to file
         self.parent_logger = parent_logger
+        self.label = label
         self.start_time = time.time()
         self.step_start_time = 0
+        self.benchmarks = None # Optional List of (step_name, elapsed_time) tuples for benchmarking
         self.pids = [psutil.Process(os.getpid())] if HAS_PSUTIL else []
         self.warnings = 0
         # States for Warning Buffering
@@ -38,10 +40,11 @@ class GranLogger:
         self.step_buffer = []
         
         # Ensure dir exists & clear log file
-        self.log_file.parent.mkdir(parents=True, exist_ok=True)
-        if clear_log:
-            with open(self.log_file, 'w') as f:
-                f.write("")
+        if not no_log:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            if clear_log:
+                with open(self.log_file, 'w') as f:
+                    f.write("")
 
         if catch_exceptions and not no_log and log_file:
             self.catch_all_exceptions()
@@ -51,7 +54,7 @@ class GranLogger:
         stream = sys.stderr
         return self.verbosity < 3 or not (hasattr(stream, "isatty") and stream.isatty())
 
-    def log(self, msg: str, key: str, to_screen: bool = True, kill_on_error: bool = True):
+    def log(self, msg: str, key: str, to_screen: bool = True, kill_on_error: bool = True, prefix: str = "# "):
         """
         Unified logging function.
         Writes to log file and optionally to screen based on verbosity.
@@ -72,7 +75,6 @@ class GranLogger:
         key_map = {'e': 0, 'i': 1, 'w': 2, 's': 2, 'd': 3, 'dx': 4}
         
         level = key_map.get(key, 0)
-        prefix = "# "
         if key == 'e': 
             prefix = "# ERROR: " if str(msg)[0].isupper() else "# Error "
         elif key == 'w':
@@ -95,7 +97,7 @@ class GranLogger:
         if log_to_file:
             # Propagate to Parent (File only)
             if self.parent_logger:
-                self.parent_logger.log(msg, key, to_screen=False, kill_on_error=False)
+                self.parent_logger.log(msg, key, to_screen=False, kill_on_error=False, prefix=prefix)
 
             try:
                 # Append to log file
@@ -142,32 +144,50 @@ class GranLogger:
         # Bind the custom handler to Python's global hook
         sys.excepthook = handle_exception
 
+    def assimilate(self, worker_log_path: Path):
+        """Safely appends a finished worker's log into the main log."""
+        if not worker_log_path.exists(): 
+            return
+            
+        if not self.no_log:
+            with open(self.log_file, 'a') as main_f:
+                with open(worker_log_path, 'r') as worker_f:
+                    # Read the worker log and write it directly
+                    main_f.write(worker_f.read())
+
+            # Pass to parent logger if exists (for multi-level workers)
+            if self.parent_logger:
+                self.parent_logger.assimilate(worker_log_path)
+
     def spaced(self, s, width):
         return str(s) + " " * (width - len(str(s)))
 
     def get_date_time(self):
         return datetime.datetime.now().strftime("%m.%d.%Y  %H:%M:%S")
 
-    def report_step(self, step_name: str, status: str, start: bool = False, full_update: bool = False):
+    def report_step(self, step_name: str, status: str, start: bool = False, full_update: bool = False, enable_benchmark: bool = False):
         """Mimics the specific table-like reporting of the old GRAMPA."""
 
         # Standard visual widths (Total width including the "# " prefix)
-        col_widths = [14, 10, 50, 40, 20, 16]
+        col_widths = [12, 10, 50, 40, 20, 16]
         if HAS_PSUTIL:
             col_widths += [18, 10]
 
         current_time = time.time()
 
         if start:
+            if enable_benchmark:
+                self.benchmarks = []
+
             headers = ["Date", "Time", "Current step", "Status", "Elapsed time (s)", "Step time (s)"]
             if HAS_PSUTIL:
                 headers += ["Current mem (MB)", "Virtual mem (MB)"]
 
             # Adjust first column: log() adds "# " (2 chars), so we subtract 2 from the first header spacing
-            header_widths = list(col_widths)
-            header_widths[0] -= 2 
+            #header_widths = list(col_widths)
+            #header_widths[0] -= 2 
                 
-            header_str = "".join([self.spaced(h, w) for h, w in zip(headers, header_widths)])
+            header_str = "".join([self.spaced(h, w) for h, w in zip(headers, col_widths)])
             border = "-" * (175 if HAS_PSUTIL else 150)
             
             self.log(border, 'i')
@@ -193,7 +213,7 @@ class GranLogger:
 
             self.step_start_time = current_time
             out_parts = [
-                f"# {datetime.datetime.now().strftime('%m.%d.%Y')}",
+                datetime.datetime.now().strftime('%m.%d.%Y'),
                 datetime.datetime.now().strftime('%H:%M:%S'),
                 step_name,
                 status
@@ -201,17 +221,20 @@ class GranLogger:
             line = "".join([self.spaced(p, w) for p, w in zip(out_parts, col_widths[:4])])
             
             if self.verbosity > 1:
-                sys.stdout.write(line)
+                sys.stdout.write("# " + line)
                 sys.stdout.flush()
         else:
             # Step completion
             self.step_active = False
 
             step_elapsed = f"{current_time - self.step_start_time:.5f}"
+
+            if self.benchmarks is not None:
+                self.benchmarks.append((step_name, step_elapsed))
             
             # Legacy logic: File gets full line, Screen gets partial update or full update
             full_parts = [
-                f"# {datetime.datetime.now().strftime('%m.%d.%Y')}",
+                datetime.datetime.now().strftime('%m.%d.%Y'),
                 datetime.datetime.now().strftime('%H:%M:%S'),
                 step_name,
                 status,
@@ -226,7 +249,7 @@ class GranLogger:
             # Screen output
             if self.verbosity > 1:
                 if full_update:
-                    sys.stdout.write(file_line + "\n")
+                    sys.stdout.write("# " + file_line + "\n")
                 else:
                     # Clear "In progress..."
                     sys.stdout.write("\b" * 40)
@@ -248,14 +271,14 @@ class GranLogger:
                     self.step_buffer = [] # Clear
             
             # Write full line to log
-            with open(self.log_file, "a") as f:
-                f.write(file_line + "\n")
+            self.log(file_line, 'i', to_screen=False)
 
     def log_software_banner(self, meta: 'GranMetadata'):
         """Prints the static software info (Authors, DOI, Version)."""
         # This replaces the first half of the old print_start_banner
         key = 'i' if self.verbosity == 0 else 's'
         
+        self.log("", key)
         self.log("=" * 73, key)
         self.log(f"Welcome to GRANDMA -- {meta.version} .", key)
         self.log(f"Version {meta.version} released on {meta.release}", key)
@@ -270,13 +293,30 @@ class GranLogger:
         self.log(f"Using Python version:               {'.'.join(map(str, sys.version_info[:3]))}", key)
         self.log(f"\n# The program was called as:          {' '.join(sys.argv)}\n#", key)
 
-    def start_run(self, ctx: 'GlobalContext', tcf: 'TaskConfig'):
+    def norun_banner(self):
+        key = 'i' if self.verbosity == 0 else 's'
+        self.log("-" * 125, key)
+        self.log("--norun SET. EXITING AFTER PRINTING OPTIONS INFO...", 'i')
+        self.log("", key)
+
+    def title_banner(self, title: str):
+        key = 'i' if self.verbosity == 0 else 's'
+        self.log("=" * 73, 'i')
+        if title:
+            self.log(f"--- {title.upper()} ---", key)
+
+    def start_info(self, ctx: 'GlobalContext', tcf: 'TaskConfig'):
         """Replicates startProg from opt_parse.py"""
-        if ctx.norun: return
         
         key = 'i' if self.verbosity == 0 else 's'
 
-        self.log("-" * 125, key)
+        if self.label:
+            self.log("=" * 125, key)
+            self.log(f"--- BEGIN TASK LOG: {self.label} ---", key)
+            self.log("=" * 125, key)
+        else:
+            self.log("-" * 125, key)
+
         self.log("INPUT/OUTPUT INFO:", key)
 
         pad = 38 # NEW: was 40, to account for "# " prefix
@@ -332,38 +372,57 @@ class GranLogger:
         self.log(self.spaced("--no-st, --st-only", pad) + self.spaced(st_opt_str, 30) + st_desc, key)
         # --maps
         if tcf.mode != "check-nums":
-             map_desc = "GRAMPA will output node mappings for the lowest scoring tree in the detailed output file." if tcf.to_map else "GRAMPA will only output duplication and loss counts in the detailed output file."
-             self.log(self.spaced("--maps", pad) + self.spaced(str(tcf.to_map), 30) + map_desc, key)
+             map_desc = "GRAMPA will output node mappings for the lowest scoring tree in the detailed output file." if ctx.maps else "GRAMPA will only output duplication and loss counts in the detailed output file."
+             self.log(self.spaced("--maps", pad) + self.spaced(str(ctx.maps), 30) + map_desc, key)
         # --overwrite
         if tcf.overwrite:
              self.log(self.spaced("--overwrite", pad) + self.spaced("True", 30) + "GRAMPA will OVERWRITE the existing files in the specified output directory.", key)
+        if ctx.norun:
+             self.log(self.spaced("--norun", pad) + self.spaced("True", 30) + "ONLY PRINTING RUNTIME INFO.", key)
 
         if self.verbosity == 1:
             self.log("-" * 125, key)
             self.log(f"{self.get_date_time()} INFO: Starting GRAMPA. With -v 1 set, no more information will be printed to the screen until the end of the run.", key)
 
-    def print_end_prog(self, tcf, min_score=0, min_idx=0, min_data=None):
+    def end_prog(self, min_score=0, min_idx=0, min_tree_str=""):
         """Replicates endProg from reconcore.py"""
         total_time = time.time() - self.start_time
+        output_dir = self.log_file.parent
         key = 'i' if self.verbosity == 0 else 's' 
         self.log("=" * 175, key)
         self.log("\n# Done!", key)
         self.log(f"The date and time at the end is: {self.get_date_time()}", key)
         self.log(f"Total execution time:            {round(total_time, 3)} seconds.", key)
-        self.log(f"Output directory for this run:   {tcf.output_dir}", key)
+        self.log(f"Output directory for this run:   {output_dir}", key)
         self.log(f"Log file for this run:           {self.log_file}", key)
+        if self.benchmarks:
+            bench_file = output_dir / f"_benchmarks.tsv"#{tcf.run_prefix}
+            try:
+                with open(bench_file, 'w') as f:
+                    f.write("Step\tTime_Seconds\n")
+                    for step_name, elapsed in self.benchmarks:
+                        f.write(f"{step_name}\t{elapsed}\n")
+                self.log(f"Benchmarks saved to:             {bench_file}", key)
+            except Exception as e:
+                self.log(f"Failed to write benchmarks: {e}", 'w')
+            # Clear benchmarks after writing
+            self.benchmarks = None
         if self.warnings > 0:
             self.log(f"\n# Task finished with {self.warnings} WARNINGS -- check log file for more info", key)
 
-        if min_data:
-            min_tree_str = min_data.mt.to_marked_str(min_data.h1_node)
-            self.log("-" * 40, key)
+        if min_tree_str:
+            self.log("-" * 125, key)
             if min_idx != 0:
                  self.log(f"The MUL-tree with the minimum parsimony score is MT-{min_idx}:\t{min_tree_str}", key)
             else:
                  self.log(f"The tree with the minimum parsimony score is the singly-labeled tree (ST):\t{min_tree_str}", key)
             self.log(f"Score = {min_score}", key)
-            self.log("-" * 40, key)
 
-        self.log("=" * 175, key)
+        if self.label:
+            self.log("=" * 125, key)
+            self.log(f"--- END TASK LOG: {self.label} ---", key)
+            self.log("=" * 125, key)
+        else:
+            self.log("-" * 125, key)
+
         self.log("", key)

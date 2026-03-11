@@ -21,7 +21,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 from .config import InitParser, GlobalContext, TaskConfig
 from .flow import FlowManager
 from .logger import GranLogger
-from .models import SmrtTree, NameRegistry, TaskResult, HistoryType
+from .models import SmrtTree, MulTree, NameRegistry, TaskResult, HistoryType
 from .ops import TreeLoader, GeneTreeManager, MulTreeManager
 from .orthology import OrthologyLabeler
 from .reconcile import Reconciler
@@ -51,7 +51,9 @@ class NoDaemonPool(multiprocessing.pool.Pool):
 
 # --- Standalone workers function supporting parallel processing --- #
 
-def task_worker(payload: Tuple[Any, Any, str], context: GlobalContext, config: TaskConfig, verbosity=0, parent_logger=None):
+def task_worker(payload: Tuple[Any, Any, str],
+                context: GlobalContext, config: TaskConfig,
+                verbosity: int = 0, label: str = '', parent_logger: Optional[GranLogger] = None) -> Tuple[str, Optional[TaskResult], Dict[str, Any], Path]:
     """
     Unified worker for both Sequential (Full) and Binary (Split) modes.
     Returns: (task_id, result, updates, log_file)
@@ -88,7 +90,7 @@ def task_worker(payload: Tuple[Any, Any, str], context: GlobalContext, config: T
 
     # If no parent logger provided (preferred in multiprocessing)
     # create logger without forwarding to parent
-    logger = GranLogger(iter_tcf.log_file, verbosity, no_log=context.nolog, debug=context.debug, parent_logger=parent_logger)
+    logger = GranLogger(iter_tcf.log_file, verbosity, no_log=context.nolog, debug=context.debug, parent_logger=parent_logger, label=label)
 
     # Execute Task
     # Task.execute returns (StepResult, updates)
@@ -123,102 +125,84 @@ class Task:
              
     def execute(self, tcf: TaskConfig) -> Tuple[Optional[TaskResult], Dict[str, Any]]:
 
-        # 0. Setup for this task & log banner
+        # Setup task & log banner
         Path(tcf.output_dir).mkdir(parents=True, exist_ok=True)
         if not self.logger:
             # Create a new logger if one wasn't passed (standard behavior)
             log_file = Path(tcf.output_dir) / f"{tcf.run_prefix}.log"
             self.logger = GranLogger(log_file, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug)
-        self.logger.start_run(self.ctx, tcf)
+        self.logger.start_info(self.ctx, tcf)
 
-        # --norun Implementation
         if self.ctx.norun:
-            self.logger.log("ONLY PRINTING RUNTIME INFO (due to --norun).", 'i')
+            self.logger.norun_banner()
             return None, {}
 
-        self.logger.report_step("", "", start=True)
+        self.logger.report_step("", "", start=True, enable_benchmark=self.ctx.bench)
 
-        # 1. Load Species Tree
+        # Load Species Tree
         self.spec_tree = TreeLoader.spec_tree(tcf, self.logger)
 
-        if tcf.mode == "label-sp":
-            self.spec_tree.report_labels()
-            return None, {}
+        # If the ST is None, terminal label-sp mode successfully finished or a warning was logged. Exit smoothly.
+        if not self.spec_tree:
+            self.logger.end_prog(); return None, {}
         
         # Re-init component with current task
         self.mul_mgr = MulTreeManager(tcf, self.spec_tree, self.logger)
 
-        # 2. Build MUL-Trees (Delegates all legacy mode intercepts natively)
+        # Build MUL-Trees
         self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(self.ctx.nesting, self.ctx.strict_max, self.ctx.allow_redun)
 
-        # If build() returns an empty dict, it means a terminal mode (count-mts or build-mts)
-        # successfully finished or a warning was logged. Exit smoothly.
+        # If build() returns an empty dict, a terminal mode (count-mts or build-mts) successfully finished or a warning was logged. Exit smoothly.
         if not self.mul_trees:
-            return None, {}
+            self.logger.end_prog(); return None, {}
 
-        # 3. Load Gene Trees
+        # Load Gene Trees
         self.gene_trees = TreeLoader.gene_trees(tcf, self.logger)
 
-        # DEBUG - print the string representation of all gene trees and the species tree and the first MUL tree
-        """for mul_idx, md in self.mul_trees.items():
-            print(f"MUL Tree {mul_idx}: {md.mt.to_str(internals=True)}, \
-                  H1: {md.h1_node}, H2: {md.h2_node}, Hybrid Clade: {md.h_clade}")
-        for gene_num, gt_obj in self.gene_trees.items():
-            ginfo = {}
-            for n in gt_obj.ete_tree.traverse():
-                # in a list, store: branch length, parent name, "tip"/"internal"/"root", support
-                n_type = "tip" if n.is_leaf() else ("root" if n.is_root() else "internal")
-                ginfo[n.name] = [n.dist, n.up.name if n.up else None, n_type, n.support]
-            print(f"Gene Tree {gene_num}: {gt_obj.to_str(internals=True)}, Node Info: {ginfo}")
-        print(f"Species Tree: {self.spec_tree.to_str(internals=True)})"""
-
         # Re-init component with current task
-        self.reconciler = Reconciler(tcf, self.logger, self.ctx.num_processes, self.ctx.optim)
-        self.gene_mgr = GeneTreeManager(tcf, self.logger, self.ctx.num_processes)
+        self.reconciler = Reconciler(tcf, self.logger, self.ctx.num_processes, self.ctx.maps, self.ctx.optim)
+        self.gene_mgr = GeneTreeManager(tcf, self.logger, self.ctx.num_processes, self.ctx.pickles)
 
-        # 4. Collapse & Filter Groups
+        # Collapse & Filter Groups
         # Note: In iterative modes, we are filtering the *memory* gene trees, 
         # which effectively filters them for subsequent iterations too.
-        # TBD !!!
-        self.gene_mgr.cull(self.mul_trees, self.gene_trees, self.registry)
-        if tcf.mode == "check-nums": return None, {}
+        # TBD ?
+        proceed = self.gene_mgr.cull(self.mul_trees, self.gene_trees, self.registry)
 
-        # DEBUG
-        """for gene_num, (gt_obj, x) in self.gene_trees.items():
-            print(f"Gene Tree {gene_num}: {gt_obj.to_string(internal_labels=True)}, {x}")
-        """
+        # In check-nums mode, cull returns False after logging the counts and handling pickles.
+        if not proceed:
+            self.logger.end_prog(); return None, {}
 
-        # 5. Reconciliation and MUL-tree Selection
+        # Reconciliation and MUL-tree Selection
         step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry)
 
         """if not step_result.sorted_scores:
             self.logger.write("No valid MUL-trees scored.", level=1)
             return None"""
 
-        # 6. Extract Best Result (using StepResult properties)
+        # Extract Best Result from StepResult properties: kept_mul_maps is Dict[mul_idx, Dict[g_idx, Maps]]
         min_idx = step_result.mt_idx()
         min_data = step_result.mul_trees[min_idx]
-        
-        # kept_mul_results is Dict[mul_idx, Dict[g_idx, Maps]]
         min_maps = step_result.kept_mul_maps[min_idx]
         
-        # 7. Orthology (Optional)
+        # Orthology (TBD)
         if self.ctx.orth_opt and min_maps:
-             # OrthologyLabeler expects dict of results. We pass min_maps directly.
-             # NOTE: OrthologyLabeler might need adjustment if it expects a list vs dict, 
-             # but standard dict iteration works for both.
-             # We pass keys as gene_num, values as ReconResult
-             # OrthologyLabeler.run signature: gene_trees, min_maps_dict
-             # But ReconResult wraps maps. Orthology.py uses res[3] (maps) and res[4] (dups)
-             # or attributes if updated. Assuming strict compat, we pass the wrapper.
-             OrthologyLabeler.run(self.gene_trees, min_maps, min_data.mt, 
+            # OrthologyLabeler expects dict of results. We pass min_maps directly.
+            # NOTE: OrthologyLabeler might need adjustment if it expects a list vs dict, 
+            # but standard dict iteration works for both.
+            # We pass keys as gene_num, values as ReconResult
+            # OrthologyLabeler.run signature: gene_trees, min_maps_dict
+            # But ReconResult wraps maps. Orthology.py uses res[3] (maps) and res[4] (dups)
+            # or attributes if updated. Assuming strict compat, we pass the wrapper.
+            OrthologyLabeler.run(self.gene_trees, min_maps, min_data.mt, 
                                 min_data.h_clade, tcf.output_dir, tcf.run_prefix)
 
-        # 8. Final Report
-        self.logger.print_end_prog(tcf, step_result.mt_score(), step_result.mt_idx(), min_data)
+        # Final Cleanup & Report
+        self.gene_mgr.handle_pickles()
+        #self.logger.end_prog(tcf, step_result.mt_score(), step_result.mt_idx(), min_data) #step_result.mul_trees[step_result.mt_idx()]
 
         # Important:
-        # ST and GTs are not needed here, as they are prepared from StepResult in FlowManager
+        # ST and GTs are not needed here, as they are prepared from StepResult in FlowManager; do NOT pass them here!
         tcf_updates = {
             'ploidies': ploidies,
             #'h1_nodes': h1_nodes, to be supported later
@@ -253,39 +237,51 @@ class Engine:
         else:
             random.seed(self.ctx.seed)
 
+    @staticmethod
+    def _unpack_min_res(res: TaskResult) -> Tuple[int, int, MulTree]:
+        min_score = res.mt_score()
+        min_idx = res.mt_idx()
+        min_mult = res.mul_trees[min_idx]
+        return min_score, min_idx, min_mult
+
     def run(self) -> Dict[str, Union[SmrtTree, HistoryType, Any]]:
-        final_res = None
+        final_smtree = None
+        run_mode = self.tcf.mode
         
         # Init FlowManager for any iterative mode, and single - to return history
-        if self.tcf.mode in ["full", "split", "mixed", "single"] and not self.ctx.norun:
-            self.flow_mgr = FlowManager(self.ctx, self.tcf.mode, self.flow_logger)
+        if run_mode in ["full", "split", "mixed", "single", "st-only", "no-st"] and not self.ctx.norun:
+            self.flow_mgr = FlowManager(self.ctx, run_mode, self.flow_logger)
 
-        final_res = None
-        if self.tcf.mode == "mixed":
-            final_res = self.run_mixed()
-        elif self.tcf.mode == "full":
-            final_res, _ = self.run_full()
-        elif self.tcf.mode == "split":
-            final_res = self.run_split()
+        final_smtree = None
+        if run_mode == "mixed":
+            final_smtree = self.run_mixed()
+        elif run_mode == "full":
+            final_smtree, _ = self.run_full()
+        elif run_mode == "split":
+            final_smtree = self.run_split()
         else:
-            step_res, _ = Task(self.ctx, self.flow_logger).execute(self.tcf)
+            res, _ = Task(self.ctx, self.flow_logger).execute(self.tcf)
             # Extract best SmrtTree if applicable
-            if step_res and step_res.mt_idx() is not None:
-                final_res = step_res.mul_trees[step_res.mt_idx()].mt
-                self.flow_mgr.update_history(0, 0, step_res)
+            if res:
+                min_score, min_idx, min_mult = self._unpack_min_res(res)
+                # Terminal report for single-run modes (single, st-only, no-st)
+                self.flow_logger.end_prog(min_score, min_idx, min_mult.to_marked_str())
+                final_smtree = min_mult.mt
+                if run_mode != "st-only":
+                    self.flow_mgr.update_history(0, 0, res)
 
-        if final_res:
-            final_res.write_forms(self.ctx.root_dir)
+        if final_smtree:
+            final_smtree.write_forms(self.ctx.root_dir)
             self.flow_logger.log("Singly- and multi-labelled forms of the final tree written to output directory.", 'i')
             if self.ctx.debug:
                 # Visualize with reticulate tree's built-in function (requires matplotlib)
-                rt = final_res.to_rt()
+                rt = final_smtree.to_rt()
                 rt.visualize(filename=self.ctx.root_dir / "final_tree.png", launch=False)
                 self.flow_logger.log(f"Final tree visualization saved.", 'i')
-            self.flow_logger.log("Final tree ASCII representation:\n" + final_res.ete_tree.get_ascii(show_internal=True), 'i')
+            self.flow_logger.log("Final tree ASCII representation:\n" + final_smtree.ete_tree.get_ascii(show_internal=True), 'i')
 
         return_obj = {
-            'final_tree': final_res,
+            'final_tree': final_smtree,
             'history': self.ctx.history,
             'maps': None # to be supported later
         }
@@ -318,7 +314,7 @@ class Engine:
         """
         Iterative mode. Returns final (st, gts) if limit reached, or (None, None) if finished naturally.
         """
-        self.flow_logger.log("Starting Fully Sequential Mode", 'i')
+        self.flow_logger.title_banner("Starting Fully Sequential Mode")
 
         # Setup: initial parameters must have been parsed already in io.py
         i = self.ctx.start_pt
@@ -326,6 +322,7 @@ class Engine:
         if max_iter > self.ctx.max_iter:
             self.flow_logger.log(f"Provided Mixed Mode switch ({max_iter}) exceeds global max_iter ({self.ctx.max_iter}). Using override.", 'w')
         iter_msg = '(inf mode)' if max_iter == float('inf') else f'of {int(max_iter)}' # ∞
+        iter_labeller = lambda s: f"Iteration {s} {iter_msg}"
         
         perm_tcf = self.tcf
         current_st = perm_tcf.st
@@ -338,6 +335,7 @@ class Engine:
         # Iteration Loop
         try:
             while True:
+                
                 if i >= max_iter:
                     if limit_override is not None:
                         self.flow_logger.log(f"Reached Mixed Mode switch point. Terminating with handoff.", 'i')
@@ -345,7 +343,7 @@ class Engine:
                     self.flow_logger.log(f"Reached maximum valid events set by user ({max_iter}). Terminating.", 'i')
                     break
 
-                self.flow_logger.log(f'\n# ----- Iteration {i} {iter_msg} -----\n#', 'i')
+                self.flow_logger.title_banner("")
 
                 # Run worker
                 # We pass the persistent config (which might have parsed ploidies from iter 1)
@@ -355,14 +353,17 @@ class Engine:
                     context = self.ctx,      # Pass Global Context
                     config  = perm_tcf,       # Pass updated Task Config 
                     verbosity = self.ctx.verbosity,
+                    label = iter_labeller(i),
                     parent_logger = self.flow_logger
                 )
-                iter_logger = GranLogger(iter_log, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug,
-                                         parent_logger=self.flow_logger, clear_log=False)
+
+                min_score, min_idx, min_mult = self._unpack_min_res(res)
 
                 # Update persistent config for next iteration
                 perm_tcf = perm_tcf.update(**updates)
 
+                iter_logger = GranLogger(iter_log, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug,
+                                         parent_logger=self.flow_logger, clear_log=False, label=iter_labeller(i))
                 # Process result and handle potential nesting
                 # This returns the trees prepared for the NEXT iteration
                 next_mt, next_gts, _ = self.flow_mgr.handle_iteration_result(
@@ -371,6 +372,8 @@ class Engine:
                     iter_out = self.ctx.root_dir / str(i) / "output", 
                     iter_logger = iter_logger,
                 )
+
+                iter_logger.end_prog(min_score, min_idx, min_mult.to_marked_str())
 
                 # Save for return even if breaking (e.g. if no events found, get ST)
                 current_st = next_mt.mt
@@ -424,7 +427,7 @@ class Engine:
         2. scheduling batches based on task weights (e.g., number of species leaves).
         Possibly due to overhead of scheduling and load balancing.
         """
-        self.flow_logger.log("Starting Binary Split Mode", 'i')
+        self.flow_logger.title_banner("Starting Binary Split Mode")
 
         perm_tcf = self.tcf
         current_tasks = []
@@ -460,9 +463,10 @@ class Engine:
             depth = int(str(current_tasks[0][2]).split('.')[0])
 
         max_iter = self.ctx.max_iter
+        iter_labeller = lambda s: f"Branch {s}"
 
         while current_tasks:
-
+    
             if events_found >= max_iter:
                 self.flow_logger.log(f"Reached maximum valid events set by user ({events_found} actual >= {max_iter}). Terminating.", 'i')
                 break
@@ -471,10 +475,8 @@ class Engine:
             if num_tasks == 0:
                 break
 
-            #self.flow_logger.write(f"Dispatching {len(current_tasks)} sub-problems at Depth {depth}...", level=1)
-            #step = f"Processing Depth {depth}"
-            #self.flow_logger.report_step(step, "", start=True)
-            self.flow_logger.report_step(f"Depth {depth}", f"Dispatching {num_tasks} tasks", start=True)
+            self.flow_logger.title_banner("")
+            self.flow_logger.log(f"Dispatching {num_tasks} tasks at Depth {depth}", 'i')
 
             # --- DYNAMIC CALCULATION ---
             total_procs = self.ctx.num_processes
@@ -506,7 +508,8 @@ class Engine:
                     payload,  
                     ctx_to_use,
                     perm_tcf, 
-                    self.ctx.verbosity
+                    self.ctx.verbosity,
+                    iter_labeller(payload[2])
                 ))
 
             # EXECUTE BATCH
@@ -516,8 +519,6 @@ class Engine:
             with NoDaemonPool(processes=outer_pool_size) as pool:
                 # starmap blocks until all tasks in this batch are done
                 batch_results = pool.starmap(task_worker, batch_args)
-
-            self.flow_logger.report_step(f"Depth {depth}", f"Success: Analyzed {num_tasks} nodes.")
 
             # Optimizing the Config (The "Split" Trick)
             # If this is the first run, the workers just parsed the ploidies/h-nodes.
@@ -531,18 +532,27 @@ class Engine:
             # Process Results & Generate Next Tasks
             # Done sequentially in the main process (safe access to flow_mgr)
             next_tasks = []
+            # Sort batch results by task_id to ensure deterministic logging
+            batch_results.sort(key=lambda x: x[0]) # Sort by task_id
             for task_id, res, _, iter_log in batch_results:
                 if not res: continue
 
+                min_score, min_idx, min_mult = self._unpack_min_res(res)
+
+                # Assimilate the worker's log into the main logger
+                self.flow_logger.assimilate(iter_log)
+                iter_logger = GranLogger(iter_log, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug,
+                                         parent_logger=self.flow_logger, clear_log=False, label=iter_labeller(task_id))
                 # Logic to determine branching vs termination moved to flow_mgr
                 # Note: We reconstruct path here to avoid passing it back from workers
-                iter_logger = GranLogger(iter_log, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug,
-                                         parent_logger=self.flow_logger, clear_log=False)
                 extracts = self.flow_mgr.handle_split_result(
                         task_id, res,
                         iter_out = self.ctx.root_dir / task_id / "output",
                         iter_logger = iter_logger
                 )
+
+                iter_logger.end_prog(min_score, min_idx, min_mult.to_marked_str())
+
 
                 if extracts is None:
                     continue # No events found, no new tasks

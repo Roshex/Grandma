@@ -516,7 +516,7 @@ class SmrtTree:
         mult_str = self.to_mult_str(internals=internals)
         return Tree(mult_str, format=8 if internals else 9)
 
-    def to_marked_str(self, node_to_mark: TreeNode, internals: bool=True) -> str:
+    def mark_node_to_str(self, node_to_mark: TreeNode, symbol: str = "+", internals: bool=True) -> str:
         """
         Node_to_mark is the node in the ete_tree that should be marked with a "+" in the string output.
         Generally it is the H1 node after a new inference.
@@ -525,10 +525,10 @@ class SmrtTree:
         marked_nodes = [n for n in node_to_mark.traverse()] if node_to_mark else []
         # Rename, create str, undo rename
         for n in marked_nodes:
-            n.name = n.name + "+" if n.is_leaf() else n.name [:-1] + '+>'
+            n.name = n.name + symbol if n.is_leaf() else n.name [:-1] + symbol + '>'
         marked_str = self.to_str(internals=internals)
         for n in marked_nodes:
-            n.name = n.name.replace("+", "")
+            n.name = n.name.replace(symbol, "")
         return marked_str
 
     def to_str(self, internals: bool=True, name_formatter=None, **kwargs) -> str:
@@ -776,6 +776,9 @@ class MulTree:
     def h1_sister(self) -> Optional[TreeNode]:
         if self.h1_node is None: return None
         return self.mt.get_sis(self.h1_node)
+    
+    def to_marked_str(self, internals: bool=True) -> str:
+        return self.mt.mark_node_to_str(self.h1_node, internals=internals)
     
     # A routine to init from a history event
     @classmethod

@@ -1,8 +1,7 @@
-import os
 import json
 import random
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Union, Any
+from typing import List, Tuple, Optional, Union, Any
 from ete3 import Tree, TreeNode
 
 from .models import SmrtTree
