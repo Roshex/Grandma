@@ -360,6 +360,7 @@ class Engine:
                 )
 
                 min_score, min_idx, min_mult = self._unpack_min_res(res)
+                min_mult_str = min_mult.to_marked_str()
 
                 # Update persistent config for next iteration
                 perm_tcf = perm_tcf.update(**updates)
@@ -375,7 +376,7 @@ class Engine:
                     iter_logger = iter_logger,
                 )
 
-                iter_logger.end_prog(min_score, min_idx, min_mult.to_marked_str())
+                iter_logger.end_prog(min_score, min_idx, min_mult_str)
 
                 # Save for return even if breaking (e.g. if no events found, get ST)
                 current_st = next_mt.mt
@@ -540,6 +541,7 @@ class Engine:
                 if not res: continue
 
                 min_score, min_idx, min_mult = self._unpack_min_res(res)
+                min_mult_str = min_mult.to_marked_str()
 
                 # Assimilate the worker's log into the main logger
                 self.flow_logger.assimilate(iter_log)
@@ -553,7 +555,7 @@ class Engine:
                         iter_logger = iter_logger
                 )
 
-                iter_logger.end_prog(min_score, min_idx, min_mult.to_marked_str())
+                iter_logger.end_prog(min_score, min_idx, min_mult_str)
 
 
                 if extracts is None:

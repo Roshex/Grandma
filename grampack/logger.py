@@ -8,7 +8,7 @@ import time
 import datetime
 import traceback
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Any
 
 # This block is ignored at runtime, and solves the circular dependency of typing
 if TYPE_CHECKING:
@@ -24,7 +24,7 @@ except ImportError:
 class GranLogger:
     def __init__(self, log_file: Path, verbosity: int = 4, debug: bool = False, no_log: bool = False,
                  parent_logger: Optional['GranLogger'] = None, clear_log: bool = True,
-                 catch_exceptions: bool = True, label: str = "", benchmarks: Optional[list] = None):
+                 catch_exceptions: bool = True, label: str = "", benchmarks: Optional[list] = None) -> None:
         self.log_file = log_file
         self.verbosity = verbosity    # Controls screen output (0-4)
         self.debug = debug       # Controls if 'd' messages go to file
@@ -55,7 +55,7 @@ class GranLogger:
         stream = sys.stderr
         return self.verbosity < 3 or not (hasattr(stream, "isatty") and stream.isatty())
 
-    def log(self, msg: str, key: str, to_screen: bool = True, kill_on_error: bool = True, prefix: str = "# "):
+    def log(self, msg: str, key: str, to_screen: bool = True, kill_on_error: bool = True, prefix: str = "# ") -> None:
         """
         Unified logging function.
         Writes to log file and optionally to screen based on verbosity.
@@ -124,7 +124,7 @@ class GranLogger:
     # check the original code for when it was screen printing!
     # combine level and key but make required
 
-    def catch_all_exceptions(self):
+    def catch_all_exceptions(self) -> None:
         """
         Overrides the global Python exception hook to route all unhandled 
         crashes through this logger's 'e' state before exiting.
@@ -145,7 +145,7 @@ class GranLogger:
         # Bind the custom handler to Python's global hook
         sys.excepthook = handle_exception
 
-    def assimilate(self, worker_log_path: Path):
+    def assimilate(self, worker_log_path: Path) -> None:
         """Safely appends a finished worker's log into the main log."""
         if not worker_log_path.exists(): 
             return
@@ -160,13 +160,13 @@ class GranLogger:
             if self.parent_logger:
                 self.parent_logger.assimilate(worker_log_path)
 
-    def space(self, s, width):
+    def space(self, s: Any, width: int) -> str:
         return str(s) + " " * (width - len(str(s)))
 
-    def get_date_time(self):
+    def get_date_time(self) -> str:
         return datetime.datetime.now().strftime("%m.%d.%Y  %H:%M:%S")
 
-    def report_step(self, step_name: str, status: str, start: bool = False, full_update: bool = False, enable_benchmark: bool = False):
+    def report_step(self, step_name: str, status: str, start: bool = False, full_update: bool = False, enable_benchmark: bool = False) -> None:
         """Mimics the specific table-like reporting of the old GRAMPA."""
 
         # Standard visual widths (Total width including the "# " prefix)
@@ -274,7 +274,7 @@ class GranLogger:
             # Write full line to log
             self.log(file_line, 'i', to_screen=False)
 
-    def log_software_banner(self, meta: 'GranMetadata'):
+    def log_software_banner(self, meta: 'GranMetadata') -> None:
         """Prints the static software info (Authors, DOI, Version)."""
         # This replaces the first half of the old print_start_banner
         key = 'i' if self.verbosity == 0 else 's'
@@ -295,19 +295,19 @@ class GranLogger:
         log_(f"Using Python version:               {'.'.join(map(str, sys.version_info[:3]))}")
         log_(f"\n# The program was called as:          {' '.join(sys.argv)}\n#")
 
-    def norun_banner(self):
+    def norun_banner(self) -> None:
         key = 'i' if self.verbosity == 0 else 's'
         self.log("-" * 125, key)
         self.log("--norun SET. EXITING AFTER PRINTING OPTIONS INFO...", 'i')
         self.log("", key)
 
-    def title_banner(self, title: str):
+    def title_banner(self, title: str) -> None:
         key = 'i' if self.verbosity == 0 else 's'
         self.log("=" * 73, 'i')
         if title:
             self.log(f"--- {title.upper()} ---", key)
 
-    def start_info(self, ctx: 'GlobalContext', tcf: 'TaskConfig'):
+    def start_info(self, ctx: 'GlobalContext', tcf: 'TaskConfig') -> None:
         """Prints the overarching configuration once at the start of the entire Engine run."""
         key = 'i' if self.verbosity == 0 else 's'
         pad = 38 # was 40, to account for "# " prefix
@@ -436,7 +436,7 @@ class GranLogger:
             log_("-" * 125)
             log_(f"{self.get_date_time()} INFO: Starting GRANDMA. With -v 1 set, minimal screen output will be printed.")
 
-    def end_prog(self, min_score=0, min_idx=0, min_tree_str=""):
+    def end_prog(self, min_score: int = 0, min_idx: int = 0, min_tree_str: str = "") -> None:
         """Replicates endProg from reconcore.py"""
         total_time = time.time() - self.start_time
         output_dir = self.log_file.parent
@@ -453,7 +453,7 @@ class GranLogger:
         log_(f"Output directory for this run:   {output_dir}")
         log_(f"Log file for this run:           {self.log_file}")
         if self.benchmarks:
-            bench_file = output_dir / f"{fn_prefix}-benchmarks.tsv"
+            bench_file = output_dir / f"{fn_prefix}-benchmarks.txt"
             try:
                 with open(bench_file, 'w') as f:
                     f.write("Step\tTime_Seconds\n")
@@ -483,3 +483,4 @@ class GranLogger:
             log_("-" * 125)
 
         log_("")
+        return None # Explicitly return None to reset benchmarks
