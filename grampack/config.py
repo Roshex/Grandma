@@ -68,6 +68,7 @@ class GlobalContext:
     # Global Flow/Algorithm Options
     orth_opt: bool = False
     max_iter: Union[int, float] = 0
+    start_pt: int = 0
     mixed_switch: int = 0
     cutoff: Tuple[str, Optional[Union[int, float]]] = ("auto", None)
     # For full mode
@@ -86,7 +87,6 @@ class GlobalContext:
     
     # History Tracking (Global State)
     history: HistoryType = field(default_factory=dict)
-    start_pt: int = 0
 
     @property
     def history_file(self) -> Path:
@@ -99,9 +99,9 @@ class GlobalContext:
         Validates that keys exist to prevent silent errors.
         """
         # Certain fields should not be allowed to be changed
-        forbidden_keys = {"seed", "pickles", "maps", "plot", "norun", "nolog", 
-        "bench", "orth_opt", "max_iter", "nesting", "mixed_switch",
-        "min_gt_lvs", "min_st_lvs", "root_dir", "log_file", "history", "start_pt"}
+        forbidden_keys = {"seed", "pickles", "maps", "plot", "norun", "nolog", "bench", "sample",
+        "orth_opt", "max_iter", "start_pt", "mixed_switch", "nesting", "min_gt_lvs", "min_st_lvs",
+        "strict_max", "allow_redun", "root_dir", "log_file", "history"}
         # Safety check to ensure we aren't inventing new fields
         valid_fields = {f.name for f in fields(self)}
         for key in changes:
@@ -121,15 +121,15 @@ class TaskConfig:
     Contains sanitized arguments specific to one reconciliation task (~Grampa).
     """
     # I/O for this specific step
-    output_dir: Path
     st: Union[str, Path, SmrtTree]
     gts: Optional[Union[str, Path, Dict[int, SmrtTree]]] = None
+    output_dir: Path = field(default_factory=lambda: Path(get_default_outdir()))
     run_prefix: str = "grandma"
-
-    # Mode Targets
-    mode: str = "single"
-    overwrite: bool = False
     repair: bool = False
+    overwrite: bool = False
+
+    # Mode Target
+    mode: str = "single"
     
     # Algorithm Tunables
     h1_nodes: Optional[Union[str, List[str]]] = None
@@ -160,7 +160,7 @@ class TaskConfig:
         Validates that keys exist to prevent silent errors.
         """
         # Certain fields should not be allowed to be changed
-        forbidden_keys = {'group_cap', 'max_select', 'run_prefix'}
+        forbidden_keys = {'group_cap', 'weights', 'max_select', 'run_prefix'}
         # Safety check to ensure we aren't inventing new fields
         valid_fields = {f.name for f in fields(self)}
         for key in changes:
@@ -458,12 +458,16 @@ class InitParser:
             help="Output directory. If it does not exist, it will be created. Default = 'grandma_out_' + timestamp.")
         g_general.add_argument("-f", "--prefix", default="grandma", type=str,
             help="A string prepended to all output files. Default = 'grandma'.")
+        g_general.add_argument('-r', '--repair', action='store_true',
+            help="If set, attempt to repair input files by forcing bifurcating trees, rooting, valid tip names, and more.")
         g_general.add_argument("-p", "--procs", type=int, default=1,
             help="Number of processes to use for parallelizable tasks. Default = 1. Non-positive to autodetect and " 
                  "use all available cores.")
         g_general.add_argument("-v", "--verbosity", type=int, default=2, choices=range(5),
             help="Level of verbosity printed to the screen. 0 = none; 1 = run info; 2 = standard; "
                  "3 = debug; 4 = verbose debugging. Default = 2.")
+        g_general.add_argument("--overwrite", action="store_true",
+            help="If set, overwrite existing files in the output directory. Default: exit if files exist.")
         g_general.add_argument("--generate", type=str, metavar="JSON_CONFIG",
             help="Path to JSON configuration file. Enters Generation Mode (ignores other flags).")
 
@@ -478,8 +482,8 @@ class InitParser:
             help="Ploidy file or string formatted as a line-separated counter of diploid subgenomes (e.g., 'A 1' = "
                  "A is at most diploid). If provided, H1 and H2 nodes will be enforced by ploidy levels. Default: None.")
         g_algo.add_argument("-c", "--cap", type=int, default=8,
-            help="The maximum number of groups a gene tree is allowed to have. A gene tree with more than --cap "
-                 "number of groups for a given MUL-tree, will be skipped. Default = 8 [to be raised to 15 on release].")
+            help="The maximum number of groups with polyploid species a gene tree is allowed to have given a MUL-tree. "
+                 "A GT with more than --cap groups for at least one MT, will be skipped entirely. Default = 8 [15 on release].")
         g_algo.add_argument("-w", "--weights", type=int, nargs=2, default=[1, 1],
             help="Space-separated integer weights for the parsimony score calculation: 'w_dup w_loss'. Default = '1 1'.")
         g_algo.add_argument("-n", "--max_select", type=int, default=1,
@@ -527,8 +531,6 @@ class InitParser:
                  "st-only: Reconciliation to input only.")
         g_flow.add_argument('-i', '--iter', type=int, default=0,
             help="Maximun number of iterations or (~depth) event num for iterative modes; <int>, non-positive to be unlimited. Default = 0.")
-        g_flow.add_argument('-r', '--repair', action='store_true',
-            help="If set, attempt to repair input files by forcing bifurcating trees, rooting, valid tip names, and more.")
         g_flow.add_argument('--start', type=str, default='auto',
             help="Start point when resuming a previous execution; positive <int>, or 'auto' [default] for auto-detection.")
         g_flow.add_argument('--cutoff', type=str, default='auto',
@@ -540,8 +542,6 @@ class InitParser:
 
         # --- Output Options ---
         g_output = self.parser.add_argument_group("Output Options")
-        g_output.add_argument("--overwrite", action="store_true",
-            help="If set, overwrite existing files in the output directory. Default: exit if files exist.")
         g_output.add_argument("--pickles", type=str, choices=['keep', 'k', 'clean', 'c', 'archive', 'a'], default='archive',
             help="Action to take on the pickle directory after an inference step: "
                  "(k)eep: leave files untouched for fast resuming. "
@@ -1078,6 +1078,7 @@ class InitParser:
             optim         = args.optim,
             orth_opt      = args.orthologies,
             max_iter      = check_loop_length(args.iter, i, None, history, self.logger),
+            start_pt      = i,
             mixed_switch  = mixed_switch,
             cutoff        = self.parse_cutoff(args.cutoff),
             nesting       = nesting,
@@ -1087,19 +1088,18 @@ class InitParser:
             allow_redun   = args.allow_redundant_mts,
             root_dir      = out_dir,
             log_file      = log_file,
-            history       = history,
-            start_pt      = i
+            history       = history
         )
 
         # --- Prepare Step Config ---
         tcf = TaskConfig(
-            output_dir    = ctx.root_dir,
             st            = args.spec_input,
             gts           = args.genes_input,
+            output_dir    = ctx.root_dir,
             run_prefix    = args.prefix,
-            mode          = mode,
-            overwrite     = args.overwrite,
             repair        = args.repair,
+            overwrite     = args.overwrite,
+            mode          = mode,
             h1_nodes      = args.h1,
             h2_nodes      = args.h2,
             ploidies      = args.ploidy,

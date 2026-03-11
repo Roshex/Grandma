@@ -8,7 +8,7 @@ import time
 import datetime
 import traceback
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 # This block is ignored at runtime, and solves the circular dependency of typing
 if TYPE_CHECKING:
@@ -23,7 +23,8 @@ except ImportError:
 
 class GranLogger:
     def __init__(self, log_file: Path, verbosity: int = 4, debug: bool = False, no_log: bool = False,
-                 parent_logger: 'GranLogger' = None, clear_log: bool = True, catch_exceptions: bool = True, label: str = ""):
+                 parent_logger: Optional['GranLogger'] = None, clear_log: bool = True,
+                 catch_exceptions: bool = True, label: str = "", benchmarks: Optional[list] = None):
         self.log_file = log_file
         self.verbosity = verbosity    # Controls screen output (0-4)
         self.debug = debug       # Controls if 'd' messages go to file
@@ -32,7 +33,7 @@ class GranLogger:
         self.label = label
         self.start_time = time.time()
         self.step_start_time = 0
-        self.benchmarks = None # Optional List of (step_name, elapsed_time) tuples for benchmarking
+        self.benchmarks = benchmarks # Optional List of (step_name, elapsed_time) tuples for benchmarking
         self.pids = [psutil.Process(os.getpid())] if HAS_PSUTIL else []
         self.warnings = 0
         # States for Warning Buffering
@@ -159,7 +160,7 @@ class GranLogger:
             if self.parent_logger:
                 self.parent_logger.assimilate(worker_log_path)
 
-    def spaced(self, s, width):
+    def space(self, s, width):
         return str(s) + " " * (width - len(str(s)))
 
     def get_date_time(self):
@@ -187,7 +188,7 @@ class GranLogger:
             #header_widths = list(col_widths)
             #header_widths[0] -= 2 
                 
-            header_str = "".join([self.spaced(h, w) for h, w in zip(headers, col_widths)])
+            header_str = "".join([self.space(h, w) for h, w in zip(headers, col_widths)])
             border = "-" * (175 if HAS_PSUTIL else 150)
             
             self.log(border, 'i')
@@ -218,7 +219,7 @@ class GranLogger:
                 step_name,
                 status
             ]
-            line = "".join([self.spaced(p, w) for p, w in zip(out_parts, col_widths[:4])])
+            line = "".join([self.space(p, w) for p, w in zip(out_parts, col_widths[:4])])
             
             if self.verbosity > 1:
                 sys.stdout.write("# " + line)
@@ -244,7 +245,7 @@ class GranLogger:
             if HAS_PSUTIL:
                 full_parts += [mem_str, vmem_str]
             
-            file_line = "".join([self.spaced(p, w) for p, w in zip(full_parts, col_widths)])
+            file_line = "".join([self.space(p, w) for p, w in zip(full_parts, col_widths)])
             
             # Screen output
             if self.verbosity > 1:
@@ -260,7 +261,7 @@ class GranLogger:
                     
                     # Columns start from index 3 (Status)
                     screen_widths = col_widths[3:]
-                    screen_line = "".join([self.spaced(p, w) for p, w in zip(screen_parts, screen_widths)])
+                    screen_line = "".join([self.space(p, w) for p, w in zip(screen_parts, screen_widths)])
                     sys.stdout.write(screen_line + "\n")
                 
                 sys.stdout.flush()
@@ -277,21 +278,22 @@ class GranLogger:
         """Prints the static software info (Authors, DOI, Version)."""
         # This replaces the first half of the old print_start_banner
         key = 'i' if self.verbosity == 0 else 's'
+        log_ = lambda msg: self.log(msg, key)
         
-        self.log("", key)
-        self.log("=" * 73, key)
-        self.log(f"Welcome to GRANDMA -- {meta.version} .", key)
-        self.log(f"Version {meta.version} released on {meta.release}", key)
-        self.log(f"GRANDMA was developed by {meta.authors}", key)
-        self.log(f"\t\tinspired by GRAMPA [Gene tree reconciliations with MUL-trees] by {meta.source_authors}", key)
-        self.log(f"Citation:      {meta.doi}", key)
-        self.log(f"Website:       {meta.http}", key)
-        self.log(f"Report issues: {meta.github}", key)
-        self.log("", key)
-        self.log(f"The date and time at the start is:  {self.get_date_time()}", key)
-        self.log(f"Using Python executable located at: {sys.executable}", key)
-        self.log(f"Using Python version:               {'.'.join(map(str, sys.version_info[:3]))}", key)
-        self.log(f"\n# The program was called as:          {' '.join(sys.argv)}\n#", key)
+        log_("")
+        log_("=" * 73)
+        log_(f"Welcome to GRANDMA -- {meta.version} .")
+        log_(f"Version {meta.version} released on {meta.release}")
+        log_(f"GRANDMA was developed by {meta.authors}")
+        log_(f"\t\tinspired by GRAMPA [Gene tree reconciliations with MUL-trees] by {meta.source_authors}")
+        log_(f"Citation:      {meta.doi}")
+        log_(f"Website:       {meta.http}")
+        log_(f"Report issues: {meta.github}")
+        log_("")
+        log_(f"The date and time at the start is:  {self.get_date_time()}")
+        log_(f"Using Python executable located at: {sys.executable}")
+        log_(f"Using Python version:               {'.'.join(map(str, sys.version_info[:3]))}")
+        log_(f"\n# The program was called as:          {' '.join(sys.argv)}\n#")
 
     def norun_banner(self):
         key = 'i' if self.verbosity == 0 else 's'
@@ -306,123 +308,178 @@ class GranLogger:
             self.log(f"--- {title.upper()} ---", key)
 
     def start_info(self, ctx: 'GlobalContext', tcf: 'TaskConfig'):
-        """Replicates startProg from opt_parse.py"""
-        
+        """Prints the overarching configuration once at the start of the entire Engine run."""
         key = 'i' if self.verbosity == 0 else 's'
+        pad = 38 # was 40, to account for "# " prefix
+        
+        # Aliases for clean readability
+        log_ = lambda msg: self.log(msg, key)
+        space = self.space
+        mode = tcf.mode
 
-        if self.label:
-            self.log("=" * 125, key)
-            self.log(f"--- BEGIN TASK LOG: {self.label} ---", key)
-            self.log("=" * 125, key)
+        # Comdition aliases
+        is_task = bool(self.label)
+        is_iter = mode in ("split", "full", "mixed")
+        is_top_level = not is_task and is_iter
+        is_singleton = not is_task and not is_iter
+        is_terminal = is_singleton or is_task # == not is_top_level
+
+        if is_task:
+            log_("=" * 125)
+            log_(f"--- BEGIN TASK LOG: {self.label} ---")
+            log_("=" * 125)
         else:
-            self.log("-" * 125, key)
+            log_("-" * 125)
 
-        self.log("INPUT/OUTPUT INFO:", key)
+        # --- Input / Output Info ---
+        
+        log_("INPUT / OUTPUT FILES:")
+        st_str = str(tcf.st) if isinstance(tcf.st, (Path, str)) else ("None" if not tcf.st else "Memory object")
+        log_(space("Species tree input:", pad) + st_str)
+        gts_str = str(tcf.gts) if isinstance(tcf.gts, (Path, str)) else ("None" if not tcf.gts else "Memory object")
+        log_(space("Gene tree input:", pad) + gts_str)
 
-        pad = 38 # NEW: was 40, to account for "# " prefix
-        
-        # Files
-        if isinstance(tcf.st, (Path, str)):
-            self.log(self.spaced("Species tree file:", pad) + str(tcf.st), key)
-        if not tcf.is_mul_input and isinstance(tcf.gts, (Path, str)):
-             self.log(self.spaced("Gene tree file:", pad) + (str(tcf.gts) if tcf.gts else ""), key)
-        
-        self.log(self.spaced("Output directory:", pad) + str(tcf.output_dir), key)
-        
-        if not tcf.is_mul_input:
-            self.log(self.spaced("Score file:", pad) + str(Path(tcf.output_dir) / f"{tcf.run_prefix}-scores.txt"), key)
-            self.log(self.spaced("Filtered gene trees:", pad) + str(Path(tcf.output_dir) / f"{tcf.run_prefix}-trees-filtered.txt"), key)
-            self.log(self.spaced("Check nums file:", pad) + str(Path(tcf.output_dir) / f"{tcf.run_prefix}-checknums.txt"), key)
-            if tcf.mode != "check-nums":
-                self.log(self.spaced("Detailed mapping file:", pad) + str(Path(tcf.output_dir) / f"{tcf.run_prefix}-detailed.txt"), key)
-                self.log(self.spaced("Duplication count file:", pad) + str(Path(tcf.output_dir) / f"{tcf.run_prefix}-dup-counts.txt"), key)
+        if is_terminal:
+            log_(space("Output directory:", pad) + str(tcf.output_dir))
+            logging_str = "Off" if ctx.nolog else str(tcf.output_dir / "grandma.log")
+            log_(space("Log file:", pad) + logging_str)
+            if mode not in ("label-sp", "count-mts", "build-mts"):
+                if mode != "check-nums":
+                    log_(space("Score file:", pad) + str(tcf.output_dir / f"{tcf.run_prefix}-scores.txt"))
+                log_(space("Filtered gene trees:", pad) + str(tcf.output_dir / f"{tcf.run_prefix}-trees-filtered.txt"))
+                log_(space("Check nums file:", pad) + str(tcf.output_dir / f"{tcf.run_prefix}-checknums.txt"))
+                if mode != "check-nums":
+                    log_(space("Detailed mapping file:", pad) + str(tcf.output_dir / f"{tcf.run_prefix}-detailed.txt"))
+                    log_(space("Duplication count file:", pad) + str(tcf.output_dir / f"{tcf.run_prefix}-dup-counts.txt"))
+            if ctx.bench:
+                log_(space("Benchmarks file:", pad) + str(tcf.output_dir / f"{tcf.run_prefix}-benchmarks.txt"))
+        else:
+            log_(space("Root output directory:", pad) + str(ctx.root_dir))
+            logging_str = "Off" if ctx.nolog else str(ctx.root_dir / "grandma.log")
+            log_(space("Root log file:", pad) + logging_str)
 
-        self.log("-" * 125, key)
-        self.log("OPTIONS INFO:", key)
-        self.log(self.spaced("Option", pad) + self.spaced("Current setting", 30) + "Current action", key)
-        
-        # Options Table
-        # -h1
-        h1_str = tcf.h1_nodes if tcf.h1_nodes else "All"
-        self.log(self.spaced("-h1", pad) + self.spaced(h1_str, 30) + "GRAMPA will search these H1 nodes. If none are specified, all nodes will be searched as H1 nodes.", key)
-        # -h2
-        h2_str = tcf.h2_nodes if tcf.h2_nodes else "All"
-        self.log(self.spaced("-h2", pad) + self.spaced(h2_str, 30) + "GRAMPA will search these H2 nodes. If none are specified, all nodes will be searched as H2 nodes.", key)
-        # -c
-        self.log(self.spaced("-c", pad) + self.spaced(str(tcf.group_cap), 30) + "Gene trees with more than this number of groups/clades with polyploid species for a given h1/h2 combination will be skipped.", key)
-        # -f
-        self.log(self.spaced("-f", pad) + self.spaced(tcf.run_prefix, 30) + "All output files generated will have this string preprended to them.", key)
-        # -p
-        self.log(self.spaced("-p", pad) + self.spaced(str(ctx.num_processes), 30) + "GRAMPA will use this number of processes for LCA mapping.", key)
-        # -v
-        self.log(self.spaced("-v", pad) + self.spaced(str(self.verbosity), 30) + "Controls the amount of info printed to the screen as GRAMPA is running.", key)
-        # --multree
-        mul_str = "The tree input with -s will be read as a MUL-tree." if tcf.is_mul_input else "The tree input with -s will be read as singly-labeled tree."
-        self.log(self.spaced("--multree", pad) + self.spaced(str(tcf.is_mul_input), 30) + mul_str, key)
-        # --checknums
-        cn_str = "GRAMPA will count groups to filter gene trees and exit." if tcf.mode == "check-nums" else "GRAMPA will count groups to filter gene trees and then perform reconciliations."
-        self.log(self.spaced("--checknums", pad) + self.spaced(str(tcf.mode == "check-nums"), 30) + cn_str, key)
-        # --no-st, --st-only
-        st_opt_str = "default"
-        if tcf.mode == "no-st": st_opt_str = "no-st"
-        if tcf.mode == "st-only": st_opt_str = "st-only"
-        st_desc = "GRAMPA will perform reconciliations to all MUL-trees specified by -h1 and -h2 and the input species tree."
-        if tcf.mode == "no-st": st_desc = "GRAMPA will perform reconciliations to only the MUL-trees specified by -h1 and -h2."
-        if tcf.mode == "st-only": st_desc = "GRAMPA will perform reconciliations to only the input species tree."
-        self.log(self.spaced("--no-st, --st-only", pad) + self.spaced(st_opt_str, 30) + st_desc, key)
-        # --maps
-        if tcf.mode != "check-nums":
-             map_desc = "GRAMPA will output node mappings for the lowest scoring tree in the detailed output file." if ctx.maps else "GRAMPA will only output duplication and loss counts in the detailed output file."
-             self.log(self.spaced("--maps", pad) + self.spaced(str(ctx.maps), 30) + map_desc, key)
-        # --overwrite
-        if tcf.overwrite:
-             self.log(self.spaced("--overwrite", pad) + self.spaced("True", 30) + "GRAMPA will OVERWRITE the existing files in the specified output directory.", key)
-        if ctx.norun:
-             self.log(self.spaced("--norun", pad) + self.spaced("True", 30) + "ONLY PRINTING RUNTIME INFO.", key)
+        if not is_task:
+            if ctx.plot and mode in ("split", "full", "mixed"):
+                log_(space("Flow plot file:", pad) + str(ctx.root_dir / "metrics_plot.png"))
+            if mode in ("split", "full", "mixed", "single", "no-st"):
+                log_(space("Event history file:", pad) + str(ctx.root_dir / "history.json"))
+            if mode in ("split", "full", "mixed", "single", "no-st", "st-only"):
+                log_(space("Final multi- & SL tree files:", pad) + str(ctx.root_dir / "final_*.tre"))
 
+        # --- Execution Settings ---
+
+        log_("-" * 125)
+        log_("EXECUTION SETTINGS:")
+        m_switch = ctx.mixed_switch
+        mixed_switch_str = "" if mode != "mixed" and not m_switch else f" [switch at {str(m_switch)}]"
+        log_(space("------ MODE ------:", pad) + f"{str(mode).upper()}{mixed_switch_str}")
+        if is_top_level:
+            iter_text = "Unlimited" if ctx.max_iter == float('inf') else str(ctx.max_iter)
+            log_(space("Max iterations:", pad) + iter_text)
+            log_(space("Start iteration:", pad) + str(ctx.start_pt))
+        if not is_task or ctx.debug:
+            log_(space("Automatic tree repair:", pad) + str("On" if tcf.repair else "Off"))
+        if not is_task and mode not in ("label-sp", "count-mts", "build-mts", "check-nums"):
+            log_(space("Orthology labeling analysis:", pad) + str("On" if ctx.orth_opt else "Off"))
+
+        # --- Algorithmic Settings ---
+
+        if mode != "label-sp":
+            log_("-" * 125)
+            log_("ALGORITHMIC SETTINGS:")
+            if mode != "st-only":
+                if is_terminal:
+                    if tcf.predefined_rets:
+                        log_(space("Predefined reconciliations from MT input:", pad) + str(tcf.predefined_rets))
+                    h1_str = tcf.h1_nodes if tcf.h1_nodes else "All"
+                    log_(space("H1 search space:", pad) + str(h1_str))
+                    h2_str = tcf.h2_nodes if tcf.h2_nodes else "All"
+                    log_(space("H2 search space:", pad) + str(h2_str))
+                if tcf.ploidies:
+                    ploidies_str = str(tcf.ploidies) if isinstance(tcf.ploidies, (str, Path)) else "Memory object"
+                    log_(space("Ploidy constraint input:", pad) + ploidies_str)
+                    log_(space("Ploidy constraint behavior:", pad) + "Strict" if ctx.strict_max else "Lineage-based")
+                    if is_task and mode in ("split", "mixed"):
+                        log_(space("Depth ploidy constraint:", pad) + str(tcf.binary_id))
+                log_(space("Redundant MT filter:", pad) + str("Off" if ctx.allow_redun else "On"))
+                if ctx.nesting == "model" and mode not in ("full", "mixed"):
+                    log_(space("Nestedness behavior:", pad) + str(ctx.nesting).capitalize())
+            if mode not in ("count-mts", "build-mts"):
+                log_(space("GT polyploid group cap:", pad) + str(tcf.group_cap))
+                if mode != "check-nums":
+                    log_(space("Optimized reconciliation:", pad) + str("On" if ctx.optim else "Off"))
+                    log_(space("Parsimony penalty weights:", pad) + f"Dup: {tcf.weights[0]}, Loss: {tcf.weights[1]}")
+                    max_select_str = str(tcf.max_select) if tcf.max_select > 0 else ("Up to input ST (inclusive)" if not tcf.max_select else "All")
+                    if mode != "st-only":
+                        log_(space("Max number of MTs to select:", pad) + max_select_str)
+                    if mode in ("split", "full", "mixed"):
+                        log_(space("Parsimony score cutoff:", pad) + f"Type: {ctx.cutoff[0]}, Value: {ctx.cutoff[1]}")
+                        if mode in ("full", "mixed"):
+                            log_(space("Nestedness behavior:", pad) + str(ctx.nesting).capitalize())
+                        if mode in ("split", "mixed"):
+                            log_(space("Min extracted tree leaves:", pad) + f"Species: {ctx.min_st_lvs}, Genes: {ctx.min_gt_lvs}")
+        
+        log_("-" * 125)
+        log_("SYSTEM & OUTPUT:")
+        if not is_task:
+            log_(space("Outputs prefix:", pad) + str(tcf.run_prefix))
+        log_(space("Parallel processes:", pad) + str(ctx.num_processes))
+        log_(space("Verbosity level:", pad) + str(self.verbosity))
+        if not is_task and mode not in ("label-sp", "count-mts", "build-mts"):
+            log_(space("Pickle directory handling:", pad) + str(ctx.pickles).capitalize())
+            if mode != "check-nums":
+                log_(space("Detailed maps output:", pad) + str("On" if ctx.maps else "Off"))
+        if ctx.debug:
+            log_(space("Debugging state:", pad) + f"Seed={ctx.seed}, N={ctx.sample}")
+        
         if self.verbosity == 1:
-            self.log("-" * 125, key)
-            self.log(f"{self.get_date_time()} INFO: Starting GRAMPA. With -v 1 set, no more information will be printed to the screen until the end of the run.", key)
+            log_("-" * 125)
+            log_(f"{self.get_date_time()} INFO: Starting GRANDMA. With -v 1 set, minimal screen output will be printed.")
 
     def end_prog(self, min_score=0, min_idx=0, min_tree_str=""):
         """Replicates endProg from reconcore.py"""
         total_time = time.time() - self.start_time
         output_dir = self.log_file.parent
-        key = 'i' if self.verbosity == 0 else 's' 
-        self.log("=" * 175, key)
-        self.log("\n# Done!", key)
-        self.log(f"The date and time at the end is: {self.get_date_time()}", key)
-        self.log(f"Total execution time:            {round(total_time, 3)} seconds.", key)
-        self.log(f"Output directory for this run:   {output_dir}", key)
-        self.log(f"Log file for this run:           {self.log_file}", key)
+        fn_prefix = self.log_file.stem
+        key = 'i' if self.verbosity == 0 else 's'
+
+        # Aliases for clean readability
+        log_ = lambda msg: self.log(msg, key)
+
+        log_("=" * 175)
+        log_("\n# Done!")
+        log_(f"The date and time at the end is: {self.get_date_time()}")
+        log_(f"Total execution time:            {round(total_time, 3)} seconds.")
+        log_(f"Output directory for this run:   {output_dir}")
+        log_(f"Log file for this run:           {self.log_file}")
         if self.benchmarks:
-            bench_file = output_dir / f"_benchmarks.tsv"#{tcf.run_prefix}
+            bench_file = output_dir / f"{fn_prefix}-benchmarks.tsv"
             try:
                 with open(bench_file, 'w') as f:
                     f.write("Step\tTime_Seconds\n")
                     for step_name, elapsed in self.benchmarks:
                         f.write(f"{step_name}\t{elapsed}\n")
-                self.log(f"Benchmarks saved to:             {bench_file}", key)
+                log_(f"Benchmarks saved to:             {bench_file}")
             except Exception as e:
                 self.log(f"Failed to write benchmarks: {e}", 'w')
             # Clear benchmarks after writing
             self.benchmarks = None
         if self.warnings > 0:
-            self.log(f"\n# Task finished with {self.warnings} WARNINGS -- check log file for more info", key)
+            log_(f"\n# Task finished with {self.warnings} WARNINGS -- check log file for more info")
 
         if min_tree_str:
-            self.log("-" * 125, key)
+            log_("-" * 125)
             if min_idx != 0:
-                 self.log(f"The MUL-tree with the minimum parsimony score is MT-{min_idx}:\t{min_tree_str}", key)
+                log_(f"The MUL-tree with the minimum parsimony score is MT-{min_idx}:\t{min_tree_str}")
             else:
-                 self.log(f"The tree with the minimum parsimony score is the singly-labeled tree (ST):\t{min_tree_str}", key)
-            self.log(f"Score = {min_score}", key)
+                log_(f"The tree with the minimum parsimony score is the singly-labeled tree (ST):\t{min_tree_str}")
+            log_(f"Score = {min_score}")
 
         if self.label:
-            self.log("=" * 125, key)
-            self.log(f"--- END TASK LOG: {self.label} ---", key)
-            self.log("=" * 125, key)
+            log_("=" * 125)
+            log_(f"--- END TASK LOG: {self.label} ---")
+            log_("=" * 125)
         else:
-            self.log("-" * 125, key)
+            log_("-" * 125)
 
-        self.log("", key)
+        log_("")

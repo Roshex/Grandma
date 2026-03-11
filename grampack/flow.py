@@ -380,7 +380,7 @@ class FlowManager:
             step = f"Nested Fix Iteration {iter}.{next_copy_idx}"
             self.logger.report_step(step, "In progress...")
 
-            res, _ = engine_callback(
+            res, _, _ = engine_callback(
                 curr_mt.mt, curr_gts,
                 ",".join([l.name for l in h1_leaves]), # H1 is the reference
                 ",".join([l.name for l in h2_loc.get_leaves()]), # H2 is the new found copy

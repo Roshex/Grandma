@@ -1261,15 +1261,13 @@ class GeneTreeManager:
             
             # String Formatting
             mt_str = m_data.to_marked_str()
-            h_info = ""
-            if not self.tcf.is_mul_input:
-                h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
-                hx_sisters = m_data.hx_sisters
-                if hx_sisters:
-                    hx_str = "\t".join([f'H{i+2} Node:{hx.name}' for i, hx in enumerate(hx_sisters)])
-                else:
-                    hx_str = "Hx Nodes:NA"
-                h_info = f"\tH1 Node:{h1_name}\t{hx_str}"
+            h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
+            hx_sisters = m_data.hx_sisters
+            if hx_sisters:
+                hx_str = "\t".join([f'H{i+2} Node:{hx.name}' for i, hx in enumerate(hx_sisters)])
+            else:
+                hx_str = "Hx Nodes:NA"
+            h_info = f"\tH1 Node:{h1_name}\t{hx_str}"
             
             tasks.append((m_idx, mt_str, h_info, str(pickle_path)))
         

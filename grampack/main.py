@@ -53,10 +53,11 @@ class NoDaemonPool(multiprocessing.pool.Pool):
 
 def task_worker(payload: Tuple[Any, Any, str],
                 context: GlobalContext, config: TaskConfig,
-                verbosity: int = 0, label: str = '', parent_logger: Optional[GranLogger] = None) -> Tuple[str, Optional[TaskResult], Dict[str, Any], Path]:
+                verbosity: int = 0, label: str = '',
+                parent_logger: Optional[GranLogger] = None) -> Tuple[str, Optional[TaskResult], Dict[str, Any], Path, Optional[list]]:
     """
     Unified worker for both Sequential (Full) and Binary (Split) modes.
-    Returns: (task_id, result, updates, log_file)
+    Returns: (task_id, result, updates, log_file, benchmarks)
     """
         
     st, gts, task_id = payload
@@ -90,15 +91,16 @@ def task_worker(payload: Tuple[Any, Any, str],
 
     # If no parent logger provided (preferred in multiprocessing)
     # create logger without forwarding to parent
-    logger = GranLogger(iter_tcf.log_file, verbosity, no_log=context.nolog, debug=context.debug, parent_logger=parent_logger, label=label)
+    iter_logger = GranLogger(iter_tcf.log_file, verbosity, no_log=context.nolog, debug=context.debug, parent_logger=parent_logger, label=label)
+    iter_logger.start_info(iter_ctx, iter_tcf)
 
     # Execute Task
     # Task.execute returns (StepResult, updates)
     # 'updates' contains ONLY the hydrated persistent config data (parsed ploidies, etc.)
-    task = Task(iter_ctx, logger=logger)
-    res, updates = task.execute(iter_tcf)
+    task = Task(iter_ctx, logger=iter_logger)
+    res, updates, benchmarks = task.execute(iter_tcf)
 
-    return task_id, res, updates, logger.log_file
+    return task_id, res, updates, iter_logger.log_file, benchmarks
 
 # --- Core Classes --- #
 
@@ -123,19 +125,17 @@ class Task:
         self.mul_mgr = None
         self.gene_mgr = None
              
-    def execute(self, tcf: TaskConfig) -> Tuple[Optional[TaskResult], Dict[str, Any]]:
+    def execute(self, tcf: TaskConfig) -> Tuple[Optional[TaskResult], Dict[str, Any], Optional[list]]:
 
-        # Setup task & log banner
+        # Setup task
         Path(tcf.output_dir).mkdir(parents=True, exist_ok=True)
         if not self.logger:
-            # Create a new logger if one wasn't passed (standard behavior)
+            # Create a new logger if one wasn't passed
             log_file = Path(tcf.output_dir) / f"{tcf.run_prefix}.log"
             self.logger = GranLogger(log_file, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug)
-        self.logger.start_info(self.ctx, tcf)
 
         if self.ctx.norun:
-            self.logger.norun_banner()
-            return None, {}
+            return None, {}, self.logger.norun_banner()
 
         self.logger.report_step("", "", start=True, enable_benchmark=self.ctx.bench)
 
@@ -144,7 +144,7 @@ class Task:
 
         # If the ST is None, terminal label-sp mode successfully finished or a warning was logged. Exit smoothly.
         if not self.spec_tree:
-            self.logger.end_prog(); return None, {}
+            return None, {}, self.logger.end_prog()
         
         # Re-init component with current task
         self.mul_mgr = MulTreeManager(tcf, self.spec_tree, self.logger)
@@ -154,7 +154,7 @@ class Task:
 
         # If build() returns an empty dict, a terminal mode (count-mts or build-mts) successfully finished or a warning was logged. Exit smoothly.
         if not self.mul_trees:
-            self.logger.end_prog(); return None, {}
+            return None, {}, self.logger.end_prog()
 
         # Load Gene Trees
         self.gene_trees = TreeLoader.gene_trees(tcf, self.logger)
@@ -171,7 +171,7 @@ class Task:
 
         # In check-nums mode, cull returns False after logging the counts and handling pickles.
         if not proceed:
-            self.logger.end_prog(); return None, {}
+            return None, {}, self.logger.end_prog()
 
         # Reconciliation and MUL-tree Selection
         step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry)
@@ -210,7 +210,7 @@ class Task:
             'repair': False # Disable repair for subsequent runs
         }
 
-        return step_result, tcf_updates
+        return step_result, tcf_updates, self.logger.benchmarks
         
 class Engine:
     """
@@ -245,12 +245,13 @@ class Engine:
         return min_score, min_idx, min_mult
 
     def run(self) -> Dict[str, Union[SmrtTree, HistoryType, Any]]:
-        final_smtree = None
+
         run_mode = self.tcf.mode
-        
         # Init FlowManager for any iterative mode, and single - to return history
         if run_mode in ["full", "split", "mixed", "single", "st-only", "no-st"] and not self.ctx.norun:
             self.flow_mgr = FlowManager(self.ctx, run_mode, self.flow_logger)
+
+        self.flow_logger.start_info(self.ctx, self.tcf)
 
         final_smtree = None
         if run_mode == "mixed":
@@ -260,7 +261,7 @@ class Engine:
         elif run_mode == "split":
             final_smtree = self.run_split()
         else:
-            res, _ = Task(self.ctx, self.flow_logger).execute(self.tcf)
+            res, _, _ = Task(self.ctx, self.flow_logger).execute(self.tcf)
             # Extract best SmrtTree if applicable
             if res:
                 min_score, min_idx, min_mult = self._unpack_min_res(res)
@@ -270,6 +271,7 @@ class Engine:
                 if run_mode != "st-only":
                     self.flow_mgr.update_history(0, 0, res)
 
+        # move to logger.final_report()...
         if final_smtree:
             final_smtree.write_forms(self.ctx.root_dir)
             self.flow_logger.log("Singly- and multi-labelled forms of the final tree written to output directory.", 'i')
@@ -348,7 +350,7 @@ class Engine:
                 # Run worker
                 # We pass the persistent config (which might have parsed ploidies from iter 1)
                 # worker will apply transient updates (output_dir, st, gts) internally
-                _, res, updates, iter_log = task_worker(
+                _, res, updates, iter_log, benchmarks = task_worker(
                     payload = (current_st, current_gts, str(i)),
                     context = self.ctx,      # Pass Global Context
                     config  = perm_tcf,       # Pass updated Task Config 
@@ -363,7 +365,7 @@ class Engine:
                 perm_tcf = perm_tcf.update(**updates)
 
                 iter_logger = GranLogger(iter_log, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug,
-                                         parent_logger=self.flow_logger, clear_log=False, label=iter_labeller(i))
+                                         parent_logger=self.flow_logger, clear_log=False, label=iter_labeller(i), benchmarks=benchmarks)
                 # Process result and handle potential nesting
                 # This returns the trees prepared for the NEXT iteration
                 next_mt, next_gts, _ = self.flow_mgr.handle_iteration_result(
@@ -524,7 +526,7 @@ class Engine:
             # If this is the first run, the workers just parsed the ploidies/h-nodes.
             # We grab the updates from the *first valid result* and update perm_tcf.
             # The next depth's workers will receive the PARSED dicts, not file paths.
-            for _, _, updates, _ in batch_results:
+            for _, _, updates, _, _ in batch_results:
                 if updates:
                     perm_tcf = perm_tcf.update(**updates)
                     break # Only need to do once
@@ -534,7 +536,7 @@ class Engine:
             next_tasks = []
             # Sort batch results by task_id to ensure deterministic logging
             batch_results.sort(key=lambda x: x[0]) # Sort by task_id
-            for task_id, res, _, iter_log in batch_results:
+            for task_id, res, _, iter_log, benchmarks in batch_results:
                 if not res: continue
 
                 min_score, min_idx, min_mult = self._unpack_min_res(res)
@@ -542,7 +544,7 @@ class Engine:
                 # Assimilate the worker's log into the main logger
                 self.flow_logger.assimilate(iter_log)
                 iter_logger = GranLogger(iter_log, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug,
-                                         parent_logger=self.flow_logger, clear_log=False, label=iter_labeller(task_id))
+                                         parent_logger=self.flow_logger, clear_log=False, label=iter_labeller(task_id), benchmarks=benchmarks)
                 # Logic to determine branching vs termination moved to flow_mgr
                 # Note: We reconstruct path here to avoid passing it back from workers
                 extracts = self.flow_mgr.handle_split_result(
