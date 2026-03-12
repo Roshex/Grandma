@@ -534,8 +534,9 @@ class InitParser:
         g_flow.add_argument('--start', type=str, default='auto',
             help="Start point when resuming a previous execution; positive <int>, or 'auto' [default] for auto-detection.")
         g_flow.add_argument('--cutoff', type=str, default='auto',
-            help="Stopping condition when comparing MP score; 'auto' [default] for abs:0+lookback, 'abs:<int>' for "
-                 "absolute, or 'rel:<float>' for relative.")
+            help="Stopping condition when comparing MP scores. For Split mode or the first iter of Full, score is compared to the input ST "
+                 "score. For subsequent iters of Full, score is compared to the previous iter's best score. Can be 'abs:<int>' for absolute "
+                 "difference, 'rel:<float>' for relative difference, or 'auto' as a shorthand for 'abs:0' [default].")
         g_flow.add_argument("--orthologies", action="store_true",
             help="If set, will output an additional file containing the pairwise orthology "
                  "relationships for each gene tree to the lowest scoring MUL-tree.")
@@ -591,7 +592,7 @@ class InitParser:
     def parse_cutoff(self, val: str) -> Tuple[str, Optional[Union[float, int]]]:
         """Parses stopping condition strings into a typed tuple."""
         if val == 'auto': 
-            return ('auto', 0)
+            return ('abs', 0)
         if val.startswith('rel:'):
             try: 
                 return ('rel', float(val.split(':')[1]))

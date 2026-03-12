@@ -359,7 +359,7 @@ class ReticulateTree:
 
         # Helper: get set of leaf names under node
         def get_leaf_set(n):
-            return frozenset(leaf.name for leaf in n.iter_leaves())
+            return frozenset(n.iter_leaf_names())
 
         # Near-isomorphic check (polyphest-style)
         def is_near_isomorphic(n1, n2):
@@ -893,7 +893,7 @@ class ReticulateTree:
         return sisters
     
     def get_leaf_counts(self):
-        return dict(Counter(leaf.name for leaf in self.tree.iter_leaves()))
+        return dict(Counter(self.tree.iter_leaf_names()))
 
     def measure(self, printout=False):
         measurements = {

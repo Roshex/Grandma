@@ -826,7 +826,7 @@ class Reconciler:
             for mul_idx, res_dict in detailed_res.items():
                 mul_data = mul_trees[mul_idx]
                 hybrid_clade = mul_data.h_clade
-                ordered_nodes = mul_data.mt.get_node_order()
+                ordered_nodes = mul_data.mt.node_order
                 
                 # Pre-fill dictionary with 0s to guarantee NO missing rows
                 main_dups = {node: 0 for node in ordered_nodes}

@@ -293,19 +293,6 @@ class SmrtTree:
         
         self._index_nodes()
 
-    """def _index_nodes(self):
-        self.node_map = {} 
-        i = 1
-        for node in self.ete_tree.traverse("postorder"):
-            if not node.is_leaf():
-                if not node.name:
-                    node.name = f"<{i}>"
-                    i += 1
-            else:
-                node.name = str(node.name).strip()
-            
-            self.node_map[node.name] = node"""
-
     def _index_nodes(self):
         """
         All nodes must have unique names after this, and pure attribute set (none-unique).
@@ -343,24 +330,6 @@ class SmrtTree:
         for node in self.ete_tree.traverse("postorder"):
             self.add_pure(node)
 
-    def refresh(self):
-        self._index_nodes()
-        self.match_map = {}
-        self.flat_tree = None # Invalidate flat tree on structural change
-
-    def make_flat(self, registry: NameRegistry):
-        """Generates the FlatTree bundle for optimized processing."""
-        self.flat_tree = TreeLinearizer.linearize(self, registry)
-
-    """def _cache_depths(self):
-        for node in self.ete_tree.traverse("preorder"):
-            if node.is_root():
-                node.add_feature("fast_depth", 0)
-            else:
-                node.add_feature("fast_depth", node.up.fast_depth + 1)
-            
-            clean = node.name.replace("*", "") if node.is_leaf() else "" """
-
     def get_node(self, name: str) -> Optional[TreeNode]:
         return self.node_map.get(name)
     
@@ -373,6 +342,29 @@ class SmrtTree:
             for node in self.ete_tree.traverse():
                 self.match_map.setdefault(node.pure, []).append(node)
         return self.match_map[name]
+
+    def make_flat(self, registry: NameRegistry):
+        """Generates the FlatTree bundle for optimized processing."""
+        self.flat_tree = TreeLinearizer.linearize(self, registry)
+
+    def refresh(self):
+        self._index_nodes()
+        self.match_map = {}
+        self.flat_tree = None # Invalidate flat tree on structural change
+
+    def _clear_dead(self, affected_nodes: Dict[str, Set[str]]) -> None:
+        """
+        Removes affected nodes from caches after structural modifications.
+        affected_nodes: Dict[pure_name, Set[node_names]]
+        """
+        self.flat_tree = None
+        for pure, names in affected_nodes.items():
+            for k in names:
+                self.node_map.pop(k, None)
+            if pure in self.match_map:
+                self.match_map[pure] = [n for n in self.match_map[pure] if n.name not in names]
+                if not self.match_map[pure]:
+                    del self.match_map[pure]
 
     def rename_leaves_from_mapping(self, recon_map: 'Map', suffix_name_map: Dict[str, Set[str]]) -> None:
         
@@ -418,6 +410,73 @@ class SmrtTree:
             node.add_feature('pure', pure)
     
     @staticmethod
+    def get_sis(node: Optional[Tree]) -> Optional[Tree]:
+        """Returns the sister node of the given node, or None if root."""
+        if not node or node.is_root():
+            return None
+        sisters = node.get_sisters()
+        if len(sisters) != 1:
+            raise ValueError("Tree structure invalid for sister retrieval.")
+        return sisters[0]
+
+    def get_targets(self, primary: Union[str, Tree]) -> List[Tree]:
+        '''
+        Returns the list of all target nodes matching the pure name of a primary target.
+        '''
+        # if primary is a string, find the node first
+        if isinstance(primary, str):
+            primary = self.get_node(primary)
+
+        prim_name = primary.name
+        if '|' in prim_name:
+            pure_name = prim_name.split('|')[0]
+            if not primary.is_leaf():
+                pure_name += '>'
+        else:
+            pure_name = prim_name
+
+        if pure_name != primary.pure:
+            raise ValueError(f"Primary target's pure attribute '{primary.pure}' does not match expected pure name '{pure_name}'.")
+        
+        return self.match(pure_name)
+
+    @property
+    def desc_pure_cache(self) -> Dict[Tree, Set[str]]:
+        pure_desc_cache = {}
+        for node in self.ete_tree.traverse("postorder"):
+            desc_set: Set[str] = set()
+            for child in node.children:
+                desc_set.add(child.pure)
+                # Union with child's descendants
+                desc_set.update(pure_desc_cache.get(child, set()))
+            pure_desc_cache[node] = desc_set
+        return pure_desc_cache
+
+    @property
+    def node_order(self) -> List[str]:
+        """
+        Returns nodes in legacy GRAMPA order: 
+        All leaves first (left-to-right), followed by all internal nodes (postorder).
+        Executes in a single O(N) pass and caches the result.
+        """
+        #if not hasattr(self, '_node_order'):
+        leaves = []
+        internals = []
+        # A single postorder traversal naturally visits leaves left-to-right!
+        for node in self.ete_tree.traverse("postorder"):
+            if node.is_leaf():
+                leaves.append(node.name)
+            else:
+                internals.append(node.name)
+        #self._node_order = leaves + internals
+        #return self._node_order
+        return leaves + internals
+
+    # --------------------------------------------------------------------------
+    # Structural Tree Manipulation Logic
+    # --------------------------------------------------------------------------
+
+    @staticmethod
     def graft_subtree(tree: TreeNode, target: TreeNode, graft: TreeNode, name: str) -> TreeNode:
         """
         Grafts `graft` on the branch leading to `p_node`.
@@ -438,18 +497,77 @@ class SmrtTree:
     
     @staticmethod
     def copy_lineage(subtree: TreeNode, tag: str = '') -> TreeNode:
-        subtree = subtree.copy()
-        # Pure name should be already set due to copy!
-        for n in subtree.traverse():
-            # n.add_feature('pure', n.name)
-            if n.is_leaf():
-                n.name = f"{n.name}{tag}"
-            elif n.name and n.name.startswith("<") and n.name.endswith(">"):
-                # Wipe internal node names which will be made unique during indexing
-                #n.name = None
-                n.name = n.name.replace(">", f"{tag}>")
+        # detach() clears the root (t.up == None)
+        subtree = subtree.copy().detach()
+        # Make sure the node is now a root
+        # assert subtree.up is None, "Subtree copy should be a new root."
+        if str:
+            # Pure name should be already set due to copy!
+            for n in subtree.traverse():
+                if n.is_leaf():
+                    n.name = f"{n.name}{tag}"
+                elif n.name and n.name.startswith("<") and n.name.endswith(">"):
+                    n.name = n.name.replace(">", f"{tag}>")
         return subtree
 
+    def trim_lineages(self, node_names: List[str]) -> Tuple[bool, List[Optional[str]]]:
+        """
+        Safely removes clades by name using O(K) differential indexing, generally used for the Outer Species Tree.
+        Deletes the resulting knuckle nodes, and handles the special case of root removal by promoting the child.
+        Returns: (will_tree_survive, trimmed_names)
+        will_tree_survive: False if the tree is to be completely trimmed away (e.g. if root was removed), True otherwise.
+        trimmed_names: List of names of the parents of the removed H nodes. Empty indicates trimming at the root (resulting in an empty tree).
+        """
+
+        """def add_trackers(n: TreeNode, trackers: List[str]):
+            if trackers:
+                if not hasattr(n, 'H'): n.add_feature('H', [])
+                n.H.extend(trackers)"""
+
+        trimmed_names = []
+        # Track nodes permanently removed from the tree
+        dead_keys = defaultdict(set) # pure_name -> set of node names removed with that pure name
+        nodes_to_trim = []
+        
+        # Assertion loop
+        for name in node_names:
+            n = self.get_node(name)
+            assert n is not None, f"Node with name '{name}' not found."
+            nodes_to_trim.append(n)
+            if n.up is None: return False, []
+
+        # Modification loop (after all checks pass)
+        for n in nodes_to_trim:
+            n_up = n.up
+            trimmed_names.append(n_up.name)
+            """trackers = getattr(n_up, 'H', [])""" 
+            
+            # Track all descendants of the detached clade for dictionary removal
+            for d in n.traverse():
+                dead_keys[d.pure].add(d.name)
+            # Parent is either bypassed (if root) or deleted
+            dead_keys[n_up.pure].add(n_up.name)
+            n.detach()
+            
+            # Handle the child promotion if the parent is the root, otherwise just delete the parent
+            if n_up.up is None:
+                children = n_up.get_children()
+                assert len(children) == 1, "Unexpected structure when trimming a tree."
+                child = children[0]
+                self.ete_tree = child.detach() # Ensures root pointer is None
+                """add_trackers(self.ete_tree, trackers)"""
+            else:
+                n_up_up = n_up.up
+                n_up.delete() # ETE3 automatically splices child to grandparent
+                """add_trackers(n_up_up, trackers)"""
+                    
+        # Clear catches appropriately after all modifications are done
+        self._clear_dead(dead_keys)
+
+        # Check cleaning vs trimming consistency
+        self.assert_len()
+        return True, trimmed_names
+    
     def to_multi_mul_tree(self, h1_name: str, hx_names: List[str]) -> Optional[Tuple['SmrtTree', TreeNode, List[TreeNode]]]:
         """
         Grafts multiple H-lineages (H2, H3...) onto the H1 branch.
@@ -495,7 +613,9 @@ class SmrtTree:
         
         return new_smrt, h1_final, hx_nodes_final
 
-    # --- I/O and Pickling ---
+    # --------------------------------------------------------------------------
+    # I/O and String Conversion (ETE3-based, with optional name formatting)
+    # --------------------------------------------------------------------------
 
     def write_forms(self, output_dir: Path):
 
@@ -572,79 +692,6 @@ class SmrtTree:
         for n in tree_copy.traverse():
             n.name = n.pure
         return ReticulateTree(tree_copy)
-
-    def get_node_order(self) -> List[str]:
-        """
-        Returns nodes in legacy GRAMPA order: 
-        All leaves first (left-to-right), followed by all internal nodes (postorder).
-        Executes in a single O(N) pass and caches the result.
-        """
-        #if not hasattr(self, '_node_order'):
-        leaves = []
-        internals = []
-        # A single postorder traversal naturally visits leaves left-to-right!
-        for node in self.ete_tree.traverse("postorder"):
-            if node.is_leaf():
-                leaves.append(node.name)
-            else:
-                internals.append(node.name)
-        #self._node_order = leaves + internals
-        return leaves + internals
-            
-        #return self._node_order
-
-    @staticmethod
-    def get_sis(node: Optional[Tree]) -> Optional[Tree]:
-        """Returns the sister node of the given node, or None if root."""
-        if not node or node.is_root():
-            return None
-        sisters = node.get_sisters()
-        if len(sisters) != 1:
-            raise ValueError("Tree structure invalid for sister retrieval.")
-        return sisters[0]
-
-    def get_targets(self, primary: Union[str, Tree]) -> List[Tree]:
-        '''
-        Returns the list of all target nodes matching the pure name of a primary target.
-        '''
-        # if primary is a string, find the node first
-        if isinstance(primary, str):
-            primary = self.get_node(primary)
-
-        prim_name = primary.name
-        if '|' in prim_name:
-            pure_name = prim_name.split('|')[0]
-            if not primary.is_leaf():
-                pure_name += '>'
-        else:
-            pure_name = prim_name
-
-        if pure_name != primary.pure:
-            raise ValueError(f"Primary target's pure attribute '{primary.pure}' does not match expected pure name '{pure_name}'.")
-        
-        return self.match(pure_name)
-
-    @property
-    def desc_pure_cache(self) -> Dict[Tree, Set[str]]:
-        pure_desc_cache = {}
-        for node in self.ete_tree.traverse("postorder"):
-            desc_set: Set[str] = set()
-            for child in node.children:
-                desc_set.add(child.pure)
-                # Union with child's descendants
-                desc_set.update(pure_desc_cache.get(child, set()))
-            pure_desc_cache[node] = desc_set
-        return pure_desc_cache
-    
-    def copy(self) -> 'SmrtTree':
-        return SmrtTree(tree_obj=self.ete_tree.copy())
-
-    def __getstate__(self):
-        return self.ete_tree
-    
-    def __setstate__(self, state):
-        self.ete_tree = state
-        self.refresh()
 
     # --------------------------------------------------------------------------
     # GROUP COLLAPSING LOGIC (Object-based, run once per iter)
@@ -749,6 +796,47 @@ class SmrtTree:
 
         return GroupData(final_ambiguous, final_fixed)
 
+    # --------------------------------------------------------------------------
+    # Utilities and Pickling
+    # --------------------------------------------------------------------------
+
+    def copy(self) -> 'SmrtTree':
+        # The faster newick-extended method should work too as it preserves attributes added as features (e.g. pure),
+        # and it is faster, but I trust the cPickle method more (and it's already faster than deepcopy), so I'll keep it for now.
+        return SmrtTree(tree_obj=self.ete_tree.copy(method="cpickle"))
+
+    def destroy(self) -> None:
+
+        # Drop the root pointer
+        tree = self.ete_tree
+        self.ete_tree = None
+
+        # Sever circular references (primary GC bottleneck)
+        for node in tree.traverse("postorder"):
+            node.up = None
+            node.children = []
+        del tree
+
+        # Clear caches
+        self.node_map.clear()
+        self.match_map.clear()
+        self.flat_tree = None
+
+    def assert_len(self):
+        assert len(self) == len(self.ete_tree), f"Length mismatch: {len(self)} by names vs {len(self.ete_tree)} by tree leaves"
+    
+    def __len__(self):
+        # Returns the number of leaves
+        # Assume bifurcating tree with unique names, so num_nodes = 2 * num_leaves - 1
+        return (len(self.node_map) + 1) // 2
+
+    def __getstate__(self):
+        return self.ete_tree
+    
+    def __setstate__(self, state):
+        self.ete_tree = state
+        self.refresh()
+
 @dataclass(slots=True, frozen=True)
 class MulTree:
     mt: SmrtTree
@@ -806,6 +894,16 @@ class MulTree:
             assert h_node == tree_wrapper.get_sis(tree_wrapper.get_node(h_locs[i])), f"Expected {to_match} to be sister of {h_locs[i]}"
             hx_nodes.append(h_node)
         return hx_nodes
+    
+    def build_h_copy_map(self) -> Dict[str, int]:
+        """Creates an O(1) lookup mapping a leaf name to its homoeologous copy index."""
+        mt_node_to_copy_idx = {}
+        for ln in self.h1_node.iter_leaf_names():
+            mt_node_to_copy_idx[ln] = 0
+        for x, hx_node in enumerate(self.hx_nodes, 1):
+            for ln in hx_node.iter_leaf_names():
+                mt_node_to_copy_idx[ln] = x
+        return mt_node_to_copy_idx
 
     def rename_marked_nodes(self, depth: int, copy_offset: int=0, skip_p_tag: bool=False) -> Dict[str, Set[str]]:
         """
@@ -881,7 +979,7 @@ class MulTree:
             if node: leaf_nodes.append(node)
         if not leaf_nodes: return None
         lca = tree.ete_tree.get_common_ancestor(leaf_nodes)
-        lca_leaves = {l.name for l in lca.iter_leaves()}
+        lca_leaves = set(lca.iter_leaf_names())
         if lca_leaves == target_leaves: return lca
         return None
     
@@ -893,11 +991,10 @@ class MulTree:
         """
         if not node_obj or not node_obj.up: return []
         # Must be l.name (not l.pure) to preserve the '*' for disjoint checks!
-        # So we can optimize by using get_leaf_names() which returns the names of leaves without traversing nodes.
         return [
             l_name 
             for sis in node_obj.up.children if sis != node_obj 
-            for l_name in sis.get_leaf_names()
+            for l_name in sis.iter_leaf_names()
         ]
 
     def get_sister_clades(self) -> Tuple[Set[str], List[Set[str]]]:
@@ -926,9 +1023,9 @@ class MulTree:
             
             if n_obj:
                 sisters = MulTree._get_sister_clade_labels(n_obj)
-                if not set(h1_sisters).isdisjoint({l.name for l in n_obj.iter_leaves()}): 
+                if not set(h1_sisters).isdisjoint(set(n_obj.iter_leaf_names())): 
                     h1_sisters = []
-                if n1_obj and not set(sisters).isdisjoint({l.name for l in n1_obj.iter_leaves()}): 
+                if n1_obj and not set(sisters).isdisjoint(set(n1_obj.iter_leaf_names())): 
                     sisters = []
                 # Append Set of clean names directly to the list
                 hx_sisters_list.append({s.replace("*", "") for s in sisters})

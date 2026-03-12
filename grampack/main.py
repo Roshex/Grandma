@@ -269,7 +269,7 @@ class Engine:
                 self.flow_logger.end_prog(min_score, min_idx, min_mult.to_marked_str())
                 final_smtree = min_mult.mt
                 if run_mode != "st-only":
-                    self.flow_mgr.update_history(0, 0, res)
+                    self.flow_mgr.judge_event(0, 0, res)
 
         # move to logger.final_report()...
         if final_smtree:
@@ -299,6 +299,7 @@ class Engine:
         full_limit = self.ctx.mixed_switch
         
         # Run Full Mode up to switch point
+        self.flow_mgr.mode = "full"
         last_st, last_gts = self.run_full(limit_override=full_limit)
         
         if not last_gts:
@@ -310,6 +311,8 @@ class Engine:
         # The ID is simply the iteration number (e.g., "5"), representing depth 5, index 0 effectively.
         # Split logic expects "Depth.Index": since we ran linear 0..4, the next depth is 5 (and index 0).
         root_id = f"{full_limit}.0"
+
+        self.flow_mgr.mode = "split"
         return self.run_split(initial_payload=(last_st, last_gts, root_id))
         
     def run_full(self, limit_override: int = None) -> Tuple[SmrtTree, Optional[Dict[int, SmrtTree]]]:
@@ -369,7 +372,7 @@ class Engine:
                                          parent_logger=self.flow_logger, clear_log=False, label=iter_labeller(i), benchmarks=benchmarks)
                 # Process result and handle potential nesting
                 # This returns the trees prepared for the NEXT iteration
-                next_mt, next_gts, _ = self.flow_mgr.handle_iteration_result(
+                next_mt, next_gts, _ = self.flow_mgr.relabel_problem(
                     i, res,
                     engine_callback = lambda st, gts, h1, h2, out: self._run_nested_subproblem(st, gts, h1, h2, out),
                     iter_out = self.ctx.root_dir / str(i) / "output", 
@@ -549,7 +552,7 @@ class Engine:
                                          parent_logger=self.flow_logger, clear_log=False, label=iter_labeller(task_id), benchmarks=benchmarks)
                 # Logic to determine branching vs termination moved to flow_mgr
                 # Note: We reconstruct path here to avoid passing it back from workers
-                extracts = self.flow_mgr.handle_split_result(
+                extracts = self.flow_mgr.extract_subproblems(
                         task_id, res,
                         iter_out = self.ctx.root_dir / task_id / "output",
                         iter_logger = iter_logger
@@ -567,11 +570,11 @@ class Engine:
 
             # Sort new tasks by num of species tree leaves [largest first - more cores to bigger problems]
             # Done after the loop guarantees a SmrtTree object for sorting!
-            next_tasks.sort(key=lambda x: len(x[0].ete_tree.get_leaves()), reverse=True)
+            next_tasks.sort(key=lambda x: len(x[0].ete_tree), reverse=True)
             # Debug: print task IDs and sizes
             self.flow_logger.log(f"Generated {len(next_tasks)} tasks for Depth {depth + 1}.", 'd')
             for t in next_tasks:
-                self.flow_logger.log(f"  Task ID: {t[2]}, Number of Species Leaves: {len(t[0].ete_tree.get_leaves())}", 'd')
+                self.flow_logger.log(f"  Task ID: {t[2]}, Number of Species Leaves: {len(t[0].ete_tree)}", 'd')
 
             current_tasks = next_tasks
             depth += 1

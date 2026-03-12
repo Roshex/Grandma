@@ -297,7 +297,7 @@ class DatasetGenerator:
         Returns list of leaf nodes to KEEP.
         """
         survivors = []
-        for leaf in node.get_leaves():
+        for leaf in node.iter_leaves():
             # Roll for survival (1 - loss_err)
             if random.random() >= self.loss_err:
                 survivors.append(leaf)

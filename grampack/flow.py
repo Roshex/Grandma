@@ -1,12 +1,12 @@
 import json
 import random
-from typing import Tuple, List, Optional, Dict, Set
+from typing import Tuple, List, Optional, Dict, Set, Callable, Any
 from collections import defaultdict
 from pathlib import Path
 from functools import partial
 
 from .config import GlobalContext
-from .models import Tree, TreeNode, SmrtTree, TaskResult, MulTree, HistoryType, ConcurrTask
+from .models import Tree, TreeNode, SmrtTree, TaskResult, MulTree, Map, HistoryType, ConcurrTask
 from .ops import CommonOps
 from .logger import GranLogger
 
@@ -42,31 +42,29 @@ class FlowManager:
 
     # --- Overlapping Methods for Full and Split Modes ---
 
-    def _check_if_passed(self, i: int, j: int) -> bool:
+    def _check_if_passed(self, i: int, j: int, curr_event: dict) -> bool:
         """Returns True if the event should be accepted."""
         cut_type, cut_val = self.ctx.cutoff
-        curr_event = self.ctx.history[(i, j)]
 
-        self.logger.log(f"Checking if passed for event ({i}, {j}): {curr_event}", 'd')
+        # --- Determine which score to compare against ---
 
-        # In split mode, always compare within current event
-        if self.mode == 'split':
-            if cut_type == 'rel': cut_val *= curr_event['input_score']
-            return cut_val < curr_event['input_score'] - curr_event['nonin_score']
-        
-        # In full mode, compare to previous event (unless within nested fix or first iteration)
-        if j > 0:
-            # Called from nested fix
+        # In split mode / the first iteration of full mode: compare to the input score of the current event
+        if self.mode == 'split' or i == 0:
+            comp_score = curr_event['input_score']
+        # The rest are full mode iterations after the first one
+        elif j > 0:
+            # Nested fix always passes
             return True
         else:
-            if i == 0:
-                if cut_type == 'rel': cut_val *= curr_event['input_score']
-                return cut_val < curr_event['input_score'] - curr_event['nonin_score']
-            else:
-                # harder condition - may want to have a flag for it, but stops infinite loops
-                prev_event = self._get_prev_event(i, j)
-                if cut_type == 'rel': cut_val *= prev_event['nonin_score']
-                return cut_val < prev_event['nonin_score'] - curr_event['nonin_score']
+            # Look-back: compare to the non-input score of the previous event
+            # (i.e., the score of the tree we are modifying, before re-evaluation in the current iteration)
+            prev_event = self._get_prev_event(i, j)
+            comp_score = prev_event['nonin_score']
+            
+        # --- Apply type of cutoff ---
+        if cut_type == 'rel': cut_val *= comp_score
+            
+        return cut_val < (comp_score - curr_event['nonin_score'])
 
     def _get_prev_event(self, i: int, j: int) -> Optional[dict]:
         """
@@ -99,52 +97,75 @@ class FlowManager:
         nonin_rank = self._get_nonin_rank(res)
         return res.mt_idx(nonin_rank)
 
-    @staticmethod
-    def _get_sis_nodes(node1: TreeNode, node2: TreeNode) -> List[TreeNode]:
-        """Returns the sister node of the given node, or None if not found."""
-        if node1.up and node2.up and node1.up.name == node2.up.name:
-            # autopolyploid case
-            node1, node2 = node1.up, node2.up
-        res = []
-        for node in [node1, node2]:
-            parent = node.up
-            if parent is None:
-                if None not in res:
-                    res.append(None)
-            else:
-                children = parent.get_children()
-                if len(children) != 2:
-                    raise ValueError("Tree structure invalid for sister retrieval.")
-                sister = children[0] if children[1] == node else children[1]
-                # Append sister if not already added
-                if sister not in res:
-                    res.append(sister)
-        if len(res) < 1:
-            raise ValueError("Sister node not found.")
-        return res
+    def judge_event(self, i: int, j: int, res: TaskResult, transform: Optional[Callable] = None) -> Tuple[bool, int, MulTree, Optional[Any]]:
+        """
+        Judges whether the current event passes the parsimony cutoff and prepares data for the next iteration.
+        Logs the input and best, or, if input is best, input and second-best MulTree data for history tracking.
+        """
+        step = "Assessing event parsimony"
+        self.logger.report_step(step, "In progress...")
 
-    def update_history(self, i: int, j: int, res: TaskResult, hold: bool = False) -> bool:
-        """
-        Logs the input and best, or, if input is best, input and second-best
-        MulTree data for history tracking.
-        Holds off writing to disk if `hold` is True, until nested fixes are done in Full mode.
-        """
         best_idx = res.mt_idx()
+        best_mt = res.mul_trees[best_idx]
+        best_mt_str = best_mt.mt.to_str(internals=True) # Before renaming if == nonin_mt
+
         nonin_rank = self._get_nonin_rank(res)
-        input_score = res.input_score
         nonin_idx = res.mt_idx(nonin_rank)
         nonin_score = res.mt_score(nonin_rank)
-        self.logger.log(f"Best non-input index: {nonin_idx}, Best index: {best_idx}", 'd')
-        self.logger.log(f"Input map score: {input_score}, Best non-input map score: {nonin_score}", 'd')
-
-        best_mt = res.mul_trees[best_idx]
         nonin_mt = res.mul_trees[nonin_idx]
-        self._debug_tree("Best MulTree:", best_mt.mt.ete_tree)
-        self._debug_tree("Best Non-input MulTree:", nonin_mt.mt.ete_tree, other_attr=['H', 'pure'])
-
         h_nodes = [nonin_mt.h1_node] + nonin_mt.hx_nodes
-        sister_nodes = [nonin_mt.mt.get_sis(n) for n in h_nodes]
 
+        input_score = res.input_score
+
+        if self.ctx.debug:
+            hx_str = [f'{n.name} (H{x+2})' for x, n in enumerate(h_nodes[1:])]
+            kind = "Splitting" if self.mode == "split" else "Renaming"
+            self._debug_tree(f"{kind} Context: {h_nodes[0].name} (H1) | {' | '.join(hx_str)}", nonin_mt.mt.ete_tree, other_attr=['pure'])
+
+        self.logger.log(f"Checking if event ({i}, {j}) passes parsimony cutoff.", 'd')
+        self.logger.log(f"Best non-input index: {nonin_idx}; Best index: {best_idx}", 'd')
+        self.logger.log(f"Input tree score: {input_score}; Best non-input tree score: {nonin_score}", 'd')
+
+        passed = self._check_if_passed(i, j, {'input_score': input_score, 'nonin_score': nonin_score})
+
+        if passed:
+            if self.mode == "full" and j > 0:
+                self.logger.report_step(step, f"Skip...: nested event assessment deferred")
+            else:
+                self.logger.report_step(step, f"Success: event accepted w/ score {nonin_score}")
+        else:
+            self.logger.report_step(step, f"Failed.: parsimony cutoff not met")
+
+        # --- Prepare data for history logging regardless of pass/fail ---
+
+        nonin_mt = res.mul_trees[nonin_idx]
+
+        # Apply operations which must take place BEFORE saving history!
+        transform_result = transform(nonin_mt, i, j) if transform else None
+
+        step = "Logging event data to history"
+        self.logger.report_step(step, "In progress...")
+
+        sister_nodes = [nonin_mt.mt.get_sis(n) for n in h_nodes]
+        # Save event data to history regardless of pass/fail
+        self.ctx.history[(i, j)] = {
+            'best_mt': best_mt_str,
+            'nonin_mt': nonin_mt.mt.to_str(internals=True),
+            'h_name': nonin_mt.h1_node.name,
+            'h_locs': [n.name if n is not None else 'None' for n in sister_nodes], # H nodes or sisters cannot be the root node! But may be None in source STs
+            'h_leaves': nonin_mt.h1_node.get_leaf_names(),
+            'num_gts': len(res.gene_trees),
+            'input_score': input_score,
+            'nonin_score': nonin_score,
+            'passed': passed,
+        }
+        self.update_history()
+
+        self.logger.report_step(step, "Success")
+
+        return passed, nonin_idx, nonin_mt, transform_result
+    
+    def update_history(self):
         #sis_nodes = self._get_sis_nodes(nonin_mt.h1_node, nonin_mt.h2_node)
 
         # Embed an attr H in each sis_node
@@ -154,68 +175,44 @@ class FlowManager:
         #        n.add_feature('H', [])
         #    n.H.append(str((i, j))) # Track which events this node was involved in for nested detection / gluing logic
 
-        self.ctx.history[(i, j)] = {
-            'best_mt': best_mt.mt.to_str(internals=True),
-            'nonin_mt': nonin_mt.mt.to_str(internals=True),
-            'h_name': nonin_mt.h1_node.name,
-            'h_locs': [n.name if n is not None else 'None' for n in sister_nodes], # H nodes or sisters cannot be the root node! But may be None in source STs
-            'h_leaves': nonin_mt.h1_node.get_leaf_names(),
-            'num_gts': len(res.gene_trees),
-            'input_score': input_score,
-            'nonin_score': nonin_score,
-        }
         #if self.logger.debug:
         #    # No longer needed to parse iterations, but is very useful for debugging
         #    track_dict = {n.name: n.H for n in nonin_mt.mt.ete_tree.traverse() if hasattr(n, 'H')}
         #    self.ctx.history[(i, j)]['trackers'] = track_dict
 
-        passed = self._check_if_passed(i, j)
-        self.ctx.history[(i, j)]['passed'] = passed
-
-        if not hold: # For full mode, until nested fixes are done (to not pollute history with partial events)
-            with open(self.ctx.history_file, 'w') as f:
-                json.dump({str(k): v for k, v in self.ctx.history.items()}, f, indent=4)
-
-        return passed
+        with open(self.ctx.history_file, 'w') as f:
+            json.dump({str(k): v for k, v in self.ctx.history.items()}, f, indent=4)
 
     # --- Handlers for the Full mode ---
 
-    def _rename_best_mt(self, res: TaskResult, best_mt_idx: int, i: int, j: int) -> Tuple[MulTree, Dict[str, Set[str]]]:
+    def _relabel_species_tree(self, best_mt: MulTree, i: int, j: int) -> Dict[str, Set[str]]:
         """
         Renames the best MulTree's hybrid lineages for the next iteration.
         Format: |{i}.{j~copy_idx} (e.g., Species|1.0, <Internal|1.1>)
         best_mt is modified in place!
         
         Returns: 
-            best_mt: The modified MulTree (modified in place).
             suffix_name_map: A mapping from suffix to the set of original names that were suffixed.
         """
-        step = "Renaming best non-input MT"
+        step = "Relabeling top non-input species tree"
         self.logger.report_step(step, "In progress...")
 
-        best_mt = res.mul_trees[best_mt_idx]
         mt_wrapper = best_mt.mt
-        h1_node = best_mt.h1_node # Source
-        hx_nodes = best_mt.hx_nodes # Copies
-
-        hx_str = [f'{n.name} (H{x+2})' for x, n in enumerate(hx_nodes)]
-
-        self._debug_tree(f"Renaming Context: {h1_node.name} (H1) | {' | '.join(hx_str)}", mt_wrapper.ete_tree)
 
         suffix_name_map = best_mt.rename_marked_nodes(i, j)
         
         self._debug_tree("Renamed MT:", mt_wrapper.ete_tree, other_attr=['H', 'pure'])
 
         self.logger.report_step(step, "Success")
-        return best_mt, suffix_name_map # suffix -> set of original names (for syncing GTs)
+        return suffix_name_map # suffix -> set of original names (for syncing GTs)
 
-    def _partition_gt_leaves(self, res: TaskResult, best_mt_idx: int, suffix_name_map: Dict[str, Set[str]]) -> Dict[int, SmrtTree]:
+    def _relabel_gene_trees(self, res: TaskResult, best_mt_idx: int, suffix_name_map: Dict[str, Set[str]]) -> Dict[int, SmrtTree]:
         """
         Renames Gene Trees to match the Species Tree renaming logic.
         Uses the mapping generated by _rename_best_mt.
         Returns gt dict, but - GTs are modified in place!
         """
-        step = "Renaming GT leaves to match MT mapping"
+        step = "Relabeling gene trees"
         self.logger.report_step(step, "In progress...")
 
         gts = res.gene_trees
@@ -321,7 +318,7 @@ class FlowManager:
                 # Check if this H1 root is the node itself or one of its ancestors
                 if h_node and h_node.name in lineage_names:
                     # Found a containing event
-                    containing_events.append((h_node, len(h_node.get_leaves())))
+                    containing_events.append((h_node, len(h_node)))
                     # Optimization: No need to check other locs for the same event
                     break 
 
@@ -370,7 +367,7 @@ class FlowManager:
             # Trigger Nested Fix
             self.logger.log(f"Nested Fix: Nested Event Detected! Locating missing copy at the branch leading to {h2_loc.name}", 'i')
 
-            h1_leaves = curr_mt.h1_node.get_leaves()
+            h1_node = curr_mt.h1_node
             
             fix_dir = self.ctx.root_dir / f'{iter}.{next_copy_idx}' / 'output'
             
@@ -382,14 +379,14 @@ class FlowManager:
 
             res, _, _ = engine_callback(
                 curr_mt.mt, curr_gts,
-                ",".join([l.name for l in h1_leaves]), # H1 is the reference
-                ",".join([l.name for l in h2_loc.get_leaves()]), # H2 is the new found copy
+                ",".join(h1_node.iter_leaf_names()), # H1 is the reference
+                ",".join(h2_loc.iter_leaf_names()), # H2 is the new found copy
                 fix_dir
             )
 
             self.logger.report_step(step, "Success")
 
-            curr_mt, curr_gts, suffix_name_map = self.handle_iteration_result(
+            curr_mt, curr_gts, suffix_name_map = self.relabel_problem(
                 iter, res, engine_callback, fix_dir, self.logger, j=next_copy_idx
             )
 
@@ -414,7 +411,7 @@ class FlowManager:
 
         return curr_mt, curr_gts
 
-    def handle_iteration_result(
+    def relabel_problem(
             self, i: int, res: TaskResult,
             engine_callback: callable,
             iter_out: Path,
@@ -422,32 +419,21 @@ class FlowManager:
             j: int = 0
         ) -> Tuple[Optional[MulTree], Optional[Dict[int, SmrtTree]], Dict[str, Set[str]]]:
         """
-        Handles the end of a 'Full' mode iteration.
+        Handles the end of a 'Full' mode iteration using tip renaming for both the best MT and GTs.
         Returns: (next_st, next_gts) or None if stopping.
         """
         self.logger = iter_logger
 
-        # Rename best non-input MT
-        nonin_idx = self._get_nonin_idx(res)
-        next_mt, suffix_name_map = self._rename_best_mt(res, nonin_idx, i, j)
-
-        step = "Assessing event parsimony"
-        self.logger.report_step(step, "In progress...")
-
         # Update history & check if passed cutoff
-        passed = self.update_history(i, j, res)
+        # Rename best non-input MT in-place while evaluating the event
+        passed, nonin_idx, next_mt, suffix_name_map = self.judge_event(i, j, res, transform=self._relabel_species_tree)
+
         if not passed:
-            self.logger.report_step(step, "Failed.: parsimony cutoff not met")
             # Returns the input tree, i.e. index 0 in the mt dict.
             return res.mul_trees[0], None, None
 
-        if j == 0:
-            self.logger.report_step(step, f"Success: event accepted w/ score {res.mt_score()}")
-        else:
-            self.logger.report_step(step, f"Pending: nested event assessment deferred")
-
         # Rename Trees for Next Iteration
-        next_gts = self._partition_gt_leaves(res, nonin_idx, suffix_name_map)
+        next_gts = self._relabel_gene_trees(res, nonin_idx, suffix_name_map)
 
         if j == 0 and self.ctx.nesting in {"rectify", "strict_rectify"}:
             # Check for Nested Hybridization
@@ -473,41 +459,18 @@ class FlowManager:
     
     # --- Handlers for the Split mode ---
     
-    def extract_subproblems(self, res: TaskResult, depth: int, idx: int) -> Tuple[List[ConcurrTask], Dict[int, List[int]]]:
-        """
-        Refined binary recursion split using ETE3-safe surgery and O(N) GT extraction.
-        1. Inner: Extracts independent 'pure' subtrees for each hybrid lineage.
-        2. Outer: Backbone with H1 clade collapsed to a placeholder leaf.
-        """
-        step = "Extracting inferred event subproblems"
+    def _partition_gene_trees(self, res: TaskResult, best_mt_idx: int) -> Tuple[Dict[int, SmrtTree], Dict[int, SmrtTree], Dict[int, List[int]]]:
+        """Splits GTs into backbone (Outer) and hybrid clades (Inner)."""
+        step = "Partitioning gene trees"
         self.logger.report_step(step, "In progress...")
 
-        best_mt_idx = res.mt_idx()
-        best_mt = res.mul_trees[best_mt_idx]
-
-        h1_node = best_mt.h1_node
-        hx_nodes = best_mt.hx_nodes
-        mt_wrapper = best_mt.mt
-        hx_str = [f'{n.name} (H{x+2})' for x, n in enumerate(hx_nodes)]
-        self._debug_tree(f"Splitting Context: {h1_node.name} (H1) | {' | '.join(hx_str)}", mt_wrapper.ete_tree)
-
-        # Pre-compute a mapping from MT nodes to copy indices for O(1) lookup during GT leaf partitioning
-        mt_node_to_copy_idx = {}
-        for l in h1_node.get_leaves():
-            mt_node_to_copy_idx[l.name] = 0
-        for x, hx_node in enumerate(hx_nodes):
-            for l in hx_node.get_leaves():
-                mt_node_to_copy_idx[l.name] = x + 1
-
-        min_maps = res.kept_mul_maps[best_mt_idx]
         gts = res.gene_trees
+        min_maps = res.kept_mul_maps[best_mt_idx]
+        h_copy_map = res.mul_trees[best_mt_idx].build_h_copy_map() # mt_node -> copy_idx (0 for H1, 1 for H2, etc.)
 
-        outer_gts = {}
-        inner_gts = {}
-        outie_below_min_counter = 0
-        innie_below_min_counter = 0
-        innie_counter = 0
+        outer_gts, inner_gts = {}, {}
         gt_split_dict = defaultdict(list)
+        outie_below, innie_below, innie_counter = 0, 0, 0 # Below min leaf count
 
         debug_sample = self.sample(list(gts.keys()))
 
@@ -520,194 +483,152 @@ class FlowManager:
                 self._debug_tree(f"Pre-split GT {g_idx}:", source_gt)
                 self.logger.log(f"Map for GT {g_idx}: {maps.cor}", 'd')
 
-            # --- Partition leaves by homoeologous copy ---
-            rev_map = maps.rev
+            # --- Map inner/outer leaves by homoeologous copy ---
             outer_gt_lvs = set()
-            gt_leaf_to_copy_idx = {} # Inner leaves
+            gt_leaf_to_copy_idx = {} # Inner leaves: gt_leaf -> copy_idx (0 for H1, 1 for H2, etc.)
 
-            for mt_node, gt_nodes in rev_map.items():
-                if mt_node in mt_node_to_copy_idx:
-                    copy_idx = mt_node_to_copy_idx[mt_node]
+            for mt_node, gt_nodes in maps.rev.items():
+                if mt_node in h_copy_map:
+                    copy_idx = h_copy_map[mt_node]
                     # Flatten the mapping so every GT leaf knows its exact state
                     for gt_n in gt_nodes:
                         gt_leaf_to_copy_idx[gt_n] = copy_idx
                 else:
                     outer_gt_lvs.update(gt_nodes)
                     
-            source_gt_lvs = {l.name for l in source_gt.get_leaves()}
-            # We do not need to intersect gt_leaf_to_copy_idx with source_lvs 
+            source_gt_lvs = set(source_gt.iter_leaf_names())
+            # We do not need to intersect gt_leaf_to_copy_idx with source_lvs
             # because during Pass 1, we only query using `node.is_leaf()`.
             outer_gt_lvs = outer_gt_lvs.intersection(source_gt_lvs)
 
-            # --- Outer Sub-problem (Backbone) ---
+            # --- Outer Sub-problem ---
             gt_ete = source_gt.copy()
-
             if len(outer_gt_lvs) < self.ctx.min_gt_lvs:
-                outie_below_min_counter += 1
+                outie_below += 1
             if outer_gt_lvs: # Not empty
                 gt_ete.prune(list(outer_gt_lvs), preserve_branch_length=True)
                 # Special case to handle single leaf outer GTs which have a bad root: "(Spec);" instead of just "Spec;"
                 if len(outer_gt_lvs) == 1:
-                    gt_ete = gt_ete.get_leaves()[0].detach()
+                    gt_ete = next(gt_ete.iter_leaves()).detach()
                 outer_gts[g_idx] = SmrtTree(tree_obj=gt_ete)
-
+            
             if g_idx in debug_sample:
                 self._debug_tree(f"Pruned Outer GT {g_idx}:", gt_ete)
 
-            # --- Inner Sub-problem (Hybrid Clade) ---
+            # --- Inner Sub-problem (Bottom-up purity caching) ---
             gt_ete = source_gt.copy()
-
-            # Pass 1: Bottom-up multi-state purity caching (Postorder)
             node_copy_state = {}
             for node in gt_ete.traverse("postorder"):
                 if node.is_leaf():
                     node_copy_state[node] = gt_leaf_to_copy_idx.get(node.name)
                 else:
-                    child_states = [node_copy_state[child] for child in node.children]
+                    child_states = [node_copy_state[c] for c in node.children]
                     # Internal node is pure ONLY if ALL children map to the EXACT SAME copy
                     if child_states and all(s is not None for s in child_states) and len(set(child_states)) == 1:
                         node_copy_state[node] = child_states[0]
                     else:
                         node_copy_state[node] = None
 
-            # Pass 2: Top-down extraction (Optimized)
-            final_pure_lineages = []
-            # Manual stack allows 'skipping' subtrees
+            # Top-down extraction: manual stack allows 'skipping' subtrees
             stack = [gt_ete]
             while stack:
                 node = stack.pop()
-
-                copy_idx = node_copy_state.get(node)
-                
                 # If copy_idx is an integer (0, 1, 2...), this node is pure for that specific copy
-                if copy_idx is not None:
+                if node_copy_state.get(node) is not None:
                     if len(node) < self.ctx.min_gt_lvs:
-                        innie_below_min_counter += 1
-                    # SUCCESS: We found the largest pure clade for this homoeolog. 
+                        innie_below += 1
+                    # SUCCESS: We found the largest pure clade for this homoeolog
                     # Nodes are guaranteed to have at least one leaf, and no overlaps
-                    final_pure_lineages.append(node)
-                    # Do NOT add children to the stack; this skips the entire subtree.
+                    # Do NOT add children to the stack; this skips the entire subtree
+                    # No need to copy() - pure nodes' children aren't added to stack, so no unsafe nested detach()s
+                    extracted_gt = node.detach()
+                    inner_gts[innie_counter] = SmrtTree(tree_obj=extracted_gt)
+
+                    if g_idx in debug_sample:
+                        self._debug_tree(f"Extracted Inner as Lineage {innie_counter}:", extracted_gt)
+
+                    gt_split_dict[g_idx].append(innie_counter)
+                    innie_counter += 1
                 else:
-                    # Node is mixed (eg, contains H1 and H2, or outer leaves), so we must check its children
+                    # Node is mixed (e.g., contains H1 and H2, or outer leaves), so we must check its children
                     stack.extend(node.children)
 
-            for ph_node in final_pure_lineages:
-                # No need to copy() - pure nodes' children aren't added to stack, so no unsafe nested detach()s
-                extracted_gt = ph_node.detach()#.copy()
-                inner_gts[innie_counter] = SmrtTree(tree_obj=extracted_gt)
-                
-                if g_idx in debug_sample:
-                    self._debug_tree(f"Extracted Inner as Lineage {innie_counter}:", extracted_gt)
-
-                gt_split_dict[g_idx].append(innie_counter)
-                innie_counter += 1
-
+        # Apply global cutoff
         # If all GTs of a given subproblem are below the minimum leaf cutoff, we discard them.
         # Previously, we discarded individual GTs based on this, but it biases the reconciliation score because changes to signal balance.
-        if innie_below_min_counter >= len(inner_gts):
-            inner_gts = {}
-        if outie_below_min_counter >= len(outer_gts):
-            outer_gts = {}
+        if innie_below >= len(inner_gts): inner_gts = {}
+        if outie_below >= len(outer_gts): outer_gts = {}
 
-        # --- Species Tree Surgery ---
+        self.logger.report_step(step, f"Success: got {len(inner_gts)} inner and {len(outer_gts)} outer gts")
+        return inner_gts, outer_gts, gt_split_dict
 
-        # Simply copy the subtree rooted at H1 for the Inner ST
-        # detach() clears the root (t.up == None)
-        inner_st_obj = h1_node.copy().detach()
-
-        # For the Outer ST, we need to remove both H1 and H2
-        outer_st_obj = mt_wrapper.ete_tree.copy()
-        # Re-locate nodes in the COPY
-        h1_in_outer = outer_st_obj.search_nodes(name=h1_node.name)[0]
-        hx_in_outer = [outer_st_obj.search_nodes(name=hx_node.name)[0] for hx_node in hx_nodes]
-        self.logger.log(f"Removing hybrid clade ({h1_in_outer.name} and {', '.join(n.name for n in hx_in_outer)}) from Outer ST.", 'd')
-        outer_st_obj, tree_not_empty = self._trim_tree_lineages(outer_st_obj, [h1_in_outer] + hx_in_outer)
+    def _partition_species_tree(self, best_mt: MulTree) -> Tuple[SmrtTree, Optional[SmrtTree]]:
+        """Safely creates the Inner and Outer Species Trees."""
+        step = "Partitioning species tree"
+        self.logger.report_step(step, "In progress...")
+            
+        # Inner ST: Safe extraction using the wrapper's copy_lineage
+        # Simply copy the subtree rooted at H1 as the Inner ST
+        inner_st_obj = SmrtTree.copy_lineage(best_mt.h1_node)
+        inner_wrapper = SmrtTree(tree_obj=inner_st_obj)
 
         self._debug_tree("Inner Species Tree (Hybrid Clade):", inner_st_obj)
-        self._debug_tree(f"Outer Species Tree (Backbone){' is empty' if not tree_not_empty else ''}:", outer_st_obj)
-        self.logger.log(f'len(inner_gts)={len(inner_gts)}, len(outer_gts)={len(outer_gts)}', 'd')
 
-        # --- Queue Tasks with Binary IDs ---
-        next_tasks = []
-        if len(outer_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(outer_gts) > 0 and tree_not_empty:
-            next_tasks.append((SmrtTree(tree_obj=outer_st_obj), outer_gts, f"{depth + 1}.{idx * 2}"))
-        if len(inner_st_obj.get_leaves()) >= self.ctx.min_st_lvs and len(inner_gts) > 0:
-            next_tasks.append((SmrtTree(tree_obj=inner_st_obj), inner_gts, f"{depth + 1}.{idx * 2 + 1}"))
+        # Outer ST: Safe trim the wrapper directly
+        outer_wrapper = best_mt.mt
+        names_to_trim = [best_mt.h1_node.name] + [n.name for n in best_mt.hx_nodes]
+        
+        did_it_trim, _ = outer_wrapper.trim_lineages(names_to_trim)
+        if not did_it_trim:
+            self.logger.log(f"Trimming hybrid clades {names_to_trim} from Species Tree results in an empty tree.", 'd')
+            outer_wrapper = None # No trimming done means no tree would be left, so we indicate as such
+        else:
+            self._debug_tree(f"Outer Species Tree (Backbone) after hybrid clades {names_to_trim} trimming:", outer_wrapper.ete_tree)
 
-        self.logger.report_step(step, f"Success: extracted {len(next_tasks)} valid subproblems")
-        return next_tasks, gt_split_dict
+        self.logger.report_step(step, f"Success: got st sizes {len(inner_wrapper)} in. / {len(outer_wrapper) if outer_wrapper else 0} out.")
+        return inner_wrapper, outer_wrapper
 
-    @staticmethod
-    def _trim_tree_lineages(tree_to_trim: Tree, nodes_to_trim: List[TreeNode]) -> Tuple[Tree, List[Optional[str]]]:
-        """
-        Safely removes clades from the tree, generally used for the Outer Species Tree.
-        Returns: (trimmed_tree, trimmed_names)
-        trimmed_names: List of names of the parents of the removed H nodes. Empty indicates an empty tree.
-        trimmed_tree is modified in place! Must be returned for the special root case!
-        """
-        # Safely remove H nodes from Outer ST: detach leaf, then delete the resulting knuckle node
-        trimmed_names = []
-        for n in nodes_to_trim:
-            n_up = n.up # Save parent before detaching
-            if n_up is None:
-                return Tree(), [] # Special case: if H node is root, we return an empty tree to indicate no valid outer tree
-            trimmed_names.append(n_up.name)
-            trackers = getattr(n_up, 'H', []) # Preserve any existing trackers
-            n.detach()
-            if n_up.up is None:
-                children = n_up.get_children()
-                if len(children) != 1:
-                    raise ValueError("Unexpected structure when removing hybrid clade from Outer ST.")
-                # Special case: if parent is root, just promote the child
-                child = n_up.get_children()[0]
-                tree_to_trim = child.detach()#.copy()
-                # Re-assign any trackers to the new root
-                if trackers:
-                    if not hasattr(tree_to_trim, 'H'):
-                        tree_to_trim.add_feature('H', [])
-                    tree_to_trim.H.extend(trackers)
-            # delete() removes the internal node and connects children to parent
-            else:
-                n_up_up = n_up.up
-                n_up.delete()
-                # Re-assign any trackers to the grandparent
-                if trackers:
-                    if not hasattr(n_up_up, 'H'):
-                        n_up_up.add_feature('H', [])
-                    n_up_up.H.extend(trackers)
-        return tree_to_trim, trimmed_names
-
-    def handle_split_result(
+    def extract_subproblems(
             self, bin_id: str, res: TaskResult,
             iter_out: Path,
             iter_logger: GranLogger
         ) -> Optional[List[ConcurrTask]]:
         """
-        Processes a split worker result.
-        Returns: List of new sub-tasks or empty list.
+        Processes a split worker result using ETE3-safe surgery and O(N) GT extraction.
+        1. Inner: Extracts independent 'pure' subtrees for each hybrid lineage.
+        2. Outer: Backbone with H1 clade collapsed to a placeholder leaf.
+        Returns: List of new sub-tasks or None.
         """
         backup_logger = self.logger
         self.logger = iter_logger
 
-        # 1. Determine Depth and Index from Binary ID
+        # Determine Depth and Index from Binary ID
         depth, idx = (int(x) for x in bin_id.split('.')) if '.' in bin_id else (0, 0)
 
-        step = "Assessing event parsimony"
+        passed, nonin_idx, next_mt, _ = self.judge_event(depth, idx, res)
+
+        if not passed:
+            return None # Event not taken!
+
+        # --- Extract Subproblems ---
+
+        # Partition the Gene Trees into Inner and Outer sets
+        inner_gts, outer_gts, gt_split_dict = self._partition_gene_trees(res, nonin_idx)
+
+        # Perform topological surgery on the Species Tree
+        inner_wrapper, outer_wrapper = self._partition_species_tree(next_mt)
+
+        step = "Extracting inferred event subproblems"
         self.logger.report_step(step, "In progress...")
 
-        # Update history & check if passed cutoff
-        passed = self.update_history(depth, idx, res)
-        if not passed:
-            self.logger.report_step(step, "Failed.: parsimony cutoff not met")
-            return None # Event not taken!
-        
-        self.logger.report_step(step, f"Success: event accepted w/ score {res.mt_score()}")
+        # Queue Tasks with binary IDs: Outer first
+        next_tasks = []
+        if outer_wrapper and len(outer_wrapper) >= self.ctx.min_st_lvs and len(outer_gts) > 0:
+            next_tasks.append((outer_wrapper, outer_gts, f"{depth + 1}.{idx * 2}"))
+        if len(inner_wrapper) >= self.ctx.min_st_lvs and len(inner_gts) > 0:
+            next_tasks.append((inner_wrapper, inner_gts, f"{depth + 1}.{idx * 2 + 1}"))
 
-        # 3. Extract Subproblems
-        #try:
-        next_tasks, gt_split_dict = self.extract_subproblems(res, depth, idx)
-        #except Exception as e:
-        #    self.logger.log(f"extracting subproblems at Depth {depth}, Index {idx}: {e}", 'e')
+        self.logger.report_step(step, f"Success: extracted {len(next_tasks)} valid subproblems")
 
         step = "Writing handoff files"
         self.logger.report_step(step, "In progress...")
@@ -876,11 +797,12 @@ class FlowManager:
                     node = current_mt.mt.get_node(loc)
                     sister = current_mt.mt.get_sis(node)
                     nodes_to_detach.append(sister)
-                outer_tree = current_mt.mt.ete_tree # Modified in place, but no need to copy - not used later
-                outer_tree, trimmed_names = self._trim_tree_lineages(outer_tree, nodes_to_detach)
+                outer_tree_wrapper = current_mt.mt # Modified in place, but no need to copy - not used later
+                _, trimmed_names = outer_tree_wrapper.trim_lineages(nodes_to_detach)
+                outer_tree = outer_tree_wrapper.ete_tree
                 self.logger.log(f"Glue {task_id}: No Outer results for task. Retrieved from Current tree by removing {trimmed_names} nodes & {[n.name for n in nodes_to_detach]} H locs.", 'd')
-
-            outer_tree_wrapper = SmrtTree(tree_obj=outer_tree) # Re-index and re-wrap after trimming, to ensure .match() works correctly with the modified topology
+            else:
+                outer_tree_wrapper = SmrtTree(tree_obj=outer_tree) # Re-index and re-wrap after trimming, to ensure .match() works correctly with the modified topology
             self._debug_tree(f"Outer Result Tree for Task {task_id}:", outer_tree, other_attr=['H', 'pure'])
 
             # --- Location Expansion and Grafting Logic ---
@@ -1018,7 +940,7 @@ class FlowManager:
         def get_taxa_count(tree_str):
             try:
                 t_str = CommonOps._fix_semicolon(tree_str)
-                return len(Tree(t_str, format=1).get_leaves())
+                return len(Tree(t_str, format=1))
             except:
                 return 0
 

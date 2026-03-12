@@ -188,7 +188,7 @@ class TreeLoader:
         
         # Process Trees
         valid_gts = []
-        #st_taxa = {n.name for n in tcf.st.ete_tree.get_leaves()}
+        #st_taxa = set(tcf.st.ete_tree.iter_leaf_names())
         for i, line in enumerate(tree_list):
 
             origin = origins[i] if origins else "on line " + str(i+1)
@@ -218,7 +218,7 @@ class TreeLoader:
             #TreeLoader._repair_tips(gt)
 
             # Taxa Repair/Check } if tcf.repair
-            '''gt_taxa = {n.name for n in gt.ete_tree.get_leaves()}
+            '''gt_taxa = set(gt.ete_tree.iter_leaf_names())
             if not gt_taxa.issubset(st_taxa):
                 # Optionally, prune here if fixing is enabled? 
                 # For now, strict filtering based on prompts.
@@ -259,7 +259,7 @@ class TreeLoader:
         # 2. Rooting via (Num Internal = Num Tips - 1)
         # Note: ETE3 handles rooting differently, but strict bifurcating tree property holds:
         # Leaves = N, Internal = N-1.
-        leaves = len(t.get_leaves())
+        leaves = len(t)
         internal = sum(not n.is_leaf() for n in t.traverse())
         if internal != (leaves - 1):
             # This usually happens if the root has only 2 children? 
@@ -346,7 +346,7 @@ class TreeLoader:
         def singlify_tree(t: Tree) -> None:
             '''Remove duplicate labels.'''
             leaves_to_keep = set()
-            for l in t.get_leaves():
+            for l in t.iter_leaves():
                 if not l.name or l.name in leaves_to_keep:
                     l.name = None
                 else:
@@ -356,7 +356,7 @@ class TreeLoader:
         def singlify_enewick(t_line: str) -> Tree:
             t = Tree(t_line, format=1) # ENewick parsing to handle reticulation labels
             # Identify valid backbone leaves (excluding any node with #H in the name)
-            backbone_leaves = [n for n in t.get_leaves() if not (n.name and "#H" in n.name)]
+            backbone_leaves = [n for n in t.iter_leaves() if not (n.name and "#H" in n.name)]
             # Prune strips the hybrid leaves and automatically collapses 
             # any resulting unbranched internal nodes, preserving branch lengths.
             t.prune(backbone_leaves, preserve_branch_length=True)
@@ -421,8 +421,9 @@ class TreeLoader:
                 raise NotImplementedError("Reticulations with degree != 2 not supported.")
 
             n1, n2 = parents
+            succ_leaves = set(succ.iter_leaf_names())
 
-            logger.log(f"Reticulation structure: Succ: {succ.get_leaf_names()} N1: {n1.get_leaf_names()} N2: {n2.get_leaf_names()}", 'd')
+            logger.log(f"Reticulation structure: Succ: {succ_leaves} N1: {n1.get_leaf_names()} N2: {n2.get_leaf_names()}", 'd')
             logger.log(f"Succ Tree:\n{succ.get_ascii(show_internal=True)}", 'd')
             logger.log(f"Succ up Tree:\n{succ.up.get_ascii(show_internal=True)}", 'd')
             logger.log(f"N1 Tree:\n{n1.get_ascii(show_internal=True)}", 'd')
@@ -430,21 +431,16 @@ class TreeLoader:
 
             n1_children = n1.get_children()
             n2_children = n2.get_children()
-            
-            succ_leaves = set(succ.get_leaf_names())
-            if set(n2_children[0].get_leaf_names()) == succ_leaves:
-                n2_sister = n2_children[1]
-            else:
-                n2_sister = n2_children[0]
 
-            if set(n1_children[0].get_leaf_names()) == succ_leaves:
-                n1_sister = n1_children[1]
-            else:
-                n1_sister = n1_children[0]
+            n2c0_leaves = n2_children[0].get_leaf_names()
+            n2_sister_children = n2c0_leaves if set(n2c0_leaves) != succ_leaves else n2_children[1].get_leaf_names()
 
-            h_str = ",".join(succ.get_leaf_names())
-            p1_str = ",".join(n1_sister.get_leaf_names())
-            p2_str = ",".join(n2_sister.get_leaf_names())
+            n1c0_leaves = n1_children[0].get_leaf_names()
+            n1_sister_children = n1c0_leaves if set(n1c0_leaves) != succ_leaves else n1_children[1].get_leaf_names()
+
+            h_str = ",".join(succ_leaves)
+            p1_str = ",".join(n1_sister_children)
+            p2_str = ",".join(n2_sister_children)
             
             logger.log(f"Hybrid clade (h): {h_str}", 'd')
             logger.log(f"Hybrid clade parent 1 (p1): {p1_str}", 'd')
@@ -471,7 +467,7 @@ class TreeLoader:
             for h_str, p1_str, p2_str in pairs:
                 p1 = t.get_common_ancestor(p1_str.split(',')) if ',' in p1_str else t.search_nodes(name=p1_str)[0]
                 p1_sis = p1.get_sisters()[0]
-                if set(p1_sis.get_leaf_names()) == set(h_str.split(',')):
+                if set(p1_sis.iter_leaf_names()) == set(h_str.split(',')):
                     fixed_pairs.append((h_str, p2_str))
                 else:
                     fixed_pairs.append((h_str, p1_str))
@@ -629,7 +625,7 @@ class MulTreeManager:
             ploidy_stats = {}
             for sp in self.ploidies.keys():
                 # Find a representative leaf to get the targets
-                rep_leaf = next((l for l in self.st.ete_tree.get_leaves() if l.pure == sp), None)
+                rep_leaf = next((l for l in self.st.ete_tree.iter_leaves() if l.pure == sp), None)
                 if rep_leaf:
                     ploidy_stats[sp] = (len(self.st.get_targets(rep_leaf)), 1)
                 else:
@@ -649,7 +645,7 @@ class MulTreeManager:
         for node_name in h1_candidates:
             node = self.st.get_node(node_name)
             
-            clade_species = {l.replace("*", "").split('|')[0] for l in node.get_leaf_names()}
+            clade_species = {l.replace("*", "").split('|')[0] for l in node.iter_leaf_names()}
             min_allowance = float('inf')
             
             for sp in clade_species:
@@ -678,7 +674,7 @@ class MulTreeManager:
         if not raw_input:
             # Return Tips first (get_leaves), then Internal nodes (Post-order)
             # This matches the legacy GRAMPA behavior where `nodes` dict was built tips-first.
-            tips = [n.name for n in self.st.ete_tree.get_leaves()]
+            tips = self.st.ete_tree.get_leaf_names()
             internal = [n.name for n in self.st.ete_tree.traverse("postorder") if not n.is_leaf()]
             return tips + internal
 
@@ -708,9 +704,7 @@ class MulTreeManager:
                 nodes_obj = [self.st.get_node(name) for name in cleaned_clade]
                 lca_node = self.st.ete_tree.get_common_ancestor(nodes_obj)
                 
-                # OPTIMIZATION: Use get_leaf_names() instead of iter_leaves()
-                # ETE3 get_leaf_names is significantly faster as it avoids creating Node objects
-                lca_leaves = set(lca_node.get_leaf_names())
+                lca_leaves = set(lca_node.iter_leaf_names())
                 input_set = set(cleaned_clade)
                 
                 # Check subset relationship
@@ -809,7 +803,7 @@ class MulTreeManager:
                 
                 h1, h2 = h1_res[0], h2_res[0]
                 h1_st_node = self.st.get_node(h1)
-                h_clade = h1_st_node.get_leaf_names() # Optimized leaf extraction
+                h_clade = h1_st_node.get_leaf_names()
                 
                 mt_wrapper, h1_obj, h2_obj = self.st.to_mul_tree(h1, h2)
                 if mt_wrapper:
@@ -918,7 +912,7 @@ class MulTreeManager:
     def report_mt_count(self, st_ete: Tree, h1_resolved: List[str], h2_resolved: List[str], num_mul_trees: int,
                         nesting: str, has_ploidies: bool, allow_redundant_mts: bool) -> None:
         """Prints a report of the MUL-tree count, replicating legacy mul_tree.py output."""
-        n_tips = len(st_ete.get_leaves())
+        n_tips = len(st_ete)
         n_nodes = n_tips*2 - 1 # Assumes full bifurcation (a valid species tree)
         # Max possible calculation
         name_to_node = {n.name: n for n in st_ete.traverse()}
