@@ -107,9 +107,9 @@ class DatasetGenerator:
                     # Build a clean directory name from the arguments (e.g. "-m full --nesting r" -> "out_m_full_nesting_r")
                     if exec_args:
                         clean_parts = [p.strip("-") for p in exec_args]
-                        mode_str = f"out2_{'_'.join(clean_parts)}"
+                        mode_str = f"out3_{'_'.join(clean_parts)}"
                     else:
-                        mode_str = "out2_default"
+                        mode_str = "out3_default"
                     
                     # Inject paths and execution args
                     cmd.extend(['-s', str(ds_dir / "species_tree.tre")])

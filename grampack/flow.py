@@ -484,7 +484,6 @@ class FlowManager:
                 self.logger.log(f"Map for GT {g_idx}: {maps.cor}", 'd')
 
             # --- Map inner/outer leaves by homoeologous copy ---
-            outer_gt_lvs = set()
             gt_leaf_to_copy_idx = {} # Inner leaves: gt_leaf -> copy_idx (0 for H1, 1 for H2, etc.)
 
             for mt_node, gt_nodes in maps.rev.items():
@@ -493,32 +492,10 @@ class FlowManager:
                     # Flatten the mapping so every GT leaf knows its exact state
                     for gt_n in gt_nodes:
                         gt_leaf_to_copy_idx[gt_n] = copy_idx
-                else:
-                    outer_gt_lvs.update(gt_nodes)
-                    
-            source_gt_lvs = set(source_gt.iter_leaf_names())
-            # We do not need to intersect gt_leaf_to_copy_idx with source_lvs
-            # because during Pass 1, we only query using `node.is_leaf()`.
-            outer_gt_lvs = outer_gt_lvs.intersection(source_gt_lvs)
-
-            # --- Outer Sub-problem ---
-            gt_ete = source_gt.copy()
-            if len(outer_gt_lvs) < self.ctx.min_gt_lvs:
-                outie_below += 1
-            if outer_gt_lvs: # Not empty
-                gt_ete.prune(list(outer_gt_lvs), preserve_branch_length=True)
-                # Special case to handle single leaf outer GTs which have a bad root: "(Spec);" instead of just "Spec;"
-                if len(outer_gt_lvs) == 1:
-                    gt_ete = next(gt_ete.iter_leaves()).detach()
-                outer_gts[g_idx] = SmrtTree(tree_obj=gt_ete)
             
-            if g_idx in debug_sample:
-                self._debug_tree(f"Pruned Outer GT {g_idx}:", gt_ete)
-
-            # --- Inner Sub-problem (Bottom-up purity caching) ---
-            gt_ete = source_gt.copy()
+            # --- Bottom-up purity caching ---
             node_copy_state = {}
-            for node in gt_ete.traverse("postorder"):
+            for node in source_gt.traverse("postorder"):
                 if node.is_leaf():
                     node_copy_state[node] = gt_leaf_to_copy_idx.get(node.name)
                 else:
@@ -530,7 +507,8 @@ class FlowManager:
                         node_copy_state[node] = None
 
             # Top-down extraction: manual stack allows 'skipping' subtrees
-            stack = [gt_ete]
+            stack = [source_gt]
+            h_lineages = []
             while stack:
                 node = stack.pop()
                 # If copy_idx is an integer (0, 1, 2...), this node is pure for that specific copy
@@ -541,17 +519,32 @@ class FlowManager:
                     # Nodes are guaranteed to have at least one leaf, and no overlaps
                     # Do NOT add children to the stack; this skips the entire subtree
                     # No need to copy() - pure nodes' children aren't added to stack, so no unsafe nested detach()s
-                    extracted_gt = node.detach()
-                    inner_gts[innie_counter] = SmrtTree(tree_obj=extracted_gt)
-
-                    if g_idx in debug_sample:
-                        self._debug_tree(f"Extracted Inner as Lineage {innie_counter}:", extracted_gt)
-
-                    gt_split_dict[g_idx].append(innie_counter)
-                    innie_counter += 1
+                    h_lineages.append(node.name)
                 else:
                     # Node is mixed (e.g., contains H1 and H2, or outer leaves), so we must check its children
                     stack.extend(node.children)
+
+            is_outer, _, extracts = gt_wrapper.trim_lineages(h_lineages, retain=True)
+
+            if is_outer:
+                if len(gt_wrapper) < self.ctx.min_gt_lvs:
+                    outie_below += 1
+                outer_gts[g_idx] = gt_wrapper
+                if g_idx in debug_sample:
+                    self._debug_tree(f"Pruned Outer GT {g_idx}:", gt_wrapper.ete_tree)
+            else:
+                outie_below += 1 # No leaves retained in outer GT since it's empty
+                if g_idx in debug_sample:
+                    self.logger.log(f"Outer GT {g_idx} is empty after trimming ", 'd')
+
+            for extracted_gt in extracts:
+                inner_gts[innie_counter] = extracted_gt
+
+                if g_idx in debug_sample:
+                    self._debug_tree(f"Extracted Inner as Lineage {innie_counter}:", extracted_gt.ete_tree)
+
+                gt_split_dict[g_idx].append(innie_counter)
+                innie_counter += 1
 
         # Apply global cutoff
         # If all GTs of a given subproblem are below the minimum leaf cutoff, we discard them.
@@ -559,7 +552,7 @@ class FlowManager:
         if innie_below >= len(inner_gts): inner_gts = {}
         if outie_below >= len(outer_gts): outer_gts = {}
 
-        self.logger.report_step(step, f"Success: got {len(inner_gts)} inner and {len(outer_gts)} outer gts")
+        self.logger.report_step(step, f"Success: got {len(inner_gts)} in. & {len(outer_gts)} out. gts")
         return inner_gts, outer_gts, gt_split_dict
 
     def _partition_species_tree(self, best_mt: MulTree) -> Tuple[SmrtTree, Optional[SmrtTree]]:
@@ -567,21 +560,13 @@ class FlowManager:
         step = "Partitioning species tree"
         self.logger.report_step(step, "In progress...")
             
-        # Inner ST: Safe extraction using the wrapper's copy_lineage
-        # Simply copy the subtree rooted at H1 as the Inner ST
-        inner_st_obj = SmrtTree.copy_lineage(best_mt.h1_node)
-        inner_wrapper = SmrtTree(tree_obj=inner_st_obj)
-
-        self._debug_tree("Inner Species Tree (Hybrid Clade):", inner_st_obj)
-
-        # Outer ST: Safe trim the wrapper directly
-        outer_wrapper = best_mt.mt
         names_to_trim = [best_mt.h1_node.name] + [n.name for n in best_mt.hx_nodes]
-        
-        did_it_trim, _ = outer_wrapper.trim_lineages(names_to_trim)
-        if not did_it_trim:
-            self.logger.log(f"Trimming hybrid clades {names_to_trim} from Species Tree results in an empty tree.", 'd')
-            outer_wrapper = None # No trimming done means no tree would be left, so we indicate as such
+        outer_wrapper, inner_wrapper, _ = best_mt.partition('h1')
+
+        self._debug_tree("Inner Species Tree (Hybrid Clade):", inner_wrapper.ete_tree)
+
+        if outer_wrapper is None:
+            self.logger.log(f"Trimming hybrid clades {names_to_trim} from Species Tree resulted in no outer tree.", 'd')
         else:
             self._debug_tree(f"Outer Species Tree (Backbone) after hybrid clades {names_to_trim} trimming:", outer_wrapper.ete_tree)
 
@@ -798,7 +783,7 @@ class FlowManager:
                     sister = current_mt.mt.get_sis(node)
                     nodes_to_detach.append(sister)
                 outer_tree_wrapper = current_mt.mt # Modified in place, but no need to copy - not used later
-                _, trimmed_names = outer_tree_wrapper.trim_lineages(nodes_to_detach)
+                _, trimmed_names, _ = outer_tree_wrapper.trim_lineages(nodes_to_detach)
                 outer_tree = outer_tree_wrapper.ete_tree
                 self.logger.log(f"Glue {task_id}: No Outer results for task. Retrieved from Current tree by removing {trimmed_names} nodes & {[n.name for n in nodes_to_detach]} H locs.", 'd')
             else:

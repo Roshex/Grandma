@@ -510,13 +510,27 @@ class SmrtTree:
                     n.name = n.name.replace(">", f"{tag}>")
         return subtree
 
-    def trim_lineages(self, node_names: List[str]) -> Tuple[bool, List[Optional[str]]]:
+    def trim_lineages(self, node_names: List[str], retain: bool = False) -> Tuple[bool, List[Optional[str]], List['SmrtTree']]:
         """
-        Safely removes clades by name using O(K) differential indexing, generally used for the Outer Species Tree.
-        Deletes the resulting knuckle nodes, and handles the special case of root removal by promoting the child.
-        Returns: (will_tree_survive, trimmed_names)
-        will_tree_survive: False if the tree is to be completely trimmed away (e.g. if root was removed), True otherwise.
-        trimmed_names: List of names of the parents of the removed H nodes. Empty indicates trimming at the root (resulting in an empty tree).
+        Safely removes specified clades from the tree sequentially while updating topology.
+
+        This method modifies the underlying ETE3 tree in place. It automatically deletes 
+        the resulting "knuckle" (single-child) parent nodes to preserve a bifurcating structure, 
+        and safely handles root removal by promoting the remaining child.
+        
+        Notes:
+            - The target nodes are assumed to exist and must be topologically disjoint (non-overlapping).
+            - If the root node itself is detached, the ETE3 `detach()` simply passes the root through. 
+              The `is_outer` flag is used to track this edge case, indicating whether the current 
+              instance still represents the main "outer" tree.
+
+        Return:
+            - is_outer (bool): True if this instance remains the main outer tree. False if this instance
+                was entirely detached (i.e., the root itself was trimmed), and is now in detached_subtrees.
+            - trimmed_up_names (List[Optional[str]]): The names of each deleted parent node from which a 
+              lineage was severed. A `None` value indicates the root was trimmed.
+            - detached_subtrees (List['SmrtTree']): A list of the detached subtrees wrapped 
+              in new `SmrtTree` instances. Empty if `retain` is False.
         """
 
         """def add_trackers(n: TreeNode, trackers: List[str]):
@@ -524,31 +538,35 @@ class SmrtTree:
                 if not hasattr(n, 'H'): n.add_feature('H', [])
                 n.H.extend(trackers)"""
 
-        trimmed_names = []
         # Track nodes permanently removed from the tree
-        dead_keys = defaultdict(set) # pure_name -> set of node names removed with that pure name
-        nodes_to_trim = []
+        dead_keys: defaultdict[str, set] = defaultdict(set) # pure_name -> set of node names removed with that pure name
+        trimmed_up_names: List[Optional[str]] = []
+        detached_subtrees: List[TreeNode] = [] # Store detached subtrees for potential reattachment if needed (e.g. for root case)
+        is_outer: bool = True
         
-        # Assertion loop
         for name in node_names:
             n = self.get_node(name)
             assert n is not None, f"Node with name '{name}' not found."
-            nodes_to_trim.append(n)
-            if n.up is None: return False, []
-
-        # Modification loop (after all checks pass)
-        for n in nodes_to_trim:
             n_up = n.up
-            trimmed_names.append(n_up.name)
-            """trackers = getattr(n_up, 'H', [])""" 
-            
+            trimmed_up_names.append(n_up.name if n_up else None)
+            n = n.detach()
+            detached_subtrees.append(n)
+
+            if n_up is None:
+                is_outer = False
+                # break
+                continue
+
             # Track all descendants of the detached clade for dictionary removal
+            # We don't clear in the None case, because then it is self...
             for d in n.traverse():
                 dead_keys[d.pure].add(d.name)
+
             # Parent is either bypassed (if root) or deleted
             dead_keys[n_up.pure].add(n_up.name)
-            n.detach()
             
+            """trackers = getattr(n_up, 'H', [])""" 
+
             # Handle the child promotion if the parent is the root, otherwise just delete the parent
             if n_up.up is None:
                 children = n_up.get_children()
@@ -557,16 +575,27 @@ class SmrtTree:
                 self.ete_tree = child.detach() # Ensures root pointer is None
                 """add_trackers(self.ete_tree, trackers)"""
             else:
-                n_up_up = n_up.up
-                n_up.delete() # ETE3 automatically splices child to grandparent
-                """add_trackers(n_up_up, trackers)"""
-                    
-        # Clear catches appropriately after all modifications are done
+                """add_trackers(n_up.up, trackers)"""
+                # ETE3 automatically splices child to grandparent
+                # prevent_nondicotomic == True by default - recursively deletes orphans (except the deleted node)
+                # we may want to put False here to not risk it, but the rest of the tree should be dichotomic anyway!
+                n_up.delete()
+                        
+        # Clear caches appropriately after all modifications are done
         self._clear_dead(dead_keys)
 
         # Check cleaning vs trimming consistency
         self.assert_len()
-        return True, trimmed_names
+
+        if not retain:
+            if not is_outer: self.destroy() # Clean-up
+            return is_outer, trimmed_up_names, []
+            
+        detached_subtrees = [
+            SmrtTree(tree_obj=n) if up_name else self 
+            for n, up_name in zip(detached_subtrees, trimmed_up_names)
+        ]
+        return is_outer, trimmed_up_names, detached_subtrees
     
     def to_multi_mul_tree(self, h1_name: str, hx_names: List[str]) -> Optional[Tuple['SmrtTree', TreeNode, List[TreeNode]]]:
         """
@@ -812,10 +841,11 @@ class SmrtTree:
         self.ete_tree = None
 
         # Sever circular references (primary GC bottleneck)
-        for node in tree.traverse("postorder"):
-            node.up = None
-            node.children = []
-        del tree
+        if tree is not None:
+            for node in tree.traverse("postorder"):
+                node.up = None
+                node.children = []
+            del tree
 
         # Clear caches
         self.node_map.clear()
@@ -846,6 +876,9 @@ class MulTree:
     h1_node: Optional[TreeNode] = None 
     # Replaced single h2_node with hx_nodes list
     hx_nodes: List[TreeNode] = field(default_factory=list)
+
+    # Safety controls to not abuse stale wrappers
+    _stale_stars: bool = field(default=False, init=False)
 
     # For mode compatibility, h2_node can return the first element or None
     @property
@@ -963,8 +996,47 @@ class MulTree:
 
         # Must refresh after name modification
         self.mt.refresh()
+        self._stale()
         return suffix_name_map
   
+    def partition(self, get_inners: str = 'h1') -> Tuple[Optional[SmrtTree], Union[Optional[SmrtTree], List[SmrtTree]], List[Optional[str]]]:
+        """
+        Partitions the Mul Tree into outer and inner components.
+        get_inners: 'h1' to retain only the H1 lineage as inner, 'all' to retain all H lineages as inner, 'none' to not extract any inner lineages.
+
+        Return:
+            - outer_wrapper: SmrtTree representing the outer tree (None if the root was trimmed)
+            - retain: None, SmrtTree, or List[SmrtTree] representing the retained inner lineage(s) based on get_inners parameter
+            - parent_names: List of names of the parent nodes from which lineages were trimmed (None for root)
+        """
+        # Putting h1 last ensure it gets the original "real" up_name, not a <P[*]>, in cases of autopolyploidy
+        inner_lineages = [n.name for n in self.hx_nodes] + [self.h1_node.name]
+
+        is_outer, parent_names, inner_wrappers = self.mt.trim_lineages(
+            inner_lineages, retain=(get_inners != 'none')
+        )
+
+        inner_wrappers = inner_wrappers[-1:] + inner_wrappers[:-1]
+        parent_names = parent_names[-1:] + parent_names[:-1]
+
+        if not is_outer:
+            outer_wrapper = None
+        else:
+            outer_wrapper = self.mt
+
+        # Prevent destroying the outer wrapper
+        self.destroy(disconnect=True)
+
+        retained = None
+        if get_inners == 'h1':
+            retained = inner_wrappers[0]
+        elif get_inners == 'all':
+            retained = inner_wrappers
+        elif get_inners != 'none':
+            raise ValueError(f"Invalid get_inners value: {get_inners}. Expected 'h1', 'all', or 'none'.")
+
+        return outer_wrapper, retained, parent_names
+
     # --- Sister Clade Logic ---
     # The static methods below only run on MTs / STs, that's why they are in MulTree and not SmrtTree, to avoid confusion about applicability.
     # For speed and pickling reasons, they are static and operate on the SmrtTree wrapper and use node names for lookups, rather than TreeNode objects which may become stale after grafting.
@@ -1004,6 +1076,8 @@ class MulTree:
           1. h1_sisters: Set of names indicating H1 (Base) placement.
           2. hx_sisters_list: List[Set[str]] where index 0 -> H2, 1 -> H3.
         """
+        if self._stale_stars:
+            raise RuntimeError("Cannot compute sister clades after star-based renaming.")
         if self.h1_node is None: return set(), []
             
         h1_target = set(self.h_clade)
@@ -1034,6 +1108,21 @@ class MulTree:
 
         h1_sisters = {x.replace("*", "") for x in h1_sisters}
         return h1_sisters, hx_sisters_list
+    
+    def destroy(self, disconnect: bool = True):
+        """Marks the MulTree as consumed to prevent further use of it."""
+        if self.mt is not None and not disconnect:
+            self.mt.destroy()
+        object.__setattr__(self, 'mt', None)
+        object.__setattr__(self, 'h_clade', [])
+        # Drop ETE3 node pointers so they don't prevent Python from freeing the memory
+        object.__setattr__(self, 'h1_node', None)
+        object.__setattr__(self, 'hx_nodes', [])
+        self._stale()
+
+    def _stale(self):
+        """Marks the MulTree as having stale node references, which prevents any future star-based lookups."""
+        object.__setattr__(self, '_stale_stars', True)
 
 @dataclass(slots=True, frozen=True)
 class Map:
