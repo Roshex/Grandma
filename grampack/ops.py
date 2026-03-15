@@ -25,14 +25,14 @@ class CommonOps:
     @staticmethod
     def write_handoff_files(dir: Path, st: Tree=None, gts: Optional[List[Tree]]=None):
         """Writes the trees to disk to allow inspection/resume, matching iter_mode.py."""
-        ### Bug : we need to save with all names - internals and root too!
         if st:
             st_path = dir / 'multree.tre'
-            with open(st_path, 'w') as f: f.write(st.write(format=0))
+            with open(st_path, 'w') as f:
+                f.write(SmrtTree._to_str(st, internals=True) + '\n')
         if gts:
             gt_path = dir / 'genetrees.txt'
             with open(gt_path, 'w') as f:
-                for gt in gts: f.write(gt.write(format=0) + '\n')
+                for gt in gts: f.write(SmrtTree._to_str(gt, internals=True) + '\n')
 
     @staticmethod
     def _identify_path(p: Union[str, Path]) -> Tuple[str, List[Path]]:

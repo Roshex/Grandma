@@ -32,7 +32,7 @@ class GranMetadata:
     github: str = "https://github.com/Roshex/Grandma"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "3.0.7"
+    version: str = "3.0.8"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"

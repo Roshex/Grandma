@@ -31,9 +31,13 @@ class GranLogger:
         self.no_log = no_log          # Controls if ANY messages go to file
         self.parent_logger = parent_logger
         self.label = label
-        self.start_time = time.time()
         self.step_start_time = 0
+        self.start_time = time.time()
+        self.bench = False
         self.benchmarks = benchmarks # Optional List of (step_name, elapsed_time) tuples for benchmarking
+        # Adjust start time if resuming from a previous run with benchmarks
+        if benchmarks is not None:
+            self.start_time += sum(float(elapsed) for _, elapsed in benchmarks)
         self.pids = [psutil.Process(os.getpid())] if HAS_PSUTIL else []
         self.warnings = 0
         # States for Warning Buffering
@@ -177,8 +181,9 @@ class GranLogger:
         current_time = time.time()
 
         if start:
+            self.benchmarks = []
             if enable_benchmark:
-                self.benchmarks = []
+                self.bench = True
 
             headers = ["Date", "Time", "Current step", "Status", "Elapsed time (s)", "Step time (s)"]
             if HAS_PSUTIL:
@@ -436,7 +441,7 @@ class GranLogger:
             log_("-" * 125)
             log_(f"{self.get_date_time()} INFO: Starting GRANDMA. With -v 1 set, minimal screen output will be printed.")
 
-    def end_prog(self, min_score: int = 0, min_idx: int = 0, min_tree_str: str = "") -> None:
+    def end_report(self, min_score: int = 0, min_idx: int = 0, min_tree_str: str = "") -> None:
         """Replicates endProg from reconcore.py"""
         total_time = time.time() - self.start_time
         output_dir = self.log_file.parent
@@ -452,7 +457,7 @@ class GranLogger:
         log_(f"Total execution time:            {round(total_time, 3)} seconds.")
         log_(f"Output directory for this run:   {output_dir}")
         log_(f"Log file for this run:           {self.log_file}")
-        if self.benchmarks:
+        if self.bench:
             bench_file = output_dir / f"{fn_prefix}-benchmarks.txt"
             try:
                 with open(bench_file, 'w') as f:
@@ -462,8 +467,10 @@ class GranLogger:
                 log_(f"Benchmarks saved to:             {bench_file}")
             except Exception as e:
                 self.log(f"Failed to write benchmarks: {e}", 'w')
-            # Clear benchmarks after writing
-            self.benchmarks = None
+            # Reset bench state for potential next reports
+            self.bench = False
+        # Clear benchmarks after end report's writing
+        self.benchmarks = None
         if self.warnings > 0:
             log_(f"\n# Task finished with {self.warnings} WARNINGS -- check log file for more info")
 

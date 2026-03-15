@@ -16,7 +16,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import sys
 import random
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, List, Union
+from typing import Optional, Tuple, Dict, Any, List, Union, Set
 
 from .config import InitParser, GlobalContext, TaskConfig
 from .flow import FlowManager
@@ -144,7 +144,7 @@ class Task:
 
         # If the ST is None, terminal label-sp mode successfully finished or a warning was logged. Exit smoothly.
         if not self.spec_tree:
-            return None, {}, self.logger.end_prog()
+            return None, {}, self.logger.end_report()
         
         # Re-init component with current task
         self.mul_mgr = MulTreeManager(tcf, self.spec_tree, self.logger)
@@ -154,7 +154,7 @@ class Task:
 
         # If build() returns an empty dict, a terminal mode (count-mts or build-mts) successfully finished or a warning was logged. Exit smoothly.
         if not self.mul_trees:
-            return None, {}, self.logger.end_prog()
+            return None, {}, self.logger.end_report()
 
         # Load Gene Trees
         self.gene_trees = TreeLoader.gene_trees(tcf, self.logger)
@@ -171,7 +171,7 @@ class Task:
 
         # In check-nums mode, cull returns False after logging the counts and handling pickles.
         if not proceed:
-            return None, {}, self.logger.end_prog()
+            return None, {}, self.logger.end_report()
 
         # Reconciliation and MUL-tree Selection
         step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry)
@@ -197,9 +197,8 @@ class Task:
             OrthologyLabeler.run(self.gene_trees, min_maps, min_data.mt, 
                                 min_data.h_clade, tcf.output_dir, tcf.run_prefix)
 
-        # Final Cleanup & Report
+        # Final Cleanup and Prep for Next Iteration
         self.gene_mgr.handle_pickles()
-        #self.logger.end_prog(tcf, step_result.mt_score(), step_result.mt_idx(), min_data) #step_result.mul_trees[step_result.mt_idx()]
 
         # Important:
         # ST and GTs are not needed here, as they are prepared from StepResult in FlowManager; do NOT pass them here!
@@ -266,7 +265,7 @@ class Engine:
             if res:
                 min_score, min_idx, min_mult = self._unpack_min_res(res)
                 # Terminal report for single-run modes (single, st-only, no-st)
-                self.flow_logger.end_prog(min_score, min_idx, min_mult.to_marked_str())
+                self.flow_logger.end_report(min_score, min_idx, min_mult.to_marked_str())
                 final_smtree = min_mult.mt
                 if run_mode != "st-only":
                     self.flow_mgr.judge_event(0, 0, res)
@@ -315,6 +314,60 @@ class Engine:
         self.flow_mgr.mode = "split"
         return self.run_split(initial_payload=(last_st, last_gts, root_id))
         
+    def autocorrect(self, targets: List[str], multree: MulTree, genetrees: Dict[int, SmrtTree], iter: int) -> Tuple[MulTree, Dict[int, SmrtTree]]:
+        """
+        Detects nested hybridization by finding 'orphaned' copies of the H-lineage
+        directly in the tree structure using the .match() capability.
+        Returns the corrected MulTree and Gene Trees after iteratively fixing each detected nested copy.
+        """        
+        curr_mt = multree
+        curr_gts = genetrees 
+
+        self.flow_logger.log(f"Nested Fix: Detected {len(targets)} missing copies to fix: {targets}", 'i')
+        
+        for t_id in range(len(targets)):
+            # Start looking for Copy 2 (but index starts at 0, so start = 1)
+            next_copy_idx = t_id + 1
+
+            target = targets[t_id]
+            h2_loc = curr_mt.mt.get_node(target)
+            if h2_loc is None:
+                self.flow_logger.log(f"Nested Fix: Target node '{target}' not found in current MT. Skipping.", 'w')
+                continue
+
+            # If nest_internal_only is True, skip if the target is the most external node in the event that produced it.
+            '''if self.ctx.nesting == "strict_rectify" and self._check_internality(curr_mt.mt, h2_loc):
+                self.flow_logger.log(f"Nested Fix: Target node '{h2_loc.name}' is root in the smallest event containing it. Skipping due to strict_rectify mode.", 'd')
+                continue'''
+
+            # Trigger Nested Fix
+            self.flow_logger.log(f"Nested Fix: Nested Event Detected! Locating missing copy at the branch leading to {h2_loc.name}", 'i')
+            h1_node = curr_mt.h1_node
+            
+            fix_dir = self.ctx.root_dir / f'{iter}.{next_copy_idx}' / 'output'
+            
+            # Run Task to infer reconciliation for this missing copy
+            # We treat the 'Missing Candidate' as the H2 (Target) 
+            # and the current H1 as the source.
+            step = f"Nested Fix Iteration {iter}.{next_copy_idx}"
+            self.flow_logger.report_step(step, "In progress...")
+
+            res, _, _ = self._run_nested_subproblem(
+                curr_mt.mt, curr_gts,
+                ",".join(h1_node.iter_leaf_names()), # H1 is the reference
+                ",".join(h2_loc.iter_leaf_names()), # H2 is the new found copy
+                fix_dir
+            )
+
+            self.flow_logger.report_step(step, "Success")
+
+            curr_mt, curr_gts, targets = self.flow_mgr.relabel_problem(
+                iter, res, fix_dir, self.flow_logger, j=next_copy_idx, targets=targets
+            )
+
+        self.flow_logger.log(f"Nested check complete. Found {next_copy_idx-1} extra copies.", 'i')
+        return curr_mt, curr_gts
+
     def run_full(self, limit_override: int = None) -> Tuple[SmrtTree, Optional[Dict[int, SmrtTree]]]:
         """
         Iterative mode. Returns final (st, gts) if limit reached, or (None, None) if finished naturally.
@@ -354,11 +407,11 @@ class Engine:
                 # We pass the persistent config (which might have parsed ploidies from iter 1)
                 # worker will apply transient updates (output_dir, st, gts) internally
                 _, res, updates, iter_log, benchmarks = task_worker(
-                    payload = (current_st, current_gts, str(i)),
-                    context = self.ctx,      # Pass Global Context
-                    config  = perm_tcf,       # Pass updated Task Config 
-                    verbosity = self.ctx.verbosity,
-                    label = iter_labeller(i),
+                    payload       = (current_st, current_gts, str(i)),
+                    context       = self.ctx,      # Pass Global Context
+                    config        = perm_tcf,      # Pass updated Task Config 
+                    verbosity     = self.ctx.verbosity,
+                    label         = iter_labeller(i),
                     parent_logger = self.flow_logger
                 )
 
@@ -372,22 +425,24 @@ class Engine:
                                          parent_logger=self.flow_logger, clear_log=False, label=iter_labeller(i), benchmarks=benchmarks)
                 # Process result and handle potential nesting
                 # This returns the trees prepared for the NEXT iteration
-                next_mt, next_gts, _ = self.flow_mgr.relabel_problem(
-                    i, res,
-                    engine_callback = lambda st, gts, h1, h2, out: self._run_nested_subproblem(st, gts, h1, h2, out),
-                    iter_out = self.ctx.root_dir / str(i) / "output", 
+                next_mt, next_gts, targets = self.flow_mgr.relabel_problem(
+                    i, res, iter_out = self.ctx.root_dir / str(i) / "output", 
                     iter_logger = iter_logger,
                 )
 
-                iter_logger.end_prog(min_score, min_idx, min_mult_str)
+                iter_logger.end_report(min_score, min_idx, min_mult_str)
 
                 # Save for return even if breaking (e.g. if no events found, get ST)
-                current_st = next_mt.mt
                 if not next_gts:
                     self.flow_logger.log(f"No further events found. Terminating at iteration {i}.", 'i')
+                    current_st = next_mt.mt
                     break
 
+                if targets:
+                    next_mt, next_gts = self.autocorrect(targets, next_mt, next_gts, i)
+        
                 i += 1
+                current_st = next_mt.mt
                 current_gts = next_gts
                 
         except KeyboardInterrupt:
@@ -558,7 +613,7 @@ class Engine:
                         iter_logger = iter_logger
                 )
 
-                iter_logger.end_prog(min_score, min_idx, min_mult_str)
+                iter_logger.end_report(min_score, min_idx, min_mult_str)
 
 
                 if extracts is None:

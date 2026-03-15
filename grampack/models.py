@@ -268,6 +268,25 @@ class TreeLinearizer:
             rmq_table=rmq
         )
 
+@dataclass(slots=True)
+class GraftRecord:
+    """Encapsulates the location and metadata for a single H lineage graft."""
+    copy_id: int
+    original: str
+    corrected: str
+    parent: str
+    grandp: str
+    aunt: str
+    expanded_targets: Optional[List[TreeNode]] = None
+
+    def __repr__(self):
+        if self.expanded_targets is not None:
+            if self.expanded_targets:
+                return f"GraftRec(id={self.copy_id}, orig='{self.original}', fixed='{self.corrected}', p='{self.parent}', expanded={[n.name for n in self.expanded_targets]})"
+            else:
+                return f"GraftRec(id={self.copy_id}, orig='{self.original}', fixed='{self.corrected}', p='{self.parent}', delayed={bool(self.expanded_targets)})"
+        return f"GraftRec(id={self.copy_id}, orig='{self.original}', p='{self.parent}', g={self.grandp})"
+
 @dataclass(slots=True, frozen=True)
 class GroupData:
     # ints are IDs from NameRegistry
@@ -404,7 +423,7 @@ class SmrtTree:
         Does not modify existing pure attributes - only <P> nodes should modify pure names, and do it manually.
         """
         if not hasattr(node, 'pure'):
-            pure = node.name.replace("*", "").split('|')[0]
+            pure = node.name.replace("*", "").split('|', 1)[0]
             if not node.is_leaf() and not pure.endswith('>'):
                 pure += '>'
             node.add_feature('pure', pure)
@@ -477,7 +496,7 @@ class SmrtTree:
     # --------------------------------------------------------------------------
 
     @staticmethod
-    def graft_subtree(tree: TreeNode, target: TreeNode, graft: TreeNode, name: str) -> TreeNode:
+    def graft_subtree(tree: TreeNode, target: TreeNode, graft: TreeNode, name: str, purify: bool = False) -> TreeNode:
         """
         Grafts `graft` on the branch leading to `p_node`.
         Modifies the tree in place, but return is needed because it might create a new root
@@ -488,11 +507,15 @@ class SmrtTree:
             new_root.add_child(target.detach())
             new_root.add_child(graft)
             tree = new_root
+            if purify:
+                SmrtTree.add_pure(new_root)
         else:
             new_internal = TreeNode(name=name)
             p_parent.add_child(new_internal)
             new_internal.add_child(target.detach())
             new_internal.add_child(graft)
+            if purify:
+                SmrtTree.add_pure(new_internal)
         return tree
     
     @staticmethod
@@ -509,6 +532,55 @@ class SmrtTree:
                 elif n.name and n.name.startswith("<") and n.name.endswith(">"):
                     n.name = n.name.replace(">", f"{tag}>")
         return subtree
+
+    def _tag_and_graft(self, inner_tree: Tree, target: Tree, parent_tag: str, uid: int, copy_id: int) -> Tuple[Tree, Tree]:
+    
+        # Extract the surrounding suffix if present (returns empty string if root or '|' is missing)
+        suffix = target.up.name if target.up else ''
+        suffix = suffix.partition('|')[2].rstrip('>')
+        suffix = '|' + suffix if suffix else ''
+
+        # For copies other than the original, update the parent tag, and preppend the new copy ID to the suffix.
+        if parent_tag.startswith('<P*'):
+            parent_tag = f'<P{uid}>'
+            suffix = f"|{uid}.{copy_id}{suffix}"
+
+        # This is an internal node for sure
+        new_name = parent_tag[:-1] + suffix + '>'
+        graft = SmrtTree.copy_lineage(inner_tree, suffix)
+        return SmrtTree.graft_subtree(self.ete_tree, target, graft, name=new_name, purify=True), graft
+    
+    def _synch_graft(self, graft: Tree):
+        # Synchronize the new graft into the wrapper (.pure should be already set!)
+        for n in graft.traverse():
+            if n.name not in self.node_map:
+                self.node_map[n.name] = n
+                self.match_map.setdefault(n.pure, []).append(n)
+        p_node = graft.up
+        self.node_map[p_node.name] = p_node
+        self.match_map.setdefault(p_node.pure, []).append(p_node)
+
+    def graft_records(self, inner_tree: Tree, records: List[GraftRecord], uid: int):
+        outer_tree = self.ete_tree
+        
+        # Standard Grafts
+        for rec in records:
+            if not rec.expanded_targets: continue
+            targets = rec.expanded_targets
+            for target in targets:
+                outer_tree, graft = self._tag_and_graft(inner_tree, target, rec.parent, uid, rec.copy_id)
+                self.ete_tree = outer_tree
+                self._synch_graft(graft)
+        
+        # Delayed Inner Autopolyploidy Grafts
+        for rec in records:
+            if rec.expanded_targets: continue
+            loc_node = self.get_node(rec.corrected)
+            targets = self.match(loc_node.pure)
+            for target in targets:
+                outer_tree, graft = self._tag_and_graft(inner_tree, target, rec.parent, uid, rec.copy_id)
+                self.ete_tree = outer_tree
+                self._synch_graft(graft)
 
     def trim_lineages(self, node_names: List[str], retain: bool = False) -> Tuple[bool, List[Optional[str]], List['SmrtTree']]:
         """
@@ -679,13 +751,20 @@ class SmrtTree:
         for n in marked_nodes:
             n.name = n.name.replace(symbol, "")
         return marked_str
-
+    
     def to_str(self, internals: bool=True, name_formatter=None, **kwargs) -> str:
+        """
+        Wrapper for _to_str to work on self.
+        """
+        return self._to_str(self.ete_tree, internals=internals, name_formatter=name_formatter, **kwargs)
+
+    @staticmethod
+    def _to_str(ete_tree, internals: bool=True, name_formatter=None, **kwargs) -> str:
 
         # Determine the ETE3 format number based on your parameter
         fmt_num = 8 if internals else 9
         # Checking children > 1 prevents printing single-leaf tree's label twice
-        root_name = str(self.ete_tree.name) if internals and len(self.ete_tree) > 1 else ""
+        root_name = str(ete_tree.name) if internals and len(ete_tree) > 1 else ""
         
         if name_formatter:
             # Bind extra arguments (like maps=, dups=) to the formatter
@@ -694,7 +773,7 @@ class SmrtTree:
                 
             # Save original names and apply formatting in-place
             original_names = {}
-            for node in self.ete_tree.traverse():
+            for node in ete_tree.traverse():
                 original_names[node] = node.name
                 raw_name = str(node.name) if node.name else ""
                 fmt_name = str(name_formatter(raw_name)) if raw_name else ""
@@ -704,7 +783,7 @@ class SmrtTree:
                 root_name = str(name_formatter(root_name))
                 # No need to revert root name as it's not part of the tree object
                 
-            base_str = self.ete_tree.write(format=fmt_num)
+            base_str = ete_tree.write(format=fmt_num)
             
             # Revert the names to the original to avoid side effects on the tree object
             for node, orig_name in original_names.items():
@@ -712,7 +791,7 @@ class SmrtTree:
             
         else:
             # Standard ETE3 writing (No formatter provided)
-            base_str = self.ete_tree.write(format=fmt_num)
+            base_str = ete_tree.write(format=fmt_num)
         
         return base_str[:-1] + root_name + ";"
 
