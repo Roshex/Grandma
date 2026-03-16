@@ -359,6 +359,8 @@ class FlowManager:
         next_gts = self._relabel_gene_trees(res, nonin_idx, suffix_name_map)
 
         if self.ctx.nesting in {"rectify", "strict_rectify"}:
+            step = "Checking for nested events"
+            self.logger.report_step(step, "In progress...")
             if j == 0:
                 # Check for Nested Hybridization
                 # This encapsulates the while-loop for recursive sub-fixes
@@ -383,6 +385,13 @@ class FlowManager:
 
                         targets[k] = new_name
                         self.flow_logger.log(f"Nested Fix: Updated pending target '{future_target}' to '{new_name}'", 'd')
+            if targets:
+                if j == 0:
+                    self.logger.report_step(step, f"Success: found {len(targets)} targets to fix")
+                else:
+                    self.logger.report_step(step, f"Success: updated targets, {len(targets)-j} left")
+            else:
+                self.logger.report_step(step, f"Success: no targets detected")
         else:
             targets = []
 
@@ -392,7 +401,12 @@ class FlowManager:
         # Write handoff files for resume support
         CommonOps.write_handoff_files(iter_out.parent, next_mt.mt.ete_tree, [gt.ete_tree for gt in next_gts.values()])
 
-        self.logger.report_step(step, "Success")
+        if self.ctx.nesting in {"rectify", "strict_rectify"} and targets:
+            success_msg = f"ready for task {i}.{j+1}"
+        else:
+            success_msg = f"ready for task {i+1}"
+
+        self.logger.report_step(step, f"Success: {success_msg}")
         
         return next_mt, next_gts, targets
     
@@ -493,7 +507,7 @@ class FlowManager:
         if innie_below >= len(inner_gts): inner_gts = {}
         if outie_below >= len(outer_gts): outer_gts = {}
 
-        self.logger.report_step(step, f"Success: got {len(inner_gts)} in. & {len(outer_gts)} out. gts")
+        self.logger.report_step(step, f"Success: got {len(outer_gts)} out. & {len(inner_gts)} in. gts")
         return inner_gts, outer_gts, gt_split_dict
 
     def _partition_species_tree(self, best_mt: MulTree) -> Tuple[SmrtTree, Optional[SmrtTree]]:
@@ -511,11 +525,11 @@ class FlowManager:
         else:
             self._debug_tree(f"Outer Species Tree (Backbone) after hybrid clades {names_to_trim} trimming:", outer_wrapper.ete_tree)
 
-        self.logger.report_step(step, f"Success: got st sizes {len(inner_wrapper)} in. / {len(outer_wrapper) if outer_wrapper else 0} out.")
+        self.logger.report_step(step, f"Success: got {len(outer_wrapper) if outer_wrapper else 0} out. & {len(inner_wrapper)} in. st sizes")
         return inner_wrapper, outer_wrapper
 
     def extract_subproblems(
-            self, bin_id: str, res: TaskResult,
+            self, bin_id: Tuple[int, int], res: TaskResult,
             iter_out: Path,
             iter_logger: GranLogger
         ) -> Optional[List[ConcurrTask]]:
@@ -529,7 +543,7 @@ class FlowManager:
         self.logger = iter_logger
 
         # Determine Depth and Index from Binary ID
-        depth, idx = (int(x) for x in bin_id.split('.')) if '.' in bin_id else (0, 0)
+        depth, idx = bin_id
 
         passed, nonin_idx, next_mt, _ = self.judge_event(depth, idx, res)
 
@@ -550,9 +564,9 @@ class FlowManager:
         # Queue Tasks with binary IDs: Outer first
         next_tasks = []
         if outer_wrapper and len(outer_wrapper) >= self.ctx.min_st_lvs and len(outer_gts) > 0:
-            next_tasks.append((outer_wrapper, outer_gts, f"{depth + 1}.{idx * 2}"))
+            next_tasks.append((outer_wrapper, outer_gts, (depth + 1, idx * 2)))
         if len(inner_wrapper) >= self.ctx.min_st_lvs and len(inner_gts) > 0:
-            next_tasks.append((inner_wrapper, inner_gts, f"{depth + 1}.{idx * 2 + 1}"))
+            next_tasks.append((inner_wrapper, inner_gts, (depth + 1, idx * 2 + 1)))
 
         self.logger.report_step(step, f"Success: extracted {len(next_tasks)} valid subproblems")
 
@@ -565,14 +579,18 @@ class FlowManager:
             json.dump(gt_split_dict, f, indent=4)
 
         # Write handoff files for resume support
+        task_strs = []
         for task_st, task_gts, task_id in next_tasks:
-            task_out = iter_out.parent / task_id
+            task_str = f"{task_id[0]}.{task_id[1]}"
+            task_strs.append(task_str)
+            task_out = iter_out.parent / task_str
             task_out.mkdir(parents=True, exist_ok=True)
-            self.logger.log(f"Written handoff files for task {task_id} at {task_out.relative_to(iter_out.parent.parent.parent)}, with {len(task_gts)} GTs.", 's')
             CommonOps.write_handoff_files(task_out, task_st.ete_tree, [gt.ete_tree for gt in task_gts.values()])
 
-        self.logger.report_step(step, "Success")
-
+        if task_strs:
+            self.logger.report_step(step, f"Success: ready for tasks {', '.join(task_strs)}")
+        else:
+            self.logger.report_step(step, "Success")
         self.logger = backup_logger
         return next_tasks
 
@@ -580,7 +598,7 @@ class FlowManager:
         """
         Recombines results by recursively diving to the innermost subproblems.
         """
-        step = "Recombining Split Results (Recursive)"
+        step = "Recombining Split Results"
         self.logger.report_step(step, "In progress...", start=True)
 
         ft_wrapper = self._iterative_glue(root_id)
@@ -808,49 +826,55 @@ class FlowManager:
         self.logger.log("Fast-forwarding Split tasks based on history...", 'i')
         self.logger.log(f"Current tasks: {current_tasks}, output_dir: {self.ctx.root_dir}", 'd')
 
-        queue = [(current_tasks[0][2], None)] # Start with Root ID (e.g. "0")
+        # queue contains Tuple[Current_Task_ID_Tuple, Parent_Task_ID_Tuple]
+        # Start with Root ID (0, 0) and no parent
+        queue = [(current_tasks[0][2], None)]
         real_tasks = []
         
         while queue:
             q = queue.pop(0)
             nid = q[0]
+            depth, idx = nid
+            nid_str = f"{depth}.{idx}"
             
             # Check if this task is already solved in history
-            depth, idx = (int(x) for x in nid.split('.')) if '.' in nid else (0, int(nid))
-            
-            if (depth, idx) in self.ctx.history:
+            if nid in self.ctx.history:
                 # Task done. Check for its children directories on disk
-                c1 = f"{depth+1}.{idx*2}"
-                c2 = f"{depth+1}.{idx*2+1}"
+                c1 = (depth + 1, idx * 2)
+                c2 = (depth + 1, idx * 2 + 1)
 
-                self.logger.log(f"Task {nid} done. Checking children: {c1}, {c2} in {self.ctx.root_dir / nid}", 'd')
+                c1_str = f"{c1[0]}.{c1[1]}"
+                c2_str = f"{c2[0]}.{c2[1]}"
+
+                self.logger.log(f"Task {nid_str} done. Checking children: {c1_str}, {c2_str} in {self.ctx.root_dir / nid_str}", 'd')
                 
                 # If child dir exists, add to traversal queue
-                if (self.ctx.root_dir / nid / c1 / "multree.tre").exists():
+                if (self.ctx.root_dir / nid_str / c1_str / "multree.tre").exists():
                     queue.append((c1, nid))
-                if (self.ctx.root_dir / nid / c2 / "multree.tre").exists():
+                if (self.ctx.root_dir / nid_str / c2_str / "multree.tre").exists():
                     queue.append((c2, nid))
             else:
                 # Task NOT in history -> It is a frontier task to run.
                 # Load inputs from disk
                 p_nid = q[1]
-                self.logger.log(f"Queueing frontier task: {nid} (child of {p_nid})", 'd')
+                p_nid_str = f"{p_nid[0]}.{p_nid[1]}" if p_nid else "None"
+                self.logger.log(f"Queueing frontier task: {nid_str} (child of {p_nid_str})", 'd')
 
-                st_path = self.ctx.root_dir / p_nid / nid / "multree.tre"
-                gt_path = self.ctx.root_dir / p_nid / nid / "genetrees.txt"
+                st_path = self.ctx.root_dir / p_nid_str / nid_str / "multree.tre"
+                gt_path = self.ctx.root_dir / p_nid_str / nid_str / "genetrees.txt"
                 
                 self.logger.log(f"Looking for ST at {st_path}, GTs at {gt_path}", 'd')
 
                 if st_path.exists() and gt_path.exists():
                     real_tasks.append((st_path, gt_path, nid))
-                    self.logger.log(f"Resuming sub-problem: {nid}", 's')
+                    self.logger.log(f"Resuming sub-problem: {nid_str}", 's')
                 else:
                     # Fallback: if root is missing inputs but passed in current_tasks
                     if nid == str(current_tasks[0][2]):
-                        self.logger.log(f"Using provided inputs for root task {nid}, {current_tasks}", 's')
+                        self.logger.log(f"Using provided inputs for root task {nid_str}, {current_tasks}", 's')
                         real_tasks.extend(current_tasks)
                     else:
-                        self.logger.log(f"Missing inputs for resume task {nid}. Skipping.", 'w')
+                        self.logger.log(f"Missing inputs for resume task {nid_str}. Skipping.", 'w')
 
         self.logger.log(f"Fast-forwarded tasks: {real_tasks}", 'd')
 

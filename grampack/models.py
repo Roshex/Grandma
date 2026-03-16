@@ -1286,5 +1286,5 @@ class TaskResult:
 # --- Type aliases ---
 
 HistoryType = Dict[Tuple[int, int], Dict[str, Any]]
-ConcurrTask = Tuple[SmrtTree, Dict[int, SmrtTree], str]
+ConcurrTask = Tuple[SmrtTree, Dict[int, SmrtTree], Tuple[int, int]]
 

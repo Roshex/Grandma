@@ -20,8 +20,8 @@ from typing import Optional, Tuple, Dict, Any, List, Union, Set
 
 from .config import InitParser, GlobalContext, TaskConfig
 from .flow import FlowManager
-from .logger import GranLogger
-from .models import SmrtTree, MulTree, NameRegistry, TaskResult, HistoryType
+from .logger import GranLogger, LogInheritance
+from .models import SmrtTree, MulTree, NameRegistry, TaskResult, HistoryType, ConcurrTask
 from .ops import TreeLoader, GeneTreeManager, MulTreeManager
 from .orthology import OrthologyLabeler
 from .reconcile import Reconciler
@@ -51,30 +51,31 @@ class NoDaemonPool(multiprocessing.pool.Pool):
 
 # --- Standalone workers function supporting parallel processing --- #
 
-def task_worker(payload: Tuple[Any, Any, str],
-                context: GlobalContext, config: TaskConfig,
-                verbosity: int = 0, label: str = '',
-                parent_logger: Optional[GranLogger] = None) -> Tuple[str, Optional[TaskResult], Dict[str, Any], Path, Optional[list]]:
+def task_worker(
+        payload: ConcurrTask, context: GlobalContext, config: TaskConfig,
+        verbosity: int = 0, label: str = '', parent_logger: Optional[GranLogger] = None
+    ) -> Tuple[str, Optional[TaskResult], Dict[str, Any], LogInheritance]:
     """
     Unified worker for both Sequential (Full) and Binary (Split) modes.
-    Returns: (task_id, result, updates, log_file, benchmarks)
+    Returns: (task_id, result, updates, logger_inheritance)
     """
-        
     st, gts, task_id = payload
+    depth, idx = task_id
+    task_str = f"{depth}.{idx}"
 
     # BETA: TEMP FIX: If st is a GrandmaTree object (passed from split mode), refresh it
     if hasattr(st, 'refresh'):
         st.refresh()
 
     # Ensure ID-specific output directory
-    out = context.root_dir / task_id / "output"
+    out = context.root_dir / task_str / "output"
     out.mkdir(parents=True, exist_ok=True)
     # Note: pickle_dir is a property of TaskConfig derived from output_dir, 
     # so we don't set it via replace.
 
     # Temp fix
     if config.mode == "split":
-        binary_id = ( int(task_id.split(".")[1]) if "." in task_id else 0 ) - context.mixed_switch
+        binary_id = idx - context.mixed_switch
     else:
         binary_id = None
 
@@ -91,16 +92,16 @@ def task_worker(payload: Tuple[Any, Any, str],
 
     # If no parent logger provided (preferred in multiprocessing)
     # create logger without forwarding to parent
-    iter_logger = GranLogger(iter_tcf.log_file, verbosity, no_log=context.nolog, debug=context.debug, parent_logger=parent_logger, label=label)
+    iter_logger = GranLogger(iter_tcf.log_file, verbosity, context.debug, parent_logger=parent_logger, no_log=context.nolog, label=label)
     iter_logger.start_info(iter_ctx, iter_tcf)
 
     # Execute Task
     # Task.execute returns (StepResult, updates)
     # 'updates' contains ONLY the hydrated persistent config data (parsed ploidies, etc.)
     task = Task(iter_ctx, logger=iter_logger)
-    res, updates, benchmarks = task.execute(iter_tcf)
+    res, updates = task.execute(iter_tcf)
 
-    return task_id, res, updates, iter_logger.log_file, benchmarks
+    return task_id, res, updates, iter_logger.inheritance
 
 # --- Core Classes --- #
 
@@ -125,17 +126,17 @@ class Task:
         self.mul_mgr = None
         self.gene_mgr = None
              
-    def execute(self, tcf: TaskConfig) -> Tuple[Optional[TaskResult], Dict[str, Any], Optional[list]]:
+    def execute(self, tcf: TaskConfig) -> Tuple[Optional[TaskResult], Dict[str, Any]]:
 
         # Setup task
         Path(tcf.output_dir).mkdir(parents=True, exist_ok=True)
         if not self.logger:
             # Create a new logger if one wasn't passed
             log_file = Path(tcf.output_dir) / f"{tcf.run_prefix}.log"
-            self.logger = GranLogger(log_file, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug)
+            self.logger = GranLogger(log_file, self.ctx.verbosity, self.ctx.debug, no_log=self.ctx.nolog)
 
         if self.ctx.norun:
-            return None, {}, self.logger.norun_banner()
+            return self.logger.norun_banner(), {}
 
         self.logger.report_step("", "", start=True, enable_benchmark=self.ctx.bench)
 
@@ -144,7 +145,7 @@ class Task:
 
         # If the ST is None, terminal label-sp mode successfully finished or a warning was logged. Exit smoothly.
         if not self.spec_tree:
-            return None, {}, self.logger.end_report()
+            return self.logger.end_report(), {}
         
         # Re-init component with current task
         self.mul_mgr = MulTreeManager(tcf, self.spec_tree, self.logger)
@@ -154,7 +155,7 @@ class Task:
 
         # If build() returns an empty dict, a terminal mode (count-mts or build-mts) successfully finished or a warning was logged. Exit smoothly.
         if not self.mul_trees:
-            return None, {}, self.logger.end_report()
+            return self.logger.end_report(), {}
 
         # Load Gene Trees
         self.gene_trees = TreeLoader.gene_trees(tcf, self.logger)
@@ -171,7 +172,7 @@ class Task:
 
         # In check-nums mode, cull returns False after logging the counts and handling pickles.
         if not proceed:
-            return None, {}, self.logger.end_report()
+            return self.logger.end_report(), {}
 
         # Reconciliation and MUL-tree Selection
         step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry)
@@ -209,7 +210,7 @@ class Task:
             'repair': False # Disable repair for subsequent runs
         }
 
-        return step_result, tcf_updates, self.logger.benchmarks
+        return step_result, tcf_updates
         
 class Engine:
     """
@@ -222,7 +223,7 @@ class Engine:
         
         # In Single mode, we don't need a separate engine logger.
         # In Full mode, we might want a flow logger.
-        self.flow_logger = GranLogger(self.ctx.log_file, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug, clear_log=False)
+        self.flow_logger = GranLogger(self.ctx.log_file, self.ctx.verbosity, self.ctx.debug, no_log=self.ctx.nolog, clear_log=False)
         """# In resume, append to log, don't clear
         is_resume = (self.tcf.history is not None and len(self.tcf.history) > 0)
         self.flow_logger = GrandmaLogger(log_path, self.cfg.verbosity, clear_log=not is_resume)"""
@@ -260,7 +261,7 @@ class Engine:
         elif run_mode == "split":
             final_smtree = self.run_split()
         else:
-            res, _, _ = Task(self.ctx, self.flow_logger).execute(self.tcf)
+            res, _ = Task(self.ctx, self.flow_logger).execute(self.tcf)
             # Extract best SmrtTree if applicable
             if res:
                 min_score, min_idx, min_mult = self._unpack_min_res(res)
@@ -309,7 +310,7 @@ class Engine:
         # Prepare the root task for split mode. 
         # The ID is simply the iteration number (e.g., "5"), representing depth 5, index 0 effectively.
         # Split logic expects "Depth.Index": since we ran linear 0..4, the next depth is 5 (and index 0).
-        root_id = f"{full_limit}.0"
+        root_id = (full_limit, 0)
 
         self.flow_mgr.mode = "split"
         return self.run_split(initial_payload=(last_st, last_gts, root_id))
@@ -352,7 +353,7 @@ class Engine:
             step = f"Nested Fix Iteration {iter}.{next_copy_idx}"
             self.flow_logger.report_step(step, "In progress...")
 
-            res, _, _ = self._run_nested_subproblem(
+            res, _ = self._run_nested_subproblem(
                 curr_mt.mt, curr_gts,
                 ",".join(h1_node.iter_leaf_names()), # H1 is the reference
                 ",".join(h2_loc.iter_leaf_names()), # H2 is the new found copy
@@ -380,7 +381,7 @@ class Engine:
         if max_iter > self.ctx.max_iter:
             self.flow_logger.log(f"Provided Mixed Mode switch ({max_iter}) exceeds global max_iter ({self.ctx.max_iter}). Using override.", 'w')
         iter_msg = '(inf mode)' if max_iter == float('inf') else f'of {int(max_iter)}' # ∞
-        iter_labeller = lambda s: f"Iteration {s} {iter_msg}"
+        iter_labeller = lambda it: f"Iteration {it} {iter_msg}"
         
         perm_tcf = self.tcf
         current_st = perm_tcf.st
@@ -406,7 +407,7 @@ class Engine:
                 # Run worker
                 # We pass the persistent config (which might have parsed ploidies from iter 1)
                 # worker will apply transient updates (output_dir, st, gts) internally
-                _, res, updates, iter_log, benchmarks = task_worker(
+                _, res, updates, log_inheritance = task_worker(
                     payload       = (current_st, current_gts, str(i)),
                     context       = self.ctx,      # Pass Global Context
                     config        = perm_tcf,      # Pass updated Task Config 
@@ -421,8 +422,7 @@ class Engine:
                 # Update persistent config for next iteration
                 perm_tcf = perm_tcf.update(**updates)
 
-                iter_logger = GranLogger(iter_log, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug,
-                                         parent_logger=self.flow_logger, clear_log=False, label=iter_labeller(i), benchmarks=benchmarks)
+                iter_logger = GranLogger(None, self.ctx.verbosity, self.ctx.debug, parent_logger=self.flow_logger, inheritance=log_inheritance)
                 # Process result and handle potential nesting
                 # This returns the trees prepared for the NEXT iteration
                 next_mt, next_gts, targets = self.flow_mgr.relabel_problem(
@@ -471,7 +471,7 @@ class Engine:
         
         return Task(fix_ctx, logger=None).execute(fix_tcf)
     
-    def run_split(self, initial_payload: Tuple = None) -> SmrtTree:
+    def run_split(self, initial_payload: Optional[ConcurrTask] = None) -> SmrtTree:
         """
         Binary Split Mode:
         Executes sub-problems in parallel where possible.
@@ -497,17 +497,12 @@ class Engine:
         if initial_payload:
             # Mixed Mode Handoff
             current_tasks = [initial_payload]
-            # We assume previous iterations count towards max_iter
-            events_found = int(float(initial_payload[2])) # Start count at depth
-            ### TBD:
-            ### at the end of this gluing needs to only apply until the switchpoint, and then do a different glue!
-            ### Also, we might want to fast-forward the history if we are resuming deep, but TBD on how to track that with the mixed start.
-            root_task_id = (int(k) for k in initial_payload[2].split("."))
+            events_found = initial_payload[2][0] # Depth is index 0 of the tuple
+            root_task_id = initial_payload[2]
         else:
-            # Standard Start
-            # Initialize Task Queue to the root problem
+            # Standard Start: initialize Task Queue to the root problem
             root_task_id = (0, 0)
-            root_task = (perm_tcf.st, perm_tcf.gts, "0")
+            root_task = (perm_tcf.st, perm_tcf.gts, root_task_id)
             current_tasks = [root_task]
             # Fast-Forward (Resume) Logic
             # If we have history, we might have completed the root or others.
@@ -519,12 +514,10 @@ class Engine:
                 events_found = 0 # to be implemented !!!
 
         # Adjust depth display if resuming deep
-        depth = 0
-        if current_tasks and "." in str(current_tasks[0][2]):
-            depth = int(str(current_tasks[0][2]).split('.')[0])
+        depth = current_tasks[0][2][0] if current_tasks else 0
 
         max_iter = self.ctx.max_iter
-        iter_labeller = lambda s: f"Branch {s}"
+        iter_labeller = lambda it: f"Branch {it[0]}.{it[1]}"
 
         while current_tasks:
     
@@ -585,7 +578,7 @@ class Engine:
             # If this is the first run, the workers just parsed the ploidies/h-nodes.
             # We grab the updates from the *first valid result* and update perm_tcf.
             # The next depth's workers will receive the PARSED dicts, not file paths.
-            for _, _, updates, _, _ in batch_results:
+            for _, _, updates, _ in batch_results:
                 if updates:
                     perm_tcf = perm_tcf.update(**updates)
                     break # Only need to do once
@@ -595,21 +588,21 @@ class Engine:
             next_tasks = []
             # Sort batch results by task_id to ensure deterministic logging
             batch_results.sort(key=lambda x: x[0]) # Sort by task_id
-            for task_id, res, _, iter_log, benchmarks in batch_results:
+            for task_id, res, _, log_inheritance in batch_results:
                 if not res: continue
 
                 min_score, min_idx, min_mult = self._unpack_min_res(res)
                 min_mult_str = min_mult.to_marked_str()
 
                 # Assimilate the worker's log into the main logger
-                self.flow_logger.assimilate(iter_log)
-                iter_logger = GranLogger(iter_log, self.ctx.verbosity, no_log=self.ctx.nolog, debug=self.ctx.debug,
-                                         parent_logger=self.flow_logger, clear_log=False, label=iter_labeller(task_id), benchmarks=benchmarks)
+                self.flow_logger.assimilate(log_inheritance.log_file)
+                iter_logger = GranLogger(None, self.ctx.verbosity, self.ctx.debug, parent_logger=self.flow_logger, inheritance=log_inheritance)
                 # Logic to determine branching vs termination moved to flow_mgr
                 # Note: We reconstruct path here to avoid passing it back from workers
+                task_str = f"{task_id[0]}.{task_id[1]}"
                 extracts = self.flow_mgr.extract_subproblems(
                         task_id, res,
-                        iter_out = self.ctx.root_dir / task_id / "output",
+                        iter_out = self.ctx.root_dir / task_str / "output",
                         iter_logger = iter_logger
                 )
 

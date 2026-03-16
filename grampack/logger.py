@@ -8,7 +8,7 @@ import time
 import datetime
 import traceback
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Any
+from typing import TYPE_CHECKING, Optional, Any, NamedTuple
 
 # This block is ignored at runtime, and solves the circular dependency of typing
 if TYPE_CHECKING:
@@ -21,38 +21,87 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
+class LogInheritance(NamedTuple):
+    """
+    NamedTuple to encapsulate the state of a logger for inheritance by following loggers.
+    These fields shouldn't change when a logger passes its inheritance.
+    Can't pass parent_logger here due to possible multiprocessing pickling issues, so that is handled separately in the GranLogger __init__.
+    """
+    # Init arg params
+    log_file: Path
+    no_log: bool
+    label: str
+    # Init default params
+    bench: bool
+    benchmarks: Optional[list]
+    start_time: float
+    warnings: int
+
 class GranLogger:
-    def __init__(self, log_file: Path, verbosity: int = 4, debug: bool = False, no_log: bool = False,
-                 parent_logger: Optional['GranLogger'] = None, clear_log: bool = True,
-                 catch_exceptions: bool = True, label: str = "", benchmarks: Optional[list] = None) -> None:
+
+    __slots__ = ['log_file', 'no_log', 'label', 'verbosity', 'debug', 'step_start_time', 'parent_logger',
+                 'bench', 'benchmarks', 'start_time', 'warnings', 'step_active', 'step_buffer', 'pids']
+    
+    def __init__(self, log_file: Path, verbosity: int = 4, debug: bool = False,
+                 catch_exceptions: bool = True, parent_logger: Optional['GranLogger'] = None,
+                 no_log: bool = False, clear_log: bool = True, label: str = "",
+                 inheritance: Optional[LogInheritance] = None) -> None:
         self.log_file = log_file
-        self.verbosity = verbosity    # Controls screen output (0-4)
-        self.debug = debug       # Controls if 'd' messages go to file
         self.no_log = no_log          # Controls if ANY messages go to file
+        self.label = label            # Optional task label for this logger if a task logger (not main logger)
+
+        self.verbosity = verbosity    # Controls screen output (0-4)
+        self.debug = debug            # Controls if 'd' messages go to file
+
         self.parent_logger = parent_logger
-        self.label = label
-        self.step_start_time = 0
-        self.start_time = time.time()
-        self.bench = False
-        self.benchmarks = benchmarks # Optional List of (step_name, elapsed_time) tuples for benchmarking
-        # Adjust start time if resuming from a previous run with benchmarks
-        if benchmarks is not None:
-            self.start_time -= sum(float(elapsed) for _, elapsed in benchmarks)
+
+        # --- INHERITANCE INJECTION ---
+        if inheritance:
+            clear_log = False
+            self.log_file = inheritance.log_file
+            self.no_log = inheritance.no_log
+            self.label = inheritance.label
+            self.bench = inheritance.bench
+            self.benchmarks = inheritance.benchmarks
+            self.start_time = inheritance.start_time
+            self.warnings = inheritance.warnings
+        else:
+            self.bench = False
+            self.benchmarks = None
+            self.start_time = time.time()
+            self.warnings = 0
+
         self.pids = [psutil.Process(os.getpid())] if HAS_PSUTIL else []
-        self.warnings = 0
+        self.step_start_time = 0
+
         # States for Warning Buffering
         self.step_active = False
         self.step_buffer = []
         
         # Ensure dir exists & clear log file
-        if not no_log:
+        if not self.no_log:
             self.log_file.parent.mkdir(parents=True, exist_ok=True)
             if clear_log:
                 with open(self.log_file, 'w') as f:
                     f.write("")
 
-        if catch_exceptions and not no_log and log_file:
+        if catch_exceptions and not self.no_log and self.log_file:
             self.catch_all_exceptions()
+
+    @property
+    def inheritance(self) -> LogInheritance:
+        """Returns the current logger's state for inheritance by follower loggers."""
+        return LogInheritance(
+            # Init arg params
+            log_file=self.log_file,
+            no_log=self.no_log,
+            label=self.label,
+            # Init default params
+            bench=self.bench,
+            benchmarks=self.benchmarks,
+            start_time=self.start_time,
+            warnings=self.warnings
+        )
 
     @property
     def disable_tqdm(self) -> bool:

@@ -966,7 +966,7 @@ class InitParser:
         out_dir.mkdir(parents=True, exist_ok=True)
         
         log_file = out_dir / f"{args.prefix}.log"
-        self.logger = GranLogger(log_file=log_file, verbosity=args.verbosity, no_log=args.nolog, debug=args.debug)
+        self.logger = GranLogger(log_file, args.verbosity, args.debug, no_log=args.nolog)
 
         # --- GENERATION MODE INTERCEPT ---
         if args.generate:
