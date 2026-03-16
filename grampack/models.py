@@ -284,7 +284,7 @@ class GraftRecord:
             if self.expanded_targets:
                 return f"GraftRec(id={self.copy_id}, orig='{self.original}', fixed='{self.corrected}', p='{self.parent}', expanded={[n.name for n in self.expanded_targets]})"
             else:
-                return f"GraftRec(id={self.copy_id}, orig='{self.original}', fixed='{self.corrected}', p='{self.parent}', delayed={bool(self.expanded_targets)})"
+                return f"GraftRec(id={self.copy_id}, orig='{self.original}', fixed='{self.corrected}', p='{self.parent}', delayed={not bool(self.expanded_targets)})"
         return f"GraftRec(id={self.copy_id}, orig='{self.original}', p='{self.parent}', g={self.grandp})"
 
 @dataclass(slots=True, frozen=True)
@@ -356,11 +356,12 @@ class SmrtTree:
         """
         Assumes nodes have a 'pure' attribute with the cleaned name (e.g. "Species" without "*").
         Returns all nodes matching the cleaned name, which is necessary for MUL trees.
+        In list() to not give access to the original & to prevent iterator mutation during looping over matches.
         """
         if not self.match_map:
             for node in self.ete_tree.traverse():
                 self.match_map.setdefault(node.pure, []).append(node)
-        return self.match_map[name]
+        return list(self.match_map[name])
 
     def make_flat(self, registry: NameRegistry):
         """Generates the FlatTree bundle for optimized processing."""

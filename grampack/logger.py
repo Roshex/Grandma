@@ -37,7 +37,7 @@ class GranLogger:
         self.benchmarks = benchmarks # Optional List of (step_name, elapsed_time) tuples for benchmarking
         # Adjust start time if resuming from a previous run with benchmarks
         if benchmarks is not None:
-            self.start_time += sum(float(elapsed) for _, elapsed in benchmarks)
+            self.start_time -= sum(float(elapsed) for _, elapsed in benchmarks)
         self.pids = [psutil.Process(os.getpid())] if HAS_PSUTIL else []
         self.warnings = 0
         # States for Warning Buffering

@@ -724,10 +724,11 @@ class FlowManager:
             
         for p_name, group in p_groups.items():
             if len(group) > 1:
-                self.logger.log(f"Glue {task_id}: Found duplicate parent '{p_name}', indicating source WGD", 'd')
                 # Find the primary locus safely
-                clean_rec = next((r for r in group if '*' not in r.original), None)
-                assert clean_rec is group[0], f"Expected original loc to be the first occurrence for '{p_name}'"
+                self.logger.log(f"Glue {task_id}: Found duplicate parent '{p_name}', indicating source WGD", 'd')
+                assert len(group) == 2, f"Expected exactly 2 records for parent '{p_name}' in source WGD case, found {len(group)}"
+                # H1 (clean_rec) has loc marked with *
+                clean_rec = next((r for r in group if '*' in r.original), None)
                 clean_rec.parent = clean_rec.grandp
                 clean_rec.original = clean_rec.aunt
                 clean_rec.corrected = clean_rec.aunt
