@@ -9,7 +9,9 @@ from dataclasses import dataclass, field
 
 from Reticulate_Tree.reticulate_tree import ReticulateTree
 
-splitSpec = lambda raw: raw.split("_", 1)[-1] if "_" in raw else raw # raw.split("_")[-1]
+# Grampa does:                  raw.split("_")[-1]     // split by last underscore
+# Grandma will eventually do:   raw.split("_", 1)[-1]  // split by first underscore, to preserve species names with underscores
+splitSpec = lambda raw: raw.split("_")[-1] if "_" in raw else raw
 
 class NameRegistry:
     """
