@@ -9,6 +9,7 @@ from typing import List, Dict, Tuple, Union, Optional
 from .config import TaskConfig
 from .logger import GranLogger
 from .models import SmrtTree, MulTree, GroupData, Map, ReconResult, TaskResult, FlatTree, NameRegistry
+from .ops import GeneTreeManager
 
 DEFAULT_TARGET = [0]
 
@@ -64,10 +65,11 @@ def _worker_reconcile_single(
     return mul_idx, total_score, gt_results
 
 class Reconciler:
-    def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1, to_map: bool = False, optim: bool = False):
+    def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1, pickle_action: str = 'archive', to_map: bool = False, optim: bool = False):
         self.tcf = config
         self.logger = logger
         self.n_procs = num_processes
+        self.pickle_action = pickle_action
         self.to_map = to_map
         self.optim = optim
     
@@ -713,16 +715,23 @@ class Reconciler:
         if self.optim:
             self.logger.log("Using optimized reconciliation method.", 'i')
 
-        if high_demand:
-            self.logger.log(f"High map demand detected ({limit}/{num_mts}). Generating maps directly during scoring.", 'i')
-            sorted_scores, detailed_res = self.recon_all(mul_trees, gene_trees, registry, retmap=True)
-            
-            # Trim the detailed_res down to `limit` to save memory and I/O writing overhead
-            # while sorting to keep it consistent with the output format of get_lowest_maps.
-            detailed_res = {k: detailed_res[k] for k, _ in sorted_scores[:limit] if k in detailed_res}
-        else:
-            sorted_scores, _ = self.recon_all(mul_trees, gene_trees, registry, retmap=False)
-            detailed_res = self.get_lowest_maps(sorted_scores, limit, mul_trees, gene_trees, registry, enforce_input_tree)
+        try:
+            if high_demand:
+                self.logger.log(f"High map demand detected ({limit}/{num_mts}). Generating maps directly during scoring.", 'i')
+                sorted_scores, detailed_res = self.recon_all(mul_trees, gene_trees, registry, retmap=True)
+                
+                # Trim the detailed_res down to `limit` to save memory and I/O writing overhead
+                # while sorting to keep it consistent with the output format of get_lowest_maps.
+                detailed_res = {k: detailed_res[k] for k, _ in sorted_scores[:limit] if k in detailed_res}
+            else:
+                sorted_scores, _ = self.recon_all(mul_trees, gene_trees, registry, retmap=False)
+                detailed_res = self.get_lowest_maps(sorted_scores, limit, mul_trees, gene_trees, registry, enforce_input_tree)
+        finally:
+            try:
+                GeneTreeManager(self.tcf, self.logger, self.n_procs, self.pickle_action).handle_pickles()
+            except Exception:
+                # Don't re-raise errors from cleanup to avoid masking main results
+                self.logger.log("Warning: Failed to clean up pickle files. Please check the pickle directory.", 'w')
 
         if len(detailed_res) == 2 and max_select == 1 and 0 not in detailed_res:
             # Edge Case: If user requested only 1 tree but the input tree (MUL-tree 0) is not in the top 2,

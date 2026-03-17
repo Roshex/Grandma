@@ -61,7 +61,7 @@ def task_worker(
     """
     st, gts, task_id = payload
     depth, idx = task_id
-    task_str = f"{depth}.{idx}"
+    task_str = f"{depth}.{idx}" if idx is not None else f"{depth}"
 
     # BETA: TEMP FIX: If st is a GrandmaTree object (passed from split mode), refresh it
     if hasattr(st, 'refresh'):
@@ -161,7 +161,7 @@ class Task:
         self.gene_trees = TreeLoader.gene_trees(tcf, self.logger)
 
         # Re-init component with current task
-        self.reconciler = Reconciler(tcf, self.logger, self.ctx.num_processes, self.ctx.maps, self.ctx.optim)
+        self.reconciler = Reconciler(tcf, self.logger, self.ctx.num_processes, self.ctx.pickles, self.ctx.maps, self.ctx.optim)
         self.gene_mgr = GeneTreeManager(tcf, self.logger, self.ctx.num_processes, self.ctx.pickles)
 
         # Collapse & Filter Groups
@@ -237,18 +237,11 @@ class Engine:
         else:
             random.seed(self.ctx.seed)
 
-    @staticmethod
-    def _unpack_min_res(res: TaskResult) -> Tuple[int, int, MulTree]:
-        min_score = res.mt_score()
-        min_idx = res.mt_idx()
-        min_mult = res.mul_trees[min_idx]
-        return min_score, min_idx, min_mult
-
     def run(self) -> Dict[str, Union[SmrtTree, HistoryType, Any]]:
 
         run_mode = self.tcf.mode
         # Init FlowManager for any iterative mode, and single - to return history
-        if run_mode in ["full", "split", "mixed", "single", "st-only", "no-st"] and not self.ctx.norun:
+        if run_mode in ("full", "split", "mixed", "single", "st-only", "no-st") and not self.ctx.norun:
             self.flow_mgr = FlowManager(self.ctx, run_mode, self.flow_logger)
 
         self.flow_logger.start_info(self.ctx, self.tcf)
@@ -264,23 +257,18 @@ class Engine:
             res, _ = Task(self.ctx, self.flow_logger).execute(self.tcf)
             # Extract best SmrtTree if applicable
             if res:
-                min_score, min_idx, min_mult = self._unpack_min_res(res)
+                min_score, min_idx, min_mult = res.unpacked_min_mt
+                if run_mode != "st-only":
+                    self.flow_mgr.judge_event(0, 0, res)
                 # Terminal report for single-run modes (single, st-only, no-st)
                 self.flow_logger.end_report(min_score, min_idx, min_mult.to_marked_str())
                 final_smtree = min_mult.mt
-                if run_mode != "st-only":
-                    self.flow_mgr.judge_event(0, 0, res)
 
-        # move to logger.final_report()...
         if final_smtree:
             final_smtree.write_forms(self.ctx.root_dir)
-            self.flow_logger.log("Singly- and multi-labelled forms of the final tree written to output directory.", 'i')
-            if self.ctx.debug:
-                # Visualize with reticulate tree's built-in function (requires matplotlib)
-                rt = final_smtree.to_rt()
-                rt.visualize(filename=self.ctx.root_dir / "final_tree.png", launch=False)
-                self.flow_logger.log(f"Final tree visualization saved.", 'i')
-            self.flow_logger.log("Final tree ASCII representation:\n" + final_smtree.ete_tree.get_ascii(show_internal=True), 'i')
+            # Visualize with reticulate tree's built-in function (requires matplotlib)
+            rt = final_smtree.to_rt() if self.ctx.debug else None
+            self.flow_logger.final_report(final_smtree, rt, run_mode in ("full", "split", "mixed"), self.ctx.plot)
 
         return_obj = {
             'final_tree': final_smtree,
@@ -337,7 +325,7 @@ class Engine:
                 continue
 
             # If nest_internal_only is True, skip if the target is the most external node in the event that produced it.
-            '''if self.ctx.nesting == "strict_rectify" and self._check_internality(curr_mt.mt, h2_loc):
+            '''if self.ctx.nesting == "strict_rectify" and self.flow_mgr._check_internality(curr_mt.mt, h2_loc):
                 self.flow_logger.log(f"Nested Fix: Target node '{h2_loc.name}' is root in the smallest event containing it. Skipping due to strict_rectify mode.", 'd')
                 continue'''
 
@@ -408,7 +396,7 @@ class Engine:
                 # We pass the persistent config (which might have parsed ploidies from iter 1)
                 # worker will apply transient updates (output_dir, st, gts) internally
                 _, res, updates, log_inheritance = task_worker(
-                    payload       = (current_st, current_gts, str(i)),
+                    payload       = (current_st, current_gts, (i, None)),
                     context       = self.ctx,      # Pass Global Context
                     config        = perm_tcf,      # Pass updated Task Config 
                     verbosity     = self.ctx.verbosity,
@@ -416,7 +404,7 @@ class Engine:
                     parent_logger = self.flow_logger
                 )
 
-                min_score, min_idx, min_mult = self._unpack_min_res(res)
+                min_score, min_idx, min_mult = res.unpacked_min_mt
                 min_mult_str = min_mult.to_marked_str()
 
                 # Update persistent config for next iteration
@@ -450,7 +438,7 @@ class Engine:
 
         if self.ctx.plot: self.flow_mgr.plot()
         
-        self.flow_logger.log("Fully Sequential Mode Finished.", 'i')
+        self.flow_logger.title_banner("Fully Sequential Mode Finished")
         return current_st, None # Natural finish
 
     def _run_nested_subproblem(self, mem_st: SmrtTree, mem_gts: Dict[int, SmrtTree], h1_str: str, h2_str: str, fix_dir: Path) -> TaskResult:
@@ -591,11 +579,11 @@ class Engine:
             for task_id, res, _, log_inheritance in batch_results:
                 if not res: continue
 
-                min_score, min_idx, min_mult = self._unpack_min_res(res)
+                min_score, min_idx, min_mult = res.unpacked_min_mt
                 min_mult_str = min_mult.to_marked_str()
 
                 # Assimilate the worker's log into the main logger
-                self.flow_logger.assimilate(log_inheritance.log_file)
+                self.flow_logger.assimilate(log_inheritance.log_file, warnings=log_inheritance.warnings)
                 iter_logger = GranLogger(None, self.ctx.verbosity, self.ctx.debug, parent_logger=self.flow_logger, inheritance=log_inheritance)
                 # Logic to determine branching vs termination moved to flow_mgr
                 # Note: We reconstruct path here to avoid passing it back from workers
@@ -631,7 +619,7 @@ class Engine:
 
         if self.ctx.plot: self.flow_mgr.plot()
 
-        self.flow_logger.log("Binary Split Mode Finished.", 'i')
+        self.flow_logger.title_banner("Binary Split Mode Finished")
         return final_tree
 
 def main(args_list: Optional[List[str]] = None, return_results: bool = False) -> Optional[dict]:

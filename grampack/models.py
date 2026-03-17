@@ -1281,10 +1281,17 @@ class TaskResult:
         if self._input_rank == -1: return float('inf')
         # Return tuple item [1] (score), as [0] (index) is always 0
         return self.sorted_scores[self._input_rank][1]
-
+    
+    @property
+    def unpacked_min_mt(self) -> Tuple[int, int, MulTree]:
+        """Returns a tuple of (score, mt_id, mt_object) for easy unpacking of the best performing mt (incl. input)."""
+        min_score = self.mt_score()
+        min_idx = self.mt_idx()
+        min_mult = self.mul_trees[min_idx]
+        return min_score, min_idx, min_mult
 
 # --- Type aliases ---
 
 HistoryType = Dict[Tuple[int, int], Dict[str, Any]]
-ConcurrTask = Tuple[SmrtTree, Dict[int, SmrtTree], Tuple[int, int]]
+ConcurrTask = Tuple[SmrtTree, Dict[int, SmrtTree], Tuple[int, Optional[int]]]
 

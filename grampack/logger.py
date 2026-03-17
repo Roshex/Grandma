@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Optional, Any, NamedTuple
 # This block is ignored at runtime, and solves the circular dependency of typing
 if TYPE_CHECKING:
     from .config import GranMetadata, GlobalContext, TaskConfig
+    from .models import SmrtTree
 
 # Try importing psutil for memory logging
 try:
@@ -40,7 +41,7 @@ class LogInheritance(NamedTuple):
 class GranLogger:
 
     __slots__ = ['log_file', 'no_log', 'label', 'verbosity', 'debug', 'step_start_time', 'parent_logger',
-                 'bench', 'benchmarks', 'start_time', 'warnings', 'step_active', 'step_buffer', 'pids']
+                 'bench', 'benchmarks', 'start_time', 'warnings', 'step_active', 'step_buffer', 'step_interrupt', 'pids']
     
     def __init__(self, log_file: Path, verbosity: int = 4, debug: bool = False,
                  catch_exceptions: bool = True, parent_logger: Optional['GranLogger'] = None,
@@ -73,6 +74,7 @@ class GranLogger:
 
         self.pids = [psutil.Process(os.getpid())] if HAS_PSUTIL else []
         self.step_start_time = 0
+        self.step_interrupt = True
 
         # States for Warning Buffering
         self.step_active = False
@@ -168,10 +170,16 @@ class GranLogger:
                 # Buffer warnings to prevent breaking "In progress..." lines
                 self.step_buffer.append(formatted_msg)
             else:
+                if not self.step_interrupt:
+                    self.step_interrupt = True
+                    print("") # Print newline first to clear "In progress..." line before printing the message
                 print(formatted_msg)
             
         # Kill program on error
         if key == 'e' and kill_on_error:
+            # Flush buffered warnings if any before exiting
+            if self.step_buffer:
+                print("\n".join(self.step_buffer))
             sys.exit(1)
 
     # check the original code for when it was screen printing!
@@ -198,8 +206,10 @@ class GranLogger:
         # Bind the custom handler to Python's global hook
         sys.excepthook = handle_exception
 
-    def assimilate(self, worker_log_path: Path) -> None:
+    def assimilate(self, worker_log_path: Path, warnings: int = 0) -> None:
         """Safely appends a finished worker's log into the main log."""
+        self.warnings += warnings
+
         if not worker_log_path.exists(): 
             return
             
@@ -264,6 +274,7 @@ class GranLogger:
         if status == "In progress...":
             # Step start
             self.step_active = True
+            self.step_interrupt = False
             self.step_buffer = []
 
             self.step_start_time = current_time
@@ -303,7 +314,7 @@ class GranLogger:
             
             # Screen output
             if self.verbosity > 1:
-                if full_update:
+                if full_update or self.step_interrupt:
                     sys.stdout.write("# " + file_line + "\n")
                 else:
                     # Clear "In progress..."
@@ -327,6 +338,7 @@ class GranLogger:
             
             # Write full line to log
             self.log(file_line, 'i', to_screen=False)
+            self.step_interrupt = True
 
     def log_software_banner(self, meta: 'GranMetadata') -> None:
         """Prints the static software info (Authors, DOI, Version)."""
@@ -505,7 +517,8 @@ class GranLogger:
         log_(f"The date and time at the end is: {self.get_date_time()}")
         log_(f"Total execution time:            {round(total_time, 3)} seconds.")
         log_(f"Output directory for this run:   {output_dir}")
-        log_(f"Log file for this run:           {self.log_file}")
+        if not self.no_log:
+            log_(f"Log file for this run:           {self.log_file}")
         if self.bench:
             bench_file = output_dir / f"{fn_prefix}-benchmarks.txt"
             try:
@@ -540,3 +553,54 @@ class GranLogger:
 
         log_("")
         return None # Explicitly return None to reset benchmarks
+
+    def final_report(self, final_tree: Optional['SmrtTree'], ret_tree: Optional[Any], is_iter: bool = False, to_plot: bool = False) -> None:
+        """Prints the overarching global summary for the entire GRANDMA run."""
+        key = 'i' if self.verbosity == 0 else 's'
+        log_ = lambda msg: self.log(msg, key)
+
+        out_dir = self.log_file.parent
+
+        log_("")
+
+        if is_iter:
+            log_("=" * 125)
+            log_("--- ANALYSIS SUMMARY ---")
+            log_("=" * 125)
+            
+            total_time = time.time() - self.start_time
+            log_(f"The date and time at the end is: {self.get_date_time()}")
+            log_(f"Total execution time:            {round(total_time, 3)} seconds.")
+
+            log_(f"Output directory for this run:   {out_dir}")
+            log_(f"Main log file:                   {self.log_file}")
+            
+            plot_file = out_dir / "metrics_plot.png"
+            if to_plot and plot_file.exists():
+                log_(f"Metrics plot saved to:           {plot_file}")
+                
+            if ret_tree is not None:
+                viz_file = out_dir / "final_tree.png"
+                ret_tree.visualize(filename=viz_file, launch=False)
+                log_(f"Tree visualization saved to:     {viz_file}")
+
+        if final_tree:
+            log_(f"Multi -labelled form written to: {out_dir / 'final_multree.tre'}")
+            log_(f"Singly-labelled form written to: {out_dir / 'final_single_label_form.tre'}")
+            log_(f"Enriched Newick form written to: {out_dir / 'final_enriched_newick.tre'} [Not Implemented Yet]")
+
+        if is_iter and self.warnings > 0:
+                log_(f"\n# Pipeline finished with {self.warnings} WARNINGS -- check log file for more info")
+
+        if final_tree:
+            log_("-" * 125)
+            log_("FINAL TREE (Newick):")
+            log_(final_tree.ete_tree.write(format=9))
+            
+            log_("-" * 125)
+            log_("FINAL TREE (ASCII):")
+            log_(final_tree.ete_tree.get_ascii(show_internal=True))
+            log_("")
+
+        log_("=" * 125)
+        log_("")

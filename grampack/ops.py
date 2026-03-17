@@ -69,7 +69,7 @@ class CommonOps:
             except Exception as e:
                 logger.log(f"reading {desc} file '{paths[0]}': {e}", key)
         elif kind == "nonexistent":
-            logger.log(f"{desc} file '{input}' not found.", key)
+            logger.log(f"{desc.capitalize()} file '{input}' not found.", key)
         else:
             logger.log(f"Invalid input type for {desc}.", key)
 
@@ -100,7 +100,7 @@ class CommonOps:
                     logger.log(f"Could not read {p}: {e}", key)
             return content, [f'from {p.name}' for p in paths]
         elif kind == "nonexistent":
-            logger.log(f"{desc} file '{input}' not found.", key)
+            logger.log(f"{desc.capitalize()} file '{input}' not found.", key)
         else:
             logger.log(f"Invalid input type for {desc}.", key)
                 

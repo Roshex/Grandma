@@ -123,7 +123,6 @@ class FlowManager:
             kind = "Splitting" if self.mode == "split" else "Renaming"
             self._debug_tree(f"{kind} Context: {h_nodes[0].name} (H1) | {' | '.join(hx_str)}", nonin_mt.mt.ete_tree, other_attr=['pure'])
 
-        self.logger.log(f"Checking if event ({i}, {j}) passes parsimony cutoff.", 'd')
         self.logger.log(f"Best non-input index: {nonin_idx}; Best index: {best_idx}", 'd')
         self.logger.log(f"Input tree score: {input_score}; Best non-input tree score: {nonin_score}", 'd')
 
@@ -131,7 +130,7 @@ class FlowManager:
 
         if passed:
             if self.mode == "full" and j > 0:
-                self.logger.report_step(step, f"Skip...: nested event assessment deferred")
+                self.logger.report_step(step, f"Skip...: deferred by nested assessment")
             else:
                 self.logger.report_step(step, f"Success: event accepted w/ score {nonin_score}")
         else:
@@ -598,15 +597,12 @@ class FlowManager:
         """
         Recombines results by recursively diving to the innermost subproblems.
         """
-        step = "Recombining Split Results"
-        self.logger.report_step(step, "In progress...", start=True)
+        self.logger.title_banner("Recombining Split Results")
+        self.logger.log("Merging subproblem trees...", 'i')
 
         ft_wrapper = self._iterative_glue(root_id)
-        final_tree = ft_wrapper.ete_tree
-
-        self.logger.log(f"Final Merged Tree: {final_tree.write(format=9)}", 'i')
         
-        self.logger.report_step(step, "Success")
+        self.logger.log("Success: All subproblems merged successfully.", 's')
         return ft_wrapper
 
     def _iterative_glue(self, root_task_id: Tuple[int, int]) -> SmrtTree:
@@ -1046,7 +1042,7 @@ class FlowManager:
         plt.tight_layout()
         output_file = self.ctx.root_dir / 'metrics_plot.png'
         plt.savefig(output_file, dpi=600)
-        self.logger.log(f'Plot saved to {output_file}', 'i')
+        #self.logger.log(f'Plot saved to {output_file}', 'i')
         plt.close()
 
     def _debug_tree(self, title: str, ete_tree: Tree, key='d', other_attr=[]) -> None:
