@@ -428,6 +428,14 @@ class SmrtTree:
             if not node.is_leaf() and not pure.endswith('>'):
                 pure += '>'
             node.add_feature('pure', pure)
+
+    @staticmethod
+    def pure_str(name: str) -> str:
+        if not name: return name
+        base = name.replace("*", "").split('|', 1)[0]
+        if name.endswith('>') and not base.endswith('>'):
+            base += '>'
+        return base
     
     @staticmethod
     def get_sis(node: Optional[Tree]) -> Optional[Tree]:
@@ -534,14 +542,17 @@ class SmrtTree:
                     n.name = n.name.replace(">", f"{tag}>")
         return subtree
 
-    def _tag_and_graft(self, inner_tree: Tree, target: Tree, parent_tag: str, uid: int, copy_id: int) -> Tuple[Tree, Tree]:
+    def _tag_and_graft(self, inner_tree: Tree, target: Tree, parent_tag: str, uid: int, copy_id: int, skip_tagging: bool=False) -> Tuple[Tree, Tree]:
     
+        if skip_tagging:
+            suffix = ''
         # Extract the surrounding suffix if present (returns empty string if root or '|' is missing)
-        suffix = target.up.name if target.up else ''
-        suffix = suffix.partition('|')[2].rstrip('>')
-        suffix = '|' + suffix if suffix else ''
+        else:
+            suffix = target.up.name if target.up else ''
+            suffix = suffix.partition('|')[2].rstrip('>')
+            suffix = '|' + suffix if suffix else ''
 
-        # For copies other than the original, update the parent tag, and preppend the new copy ID to the suffix.
+        # For copies other than the originally named, update the parent tag, and preppend the new copy ID to the suffix.
         if parent_tag.startswith('<P*'):
             parent_tag = f'<P{uid}>'
             suffix = f"|{uid}.{copy_id}{suffix}"
@@ -568,8 +579,13 @@ class SmrtTree:
         for rec in records:
             if not rec.expanded_targets: continue
             targets = rec.expanded_targets
-            for target in targets:
-                outer_tree, graft = self._tag_and_graft(inner_tree, target, rec.parent, uid, rec.copy_id)
+            targets.sort(key=lambda x: len(x.name))
+            for i, target in enumerate(targets):
+                # Check if non-P-node parent was already added with its graft (i.e., the original copy was grafted)
+                is_first_occurrence = (rec.copy_id == 0 and self.get_node(rec.parent) is None)
+                if is_first_occurrence:
+                    assert (i == 0), f"The original copy must be untagged and grafted first (raised for target: {target.name} with graft name {rec.parent})."
+                outer_tree, graft = self._tag_and_graft(inner_tree, target, rec.parent, uid, rec.copy_id, skip_tagging=is_first_occurrence)
                 self.ete_tree = outer_tree
                 self._synch_graft(graft)
         
@@ -578,6 +594,7 @@ class SmrtTree:
             if rec.expanded_targets: continue
             loc_node = self.get_node(rec.corrected)
             targets = self.match(loc_node.pure)
+            targets.sort(key=lambda x: len(x.name))
             for target in targets:
                 outer_tree, graft = self._tag_and_graft(inner_tree, target, rec.parent, uid, rec.copy_id)
                 self.ete_tree = outer_tree

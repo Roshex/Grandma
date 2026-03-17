@@ -800,6 +800,8 @@ class FlowManager:
 
         # --- Expand Locations ---
         for rec in records:
+            # Important: we look for the node name, not node.pure!
+            # If a lookup of node.pure is needed, it means there's some bug in SmrtTree.graft_records() or downstream from it
             loc_node = outer_wrapper.get_node(rec.corrected)
             if loc_node:
                 pure_loc = loc_node.pure
