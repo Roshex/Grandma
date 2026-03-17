@@ -727,7 +727,6 @@ class Reconciler:
                 sorted_scores, _ = self.recon_all(mul_trees, gene_trees, registry, retmap=False)
                 detailed_res = self.get_lowest_maps(sorted_scores, limit, mul_trees, gene_trees, registry, enforce_input_tree)
         finally:
-            self.logger.log("Reconcile failed catastrophically. Check the input trees and parameters.", 'w')
             try:
                 GeneTreeManager(self.tcf, self.logger, self.n_procs, self.pickle_action).handle_pickles()
             except Exception:
