@@ -63,10 +63,6 @@ def task_worker(
     depth, idx = task_id
     task_str = f"{depth}.{idx}" if idx is not None else f"{depth}"
 
-    # BETA: TEMP FIX: If st is a GrandmaTree object (passed from split mode), refresh it
-    if hasattr(st, 'refresh'):
-        st.refresh()
-
     # Ensure ID-specific output directory
     out = context.root_dir / task_str / "output"
     out.mkdir(parents=True, exist_ok=True)
@@ -80,12 +76,7 @@ def task_worker(
         binary_id = None
 
     # Create local TaskConfig for this step
-    iter_tcf = config.update(
-        output_dir=out,
-        st=st,
-        gts=gts,
-        binary_id=binary_id
-    )
+    iter_tcf = config.update(output_dir=out, st=st, gts=gts, binary_id=binary_id)
 
     # Create local GlobalContext (e.g., to override verbosity for workers)
     iter_ctx = context.update(verbosity=verbosity)
@@ -93,11 +84,15 @@ def task_worker(
     # If no parent logger provided (preferred in multiprocessing)
     # create logger without forwarding to parent
     iter_logger = GranLogger(iter_tcf.log_file, verbosity, context.debug, parent_logger=parent_logger, no_log=context.nolog, label=label)
-    iter_logger.start_info(iter_ctx, iter_tcf)
+
+    # BETA: TEMP FIX: If st is a GrandmaTree object (passed from split mode), refresh it
+    if hasattr(st, 'refresh'):
+        st.refresh()
 
     # Execute Task
     # Task.execute returns (StepResult, updates)
     # 'updates' contains ONLY the hydrated persistent config data (parsed ploidies, etc.)
+    iter_logger.start_info(iter_ctx, iter_tcf)
     task = Task(iter_ctx, logger=iter_logger)
     res, updates = task.execute(iter_tcf)
 
@@ -558,9 +553,19 @@ class Engine:
             # Dispatch workers (Workers do not have access to flow_mgr)
             # Use NoDaemonPool to allow the workers to spawn their own internal pools
             # if inner_pool_size > 1.
-            with NoDaemonPool(processes=outer_pool_size) as pool:
-                # starmap blocks until all tasks in this batch are done
-                batch_results = pool.starmap(task_worker, batch_args)
+            try:
+                with NoDaemonPool(processes=outer_pool_size) as pool:
+                    # starmap blocks until all tasks in this batch are done
+                    batch_results = pool.starmap(task_worker, batch_args)
+            # Assimilate all worker logs from this batch to ensure the worker's traceback makes it into the main log
+            except Exception:
+                self.flow_logger.log("A worker process crashed: assimilating batch logs to retrieve traceback...", 'e', kill_on_error=False)
+                for args in batch_args:
+                    task_id = args[0][2]
+                    task_str = f"{task_id[0]}.{task_id[1]}"
+                    worker_log_path = self.ctx.root_dir / task_str / "output" / f"{perm_tcf.run_prefix}.log"
+                    self.flow_logger.assimilate(worker_log_path)
+                raise # Re-raise to trigger main process exit
 
             # Optimizing the Config (The "Split" Trick)
             # If this is the first run, the workers just parsed the ploidies/h-nodes.

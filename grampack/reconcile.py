@@ -726,12 +726,16 @@ class Reconciler:
             else:
                 sorted_scores, _ = self.recon_all(mul_trees, gene_trees, registry, retmap=False)
                 detailed_res = self.get_lowest_maps(sorted_scores, limit, mul_trees, gene_trees, registry, enforce_input_tree)
-        finally:
+
+        except Exception:
+            self.logger.log("Reconcile failed catastrophically: handling pickle files before exiting...", 'e', kill_on_error=False)
             try:
                 GeneTreeManager(self.tcf, self.logger, self.n_procs, self.pickle_action).handle_pickles()
-            except Exception:
-                # Don't re-raise errors from cleanup to avoid masking main results
-                self.logger.log("Failed to clean up pickle files. Please check the pickle directory.", 'w')
+            # Don't re-raise errors from cleanup to avoid masking main results
+            except Exception as cleanup_err:
+                self.logger.log(f"Failed to clean up pickle files during crash recovery: {cleanup_err}", 'w')
+            # Re-raise original exception for logger handling
+            raise
 
         if len(detailed_res) == 2 and max_select == 1 and 0 not in detailed_res:
             # Edge Case: If user requested only 1 tree but the input tree (MUL-tree 0) is not in the top 2,

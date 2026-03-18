@@ -221,7 +221,7 @@ class GranLogger:
 
             # Pass to parent logger if exists (for multi-level workers)
             if self.parent_logger:
-                self.parent_logger.assimilate(worker_log_path)
+                self.parent_logger.assimilate(worker_log_path, warnings)
 
     def space(self, s: Any, width: int) -> str:
         return str(s) + " " * (width - len(str(s)))
