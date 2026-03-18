@@ -761,24 +761,27 @@ class FlowManager:
             rec.aunt = '<invalid>'
 
         # --- Case: target_wgd & target_ils Crawling ---
-
-        # E.g., if y is a loc in (y.1, y.2); or ((a, y.1), y.2);
-        # In both cases, we want to graft only above all y's, because if more than one y is in the tree, it's either:
-        # [a.] an event in parallel [split mode], so it happened **after** the current event (in which case, we crawl up)
-        # [b.] an event from the original input or full mode [in mixed] (here, we mustn't crawl, becasue we want to expand them later)
-        # Thus, [a.] has to be done before expansion, because then we won't get redundant locations!
-        # Because, we only crawl in [a.], we can distinguish it from [b.] by checking the p depth of y.2, hence these 2 main conditions:
-        # [1.] loc.up is an old p (depth < first_uid_of_depth) [distinguish]
-        # [2.] loc.up's other child is either == loc [case t_wgd] or == one of loc's children [case t_ils], by .pure
-        # Then, we crawl up. This needs to be done until conditions are not met!
-        # We check against first_uid_of_depth, because depths have the form, e.g.: [full] 0, 1, 2, [switch to split] 3-6, 7-14...
-        # and we break the crawl if the depth is below current
-        for rec in records:
+        def _crawl_up(loc_node: TreeNode, query_name: str) -> TreeNode:
+            """
+            Crawls up the tree from a specific node to handle target WGD and ILS.
+            Returns the highest valid parent TreeNode.
+            """
+            # E.g., if y is a loc in (y.1, y.2); or ((a, y.1), y.2);
+            # In both cases, we want to graft only above all y's, because if more than one y is in the tree, it's either:
+            # [a.] an event in parallel [split mode], so it happened **after** the current event (in which case, we crawl up)
+            # [b.] an event from the original input or full mode [in mixed] (here, we mustn't crawl, becasue we want to expand them later)
+            # Thus, [a.] has to be done before expansion, because then we won't get redundant locations!
+            # Because, we only crawl in [a.], we can distinguish it from [b.] by checking the p depth of y.2, hence these 2 main conditions:
+            # [1.] loc.up is an old p (depth < first_uid_of_depth) [distinguish]
+            # [2.] loc.up's other child is either == loc [case t_wgd] or == one of loc's children [case t_ils], by .pure
+            # Then, we crawl up. This needs to be done until conditions are not met!
+            # We check against first_uid_of_depth, because depths have the form, e.g.: [full] 0, 1, 2, [switch to split] 3-6, 7-14...
+            # and we break the crawl if the depth is below current
+            current_node = loc_node
+            current_name = query_name
+            
             while True:
-                loc_node = outer_wrapper.get_node(rec.corrected)
-                if not loc_node: break # A delayed wgd loc, will be handled by expansion logic...
-                
-                parent = loc_node.up
+                parent = current_node.up
                 if not parent: break # Nowhere to crawl up to - root reached
                 
                 parent_name = parent.name
@@ -789,14 +792,18 @@ class FlowManager:
                 if int(left_side) < first_uid_of_depth:
                     break # Reached historical depth, stop crawling
                 
-                opts = [loc_node.pure] if loc_node.is_leaf() else [c.pure for c in loc_node.children]
-                loc_sis = outer_wrapper.get_sis(loc_node).pure
+                opts = [current_node.pure] # target_wgd case
+                opts += [c.pure for c in current_node.children if not current_node.is_leaf()] # target_ils case
+                loc_sis = outer_wrapper.get_sis(current_node).pure
                 
                 if loc_sis in opts:
-                    self.logger.log(f"Glue {task_id}: Target WGD/ILS found for '{rec.corrected}' by parent's sister '{loc_sis}'. Crawling to '{parent_name}'.", 'd')
-                    rec.corrected = parent_name
+                    self.logger.log(f"Glue {task_id}: Target WGD/ILS found for '{current_name}' by parent's sister '{loc_sis}'. Crawling to '{parent_name}'.", 'd')
+                    current_node = parent
+                    current_name = parent_name
                 else:
                     break # Correction complete
+                    
+            return current_node
 
         # --- Expand Locations ---
         for rec in records:
@@ -805,11 +812,17 @@ class FlowManager:
             loc_node = outer_wrapper.get_node(rec.corrected)
             if loc_node:
                 pure_loc = loc_node.pure
-                rec.expanded_targets = outer_wrapper.match(pure_loc)
+                corrected = set()
+                potential = outer_wrapper.match(pure_loc)
+                for exp in potential:
+                    corrected.add( _crawl_up(exp, exp.name) )
+                rec.expanded_targets = list(corrected)
                 rec.corrected = pure_loc
+                self.logger.log(f"Glue {task_id}: Expanded corrected location '{rec.corrected}' to {[n.name for n in rec.expanded_targets]}.", 'd')
             else:
                 # Mark as delayed WGD if missing from outer tree
                 rec.expanded_targets = []
+                self.logger.log(f"Glue {task_id}: Corrected location '{rec.corrected}' not found in Outer tree & marked as delayed WGD expansion.", 'd')
 
         self.logger.log(f"Glue {task_id}: Resolved graft locations with corrections: {[str(r) for r in records]}", 'd')
 
@@ -951,7 +964,8 @@ class FlowManager:
                 else:
                     node.name = f"-{node.name}- "
         node_zero = super_root.children[0]
-        node_zero.name = node_zero.name[1:]
+        if not node_zero.is_leaf():
+            node_zero.name = node_zero.name[1:]
 
         # Return string without the first '\n' padding character
         return super_root.get_ascii(show_internal=True)[1:]
