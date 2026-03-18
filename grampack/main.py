@@ -249,15 +249,7 @@ class Engine:
         elif run_mode == "split":
             final_smtree = self.run_split()
         else:
-            res, _ = Task(self.ctx, self.flow_logger).execute(self.tcf)
-            # Extract best SmrtTree if applicable
-            if res:
-                min_score, min_idx, min_mult = res.unpacked_min_mt
-                if run_mode != "st-only":
-                    self.flow_mgr.judge_event(0, 0, res)
-                # Terminal report for single-run modes (single, st-only, no-st)
-                self.flow_logger.end_report(min_score, min_idx, min_mult.to_marked_str())
-                final_smtree = min_mult.mt
+            final_smtree = self.run_noniter()
 
         if final_smtree:
             final_smtree.write_forms(self.ctx.root_dir)
@@ -268,13 +260,23 @@ class Engine:
             orig_tree = TreeLoader.spec_tree(self.tcf, GranLogger.dummy()).ete_tree
             self.flow_logger.final_report(final_smtree, orig_tree, rt, task_tree_ascii, is_iter, self.ctx.plot)
 
-        return_obj = {
+        return {
             'final_tree': final_smtree,
             'history': self.ctx.history,
             'maps': None # to be supported later
         }
-            
-        return return_obj
+
+    def run_noniter(self) -> Optional[SmrtTree]:
+        res, _ = Task(self.ctx, self.flow_logger).execute(self.tcf)
+        # Extract best SmrtTree if applicable
+        if res:
+            min_score, min_idx, min_mult = res.unpacked_min_mt
+            if self.tcf.mode != "st-only":
+                self.flow_mgr.judge_event(0, 0, res)
+            # Terminal report for single-run modes (single, st-only, no-st)
+            self.flow_logger.end_report(min_score, min_idx, min_mult.to_marked_str())
+            return min_mult.mt
+        return None
 
     def run_mixed(self) -> SmrtTree:
         """
@@ -300,6 +302,24 @@ class Engine:
 
         self.flow_mgr.mode = "split"
         return self.run_split(initial_payload=(last_st, last_gts, root_id))
+
+    def _run_nested_subproblem(self, mem_st: SmrtTree, mem_gts: Dict[int, SmrtTree], h1_str: str, h2_str: str, fix_dir: Path) -> TaskResult:
+        """Helper to run a constrained nested fix run."""
+        # Use self.tcf as base, explicitly overriding params
+        # Note: verbosity is passed in a quiet context to the Task.
+        
+        fix_tcf = self.tcf.update(
+                        st = mem_st,
+                        gts = mem_gts,
+                        output_dir=fix_dir,
+                        h1_nodes=h1_str, 
+                        h2_nodes=h2_str,
+                        mode="no-st")
+        
+        # Create a quiet context
+        fix_ctx = self.ctx.update(verbosity=0)
+        
+        return Task(fix_ctx, logger=None).execute(fix_tcf)
         
     def autocorrect(self, targets: List[str], multree: MulTree, genetrees: Dict[int, SmrtTree], iter: int) -> Tuple[MulTree, Dict[int, SmrtTree]]:
         """
@@ -438,24 +458,6 @@ class Engine:
         
         self.flow_logger.title_banner("Fully Sequential Mode Finished")
         return current_st, None # Natural finish
-
-    def _run_nested_subproblem(self, mem_st: SmrtTree, mem_gts: Dict[int, SmrtTree], h1_str: str, h2_str: str, fix_dir: Path) -> TaskResult:
-        """Helper to run a constrained nested fix run."""
-        # Use self.tcf as base, explicitly overriding params
-        # Note: verbosity is passed in a quiet context to the Task.
-        
-        fix_tcf = self.tcf.update(
-                        st = mem_st,
-                        gts = mem_gts,
-                        output_dir=fix_dir,
-                        h1_nodes=h1_str, 
-                        h2_nodes=h2_str,
-                        mode="no-st")
-        
-        # Create a quiet context
-        fix_ctx = self.ctx.update(verbosity=0)
-        
-        return Task(fix_ctx, logger=None).execute(fix_tcf)
     
     def run_split(self, initial_payload: Optional[ConcurrTask] = None) -> SmrtTree:
         """

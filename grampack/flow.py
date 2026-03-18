@@ -903,8 +903,7 @@ class FlowManager:
             else:
                 self.logger.log(f'Unexpected mixed_switch value of 0 for mode {self.mode}.', 'e')
 
-        # Sort tasks by depth, handling None safely by treating it as -1 for sorting
-        sorted_tasks = sorted(self.ctx.history.keys(), key=lambda x: (x[0], x[1] if x[1] is not None else -1))
+        sorted_tasks = sorted(self.ctx.history.keys(), key=lambda x: (x[0], x[1]))
 
         for task_id in sorted_tasks:
             depth, idx = task_id
