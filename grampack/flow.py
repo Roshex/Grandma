@@ -911,19 +911,16 @@ class FlowManager:
             passed = self.ctx.history[task_id].get('passed', False)
             status = "PASS" if passed else "FAIL"
             
-            idx_str = f"{idx}" if idx is not None else "Full"
-            node = TreeNode(name=f"({depth},{idx_str})[{status}]")
+            node = TreeNode(name=f"({depth},{idx})[{status}]")
             nodes[task_id] = node
-            
-            s_idx = idx if idx is not None else 0
 
-            if depth == 0 and s_idx == 0:
+            if depth == 0 and idx == 0:
                 super_root.add_child(node)
             else:
                 # --- Regime Transition Logic ---
                 if depth < mixed_switch:
                     # Full Mode Regime (Including Nested Fixes)
-                    if s_idx > 0:
+                    if idx > 0:
                         # Nested fix: Attach to the immediately preceding task at the SAME depth
                         p_id = last_task_at_depth.get(depth)
                     else:
@@ -936,7 +933,7 @@ class FlowManager:
                     
                 else:
                     # Pure Split Mode Regime (Binary Branching)
-                    p_id = (depth - 1, s_idx // 2)
+                    p_id = (depth - 1, idx // 2)
                     
                 # Safely attach to parent
                 if p_id in nodes:
@@ -948,12 +945,14 @@ class FlowManager:
             last_task_at_depth[depth] = task_id
 
         # Apply stylistic formatting to internal nodes
-        for node in super_root.traverse():
+        for node in super_root.iter_descendants():
             if not node.is_leaf():
                 if len(node.children) == 1:
                     node.name = f"-{node.name}-"
                 else:
                     node.name = f"-{node.name}- "
+        node_zero = super_root.children[0]
+        node_zero.name = node_zero.name[1:]
 
         # Return string without the first '\n' padding character
         return super_root.get_ascii(show_internal=True)[1:]
