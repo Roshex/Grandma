@@ -90,6 +90,22 @@ class GranLogger:
         if catch_exceptions and not self.no_log and self.log_file:
             self.catch_all_exceptions()
 
+    @classmethod
+    def dummy(cls) -> 'GranLogger':
+        """
+        Returns a completely silent dummy logger that bypasses all file I/O 
+        and terminal output. Safe to pass anywhere a GranLogger is expected.
+        """
+        return cls(
+            log_file=None,          # No Path object to accidentally write to
+            verbosity=-1,           # -1 guarantees even level 0 errors ('e') fail the self.verbosity >= level check
+            debug=False,
+            catch_exceptions=False, # Crucial: prevents the dummy from hijacking sys.excepthook
+            no_log=True,            # Bypasses all file open/write blocks
+            clear_log=False,
+            label="dummy"
+        )
+
     @property
     def inheritance(self) -> LogInheritance:
         """Returns the current logger's state for inheritance by follower loggers."""
@@ -554,7 +570,7 @@ class GranLogger:
         log_("")
         return None # Explicitly return None to reset benchmarks
 
-    def final_report(self, final_tree: Optional['SmrtTree'], ret_tree: Optional[Any], is_iter: bool = False, to_plot: bool = False) -> None:
+    def final_report(self, final_tree: Optional['SmrtTree'], ret_tree: Optional[Any], orig_tree: Optional[Any], is_iter: bool = False, to_plot: bool = False) -> None:
         """Prints the overarching global summary for the entire GRANDMA run."""
         key = 'i' if self.verbosity == 0 else 's'
         log_ = lambda msg: self.log(msg, key)
@@ -588,9 +604,13 @@ class GranLogger:
             log_(f"Multi -labelled form written to: {out_dir / 'final_multree.tre'}")
             log_(f"Singly-labelled form written to: {out_dir / 'final_single_label_form.tre'}")
             log_(f"Enriched Newick form written to: {out_dir / 'final_enriched_newick.tre'} [Not Implemented Yet]")
+            if not final_tree.are_all_nodes_unique():
+                self.log("Final tree contains non-unique node labels, which may cause issues for some downstream applications.", 'w')
+            if not final_tree.contains(orig_tree):
+                self.log("The original input species tree topology or node names were NOT perfectly preserved in the final merged tree!", 'w')
 
         if is_iter and self.warnings > 0:
-                log_(f"\n# Pipeline finished with {self.warnings} WARNINGS -- check log file for more info")
+            log_(f"\n# Pipeline finished with {self.warnings} WARNINGS -- check log file for more info")
 
         if final_tree:
             log_("-" * 125)

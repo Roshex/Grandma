@@ -263,7 +263,8 @@ class Engine:
             final_smtree.write_forms(self.ctx.root_dir)
             # Visualize with reticulate tree's built-in function (requires matplotlib)
             rt = final_smtree.to_rt() if self.ctx.debug else None
-            self.flow_logger.final_report(final_smtree, rt, run_mode in ("full", "split", "mixed"), self.ctx.plot)
+            orig_tree = TreeLoader.spec_tree(self.tcf, GranLogger.dummy()).ete_tree
+            self.flow_logger.final_report(final_smtree, rt, orig_tree, run_mode in ("full", "split", "mixed"), self.ctx.plot)
 
         return_obj = {
             'final_tree': final_smtree,

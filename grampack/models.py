@@ -374,6 +374,42 @@ class SmrtTree:
         self.match_map = {}
         self.flat_tree = None # Invalidate flat tree on structural change
 
+    def are_all_nodes_unique(self) -> bool:
+        """Checks if all nodes have unique names (not pure)."""
+        seen = set()
+        for node in self.ete_tree.traverse():
+            if node.name in seen:
+                return False
+            seen.add(node.name)
+        return True
+    
+    def contains(self, original_tree: Tree) -> bool:
+        """
+        Verifies that the original tree's topology and exact node names 
+        are perfectly preserved within this tree's structure.
+        """
+        # Verify all original names (internal and leaf) are still in the tree
+        orig_names = {n.name for n in original_tree.traverse() if n.name}
+        self_names = {n.name for n in self.ete_tree.traverse() if n.name}
+
+        if not orig_names.issubset(self_names):
+            return False
+
+        # Prune a copy of self down to only the original leaves
+        orig_leaves = original_tree.get_leaf_names()
+        tree_copy = self.ete_tree.copy()
+        
+        try:
+            tree_copy.prune(orig_leaves, preserve_branch_length=False)
+        except Exception:
+            return False
+
+        # Compare topologies using Robinson-Foulds distance
+        # unrooted_trees=False ensures the rooted topology is compared correctly
+        rf, rf_max, common_attrs, edges_t1, edges_t2, dis_edges_t1, dis_edges_t2 = tree_copy.robinson_foulds(original_tree, unrooted_trees=False)
+        
+        return rf == 0
+
     def _clear_dead(self, affected_nodes: Dict[str, Set[str]]) -> None:
         """
         Removes affected nodes from caches after structural modifications.
