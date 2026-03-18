@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Optional, Any, NamedTuple
 # This block is ignored at runtime, and solves the circular dependency of typing
 if TYPE_CHECKING:
     from .config import GranMetadata, GlobalContext, TaskConfig
-    from .models import SmrtTree
+    from .models import SmrtTree, Tree
 
 # Try importing psutil for memory logging
 try:
@@ -570,7 +570,12 @@ class GranLogger:
         log_("")
         return None # Explicitly return None to reset benchmarks
 
-    def final_report(self, final_tree: Optional['SmrtTree'], ret_tree: Optional[Any], orig_tree: Optional[Any], is_iter: bool = False, to_plot: bool = False) -> None:
+    def final_report(self,
+                     final_tree: 'SmrtTree',
+                     orig_tree: 'Tree',
+                     ret_tree: Optional[Any],
+                     task_tree_ascii: Optional[str], 
+                     is_iter: bool = False, to_plot: bool = False) -> None:
         """Prints the overarching global summary for the entire GRANDMA run."""
         key = 'i' if self.verbosity == 0 else 's'
         log_ = lambda msg: self.log(msg, key)
@@ -600,27 +605,30 @@ class GranLogger:
                 ret_tree.visualize(filename=viz_file, launch=False)
                 log_(f"Tree visualization saved to:     {viz_file}")
 
-        if final_tree:
-            log_(f"Multi -labelled form written to: {out_dir / 'final_multree.tre'}")
-            log_(f"Singly-labelled form written to: {out_dir / 'final_single_label_form.tre'}")
-            log_(f"Enriched Newick form written to: {out_dir / 'final_enriched_newick.tre'} [Not Implemented Yet]")
-            if not final_tree.are_all_nodes_unique():
-                self.log("Final tree contains non-unique node labels, which may cause issues for some downstream applications.", 'w')
-            if not final_tree.contains(orig_tree):
-                self.log("The original input species tree topology or node names were NOT perfectly preserved in the final merged tree!", 'w')
+        if is_iter:
+            log_("-" * 125)
+            log_("TASK EXECUTION GRAPH (Problem Tree):")
+            self.log(task_tree_ascii, key, prefix="")
+
+        log_(f"Multi -labelled form written to: {out_dir / 'final_multree.tre'}")
+        log_(f"Singly-labelled form written to: {out_dir / 'final_single_label_form.tre'}")
+        log_(f"Enriched Newick form written to: {out_dir / 'final_enriched_newick.tre'} [Not Implemented Yet]")
+        if not final_tree.are_all_nodes_unique():
+            self.log("Final tree contains non-unique node labels, which may cause issues for some downstream applications.", 'w')
+        if not final_tree.contains(orig_tree):
+            self.log("The original input species tree topology or node names were NOT perfectly preserved in the final merged tree!", 'w')
 
         if is_iter and self.warnings > 0:
             log_(f"\n# Pipeline finished with {self.warnings} WARNINGS -- check log file for more info")
 
-        if final_tree:
-            log_("-" * 125)
-            log_("FINAL TREE (Newick):")
-            log_(final_tree.ete_tree.write(format=9))
-            
-            log_("-" * 125)
-            log_("FINAL TREE (ASCII):")
-            log_(final_tree.ete_tree.get_ascii(show_internal=True))
-            log_("")
+        log_("-" * 125)
+        log_("FINAL TREE (Newick):")
+        log_(final_tree.ete_tree.write(format=9))
+        
+        log_("-" * 125)
+        log_("FINAL TREE (ASCII):")
+        log_(final_tree.ete_tree.get_ascii(show_internal=True))
+        log_("")
 
         log_("=" * 125)
         log_("")

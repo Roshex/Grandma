@@ -880,6 +880,84 @@ class FlowManager:
     
     # --- Output methods ---
 
+    def create_problem_tree_ascii(self) -> str:
+        """
+        Reconstructs the execution history into a visual ETE3 ASCII tree.
+        Shows pass/fail status and correctly roots orphaned tasks.
+        """
+        if not self.ctx.history:
+            return "No tasks recorded."
+
+        # Create a virtual super-root to hold the (0,0) start
+        super_root = TreeNode(name="<RUN_START>")
+        nodes = {}
+        last_task_at_depth = {}
+
+        mixed_switch = self.ctx.mixed_switch
+        if mixed_switch == 0:
+            if self.mode == 'split':
+                mixed_switch = 0
+            elif self.mode == 'full':
+                mixed_switch = float('inf')
+            # Any other iterative mode shouldn't have mixed_switch == 0
+            else:
+                self.logger.log(f'Unexpected mixed_switch value of 0 for mode {self.mode}.', 'e')
+
+        # Sort tasks by depth, handling None safely by treating it as -1 for sorting
+        sorted_tasks = sorted(self.ctx.history.keys(), key=lambda x: (x[0], x[1] if x[1] is not None else -1))
+
+        for task_id in sorted_tasks:
+            depth, idx = task_id
+            passed = self.ctx.history[task_id].get('passed', False)
+            status = "PASS" if passed else "FAIL"
+            
+            idx_str = f"{idx}" if idx is not None else "Full"
+            node = TreeNode(name=f"({depth},{idx_str})[{status}]")
+            nodes[task_id] = node
+            
+            s_idx = idx if idx is not None else 0
+
+            if depth == 0 and s_idx == 0:
+                super_root.add_child(node)
+            else:
+                # --- Regime Transition Logic ---
+                if depth < mixed_switch:
+                    # Full Mode Regime (Including Nested Fixes)
+                    if s_idx > 0:
+                        # Nested fix: Attach to the immediately preceding task at the SAME depth
+                        p_id = last_task_at_depth.get(depth)
+                    else:
+                        # First task at depth: Attach to the final task of the PREVIOUS depth
+                        p_id = last_task_at_depth.get(depth - 1)
+                        
+                elif depth == mixed_switch:
+                    # Regime Transition: The Split binary fan-out originates from the final Full mode task
+                    p_id = last_task_at_depth.get(depth - 1)
+                    
+                else:
+                    # Pure Split Mode Regime (Binary Branching)
+                    p_id = (depth - 1, s_idx // 2)
+                    
+                # Safely attach to parent
+                if p_id in nodes:
+                    nodes[p_id].add_child(node)
+                else:
+                    super_root.add_child(node) # Fallback for malformed history
+
+            # Update the tracker so the next task knows exactly what just finished!
+            last_task_at_depth[depth] = task_id
+
+        # Apply stylistic formatting to internal nodes
+        for node in super_root.traverse():
+            if not node.is_leaf():
+                if len(node.children) == 1:
+                    node.name = f"-{node.name}-"
+                else:
+                    node.name = f"-{node.name}- "
+
+        # Return string without the first '\n' padding character
+        return super_root.get_ascii(show_internal=True)[1:]
+
     def plot(self):
         import matplotlib.pyplot as plt
         from matplotlib.ticker import MaxNLocator, FixedLocator
