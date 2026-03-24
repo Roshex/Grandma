@@ -1020,6 +1020,92 @@ class SmrtTree:
         self.ete_tree = state
         self.refresh()
 
+@dataclass(slots=True)
+class TreeCache:
+    """O(1) Data structure holding the global tree and precomputed global state for ploidy constraints. Lazy loaded on demand."""
+    st: SmrtTree
+    populated: bool = field(default=False, init=False)
+    ploidy_stats: Optional[Dict[str, Tuple[int, int]]] = None
+    clade_counts: Optional[Dict[str, Dict[str, int]]] = None
+
+    def populate(self, ploidies: Dict[str, int], is_strict: bool) -> None:
+        if not self.populated:
+            self.ploidy_stats = self.compute_ploidy_stats(self.st, ploidies, is_strict)
+            self.clade_counts = self.st.clade_pure_counts
+            self.populated = True
+
+    @staticmethod
+    def _count_effective_lineages(tree: Tree) -> Dict[str, Tuple[int, int]]:
+        """
+        Counts effective lineages for each species in the current ST.
+        Populates self.ploidy_stats: {species: (number_of_pure_groups, max_size_of_pure_group)}
+        Logic:
+        1. Pure Groups: A clade where all descendants are the same species.
+        2. Polytomies: Siblings of the same pure species at a mixed node are aggregated 
+           into a single 'group' (e.g., (x,x,y) counts as one x-group of size 2).
+        3. Nested Pure Groups: Only the maximal pure group is counted (e.g., ((x,x),x) is 1 group of size 3).
+        """
+        counts: Dict[str, List[int]] = {}
+        node_states = {} # Cache: node -> (pure_species, size) or None
+        
+        for node in tree.traverse("postorder"):
+            if node.is_leaf():
+                node_states[node] = (node.pure, 1)
+                continue
+                
+            child_states = [node_states[c] for c in node.children]
+            first_sp = child_states[0][0] if child_states and child_states[0] else None
+            
+            all_same = True
+            total_size = 0
+            
+            for state in child_states:
+                if state is None or state[0] != first_sp:
+                    all_same = False
+                if state is not None:
+                    total_size += state[1]
+                    
+            if all_same and first_sp is not None:
+                node_states[node] = (first_sp, total_size)
+            else:
+                # Mixed clade: finalize pure children
+                current_level_groups: Dict[str, int] = {}
+                for state in child_states:
+                    if state is not None:
+                        sp, size = state
+                        current_level_groups[sp] = current_level_groups.get(sp, 0) + size
+                
+                # Update global counts
+                for sp, size in current_level_groups.items():
+                    if sp not in counts: counts[sp] = [0, 0]
+                    counts[sp][0] += 1
+                    if size > counts[sp][1]: counts[sp][1] = size
+                
+                node_states[node] = None
+
+        # Handle Root State
+        root_state = node_states.get(tree)
+        if root_state is not None:
+            sp, size = root_state
+            if sp not in counts: counts[sp] = [0, 0]
+            counts[sp][0] += 1
+            if size > counts[sp][1]: counts[sp][1] = size
+
+        return {k: tuple(v) for k, v in counts.items()}
+        
+    @staticmethod
+    def compute_ploidy_stats(st: SmrtTree, ploidies: Dict[str, int], is_strict: bool) -> Dict[str, Tuple[int, int]]:
+        if is_strict:
+            # Strict Mode
+            ploidy_stats = {}
+            for sp in ploidies.keys():
+                count = len(st.match(sp))
+                ploidy_stats[sp] = (count, 1 if count > 0 else 0)
+            return ploidy_stats
+        else:
+            # Lineage-Based Mode
+            return TreeCache._count_effective_lineages(st.ete_tree)
+        
 @dataclass(slots=True, frozen=True)
 class MulTree:
     mt: SmrtTree

@@ -15,7 +15,7 @@ from typing import Optional, Tuple, Dict, Any, Union, List
 from dataclasses import dataclass, field, replace, fields
 
 from .logger import GranLogger
-from .models import SmrtTree, HistoryType
+from .models import SmrtTree, HistoryType, TreeCache
 
 import datetime
 
@@ -145,8 +145,7 @@ class TaskConfig:
 
     # --- Global State Tracking ---
     # For Split/Mixed mode ploidy constraints
-    global_ploidy_stats: Optional[Dict[str, Tuple[int, int]]] = None
-    global_spec_tree: Optional[SmrtTree] = None
+    global_tree_cache: Optional[TreeCache] = None
     # For MulTree inputs with pre-defined reconciliations
     predefined_rets: Dict[int, List[Tuple[str, str]]] = field(default_factory=dict)
 

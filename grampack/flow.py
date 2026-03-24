@@ -597,18 +597,14 @@ class FlowManager:
         """
         Recombines results by recursively diving to the innermost subproblems.
         """
-        if is_silent:
-            original_logger = self.logger
-            self.logger = GranLogger.dummy()
-        self.logger.title_banner("Recombining Split Results")
-        self.logger.log("Merging subproblem trees...", 'i')
+        with self.logger.silenced(is_silent):
+            self.logger.title_banner("Recombining Split Results")
+            self.logger.log("Merging subproblem trees...", 'i')
 
-        ft_wrapper = self._iterative_glue(root_id)
-        
-        self.logger.log("Success: All subproblems merged successfully.", 's')
-        if is_silent:
-            self.logger = original_logger
-        return ft_wrapper
+            ft_wrapper = self._iterative_glue(root_id)
+            
+            self.logger.log("Success: All subproblems merged successfully.", 's')
+            return ft_wrapper
 
     def _iterative_glue(self, root_task_id: Tuple[int, int]) -> SmrtTree:
         """

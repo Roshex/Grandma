@@ -8,6 +8,7 @@ import time
 import datetime
 import traceback
 from pathlib import Path
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional, Any, NamedTuple
 
 # This block is ignored at runtime, and solves the circular dependency of typing
@@ -89,6 +90,32 @@ class GranLogger:
 
         if catch_exceptions and not self.no_log and self.log_file:
             self.catch_all_exceptions()
+
+    @contextmanager
+    def silenced(self, mute: bool = True):
+        """
+        Context manager to temporarily silence the logger safely.
+        If condition is True, suppresses all output within the 'with' block.
+        """
+        if mute:
+            # Save the original state
+            original_debug = self.debug
+            original_no_log = self.no_log
+            original_verbosity = self.verbosity
+            
+            # Mute the logger
+            self.debug = False
+            self.no_log = True
+            self.verbosity = -1
+            
+        try:
+            yield self
+        finally:
+            if mute:
+                # Guarantee restoration of the original state
+                self.debug = original_debug
+                self.no_log = original_no_log
+                self.verbosity = original_verbosity
 
     @classmethod
     def dummy(cls) -> 'GranLogger':
@@ -483,7 +510,7 @@ class GranLogger:
                     log_(space("Ploidy constraint input:", pad) + ploidies_str)
                     log_(space("Ploidy constraint behavior:", pad) + "Strict" if ctx.strict_max else "Lineage-based")
                     if is_task and mode in ("split", "mixed"):
-                        log_(space("Global ploidy stats:", pad) + str("On" if tcf.global_ploidy_stats is not None else "Off"))
+                        log_(space("Global tree cache:", pad) + str("On" if tcf.global_tree_cache is not None else "Off"))
                 log_(space("Redundant MT filter:", pad) + str("Off" if ctx.allow_redun else "On"))
                 if ctx.nesting == "model" and mode not in ("full", "mixed"):
                     log_(space("Nestedness behavior:", pad) + str(ctx.nesting).capitalize())

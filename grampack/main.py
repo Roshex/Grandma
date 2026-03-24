@@ -21,7 +21,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union, Set
 from .config import InitParser, GlobalContext, TaskConfig
 from .flow import FlowManager
 from .logger import GranLogger, LogInheritance
-from .models import SmrtTree, MulTree, NameRegistry, TaskResult, HistoryType, ConcurrTask
+from .models import SmrtTree, MulTree, NameRegistry, TaskResult, HistoryType, ConcurrTask, TreeCache
 from .ops import TreeLoader, GeneTreeManager, MulTreeManager
 from .orthology import OrthologyLabeler
 from .reconcile import Reconciler
@@ -501,16 +501,13 @@ class Engine:
         # Adjust depth display if resuming deep
         depth = current_tasks[0][2][0] if current_tasks else 0
 
-        # --- NEW: Hydrate Global State on Resume ---
+        # Hydrate Global State on Resume
         if depth > 0 and perm_tcf.ploidies:
             self.flow_logger.log(f"Resume detected at depth {depth}. Reconstructing global state...", 'i')
             current_global_tree = self.flow_mgr.glue_split_results(root_task_id, is_silent=True)
-            global_ploidy_stats = MulTreeManager.compute_ploidy_stats(current_global_tree, perm_tcf.ploidies, self.ctx.strict_max)
             perm_tcf = perm_tcf.update(
-                global_ploidy_stats=global_ploidy_stats,
-                global_spec_tree=current_global_tree
+                global_tree_cache=TreeCache(current_global_tree)
             )
-        # -----------------------------------------
 
         max_iter = self.ctx.max_iter
         iter_labeller = lambda it: f"Branch {it[0]}.{it[1]}"
@@ -631,7 +628,7 @@ class Engine:
 
             current_tasks = next_tasks
 
-            # --- NEW: Intermediate Gluing for Exact Ploidy & Debugging ---
+            # Intermediate Gluing for Exact Ploidy & Debugging
             if current_tasks and perm_tcf.ploidies:
                 self.flow_logger.log(f"Reconstructing global tree at depth {depth} for exact ploidy tracking", 'd')
                 
@@ -643,13 +640,9 @@ class Engine:
                     f.write(current_global_tree.to_str(internals=True) + "\n")'''
                 self.flow_logger.log(current_global_tree.ete_tree.get_ascii(show_internal=True, attributes=['name', 'pure']), 'd')
                 
-                # Update perm_tcf so the next depth workers get the global stats
-                global_ploidy_stats = MulTreeManager.compute_ploidy_stats(current_global_tree, perm_tcf.ploidies, self.ctx.strict_max)
-                if self.ctx.debug:
-                    self.flow_logger.log(f"Global Ploidy Stats at Depth {depth}:\n{global_ploidy_stats}", 'd')
+                # Update perm_tcf so the next depth workers get the global tree
                 perm_tcf = perm_tcf.update(
-                    global_ploidy_stats=global_ploidy_stats,
-                    global_spec_tree=current_global_tree
+                    global_tree_cache=TreeCache(current_global_tree)
                 )
 
             depth += 1
