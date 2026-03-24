@@ -7,13 +7,13 @@ import multiprocessing as mp
 from tqdm import tqdm
 from pathlib import Path
 from shutil import rmtree, make_archive, unpack_archive
-from itertools import chain
+from itertools import chain, combinations
 from functools import partial
 from typing import Tuple, List, Optional, Dict, Union, Set
 
 from .config import TaskConfig
 from .logger import GranLogger
-from .models import Tree, SmrtTree, MulTree, GroupData, NameRegistry
+from .models import Tree, SmrtTree, MulTree, GroupData, NameRegistry, splitSpec
 
 class CommonOps:
     @staticmethod
@@ -23,14 +23,14 @@ class CommonOps:
         return tree_str if tree_str.endswith(';') else tree_str + ';'
 
     @staticmethod
-    def write_handoff_files(dir: Path, st: Tree=None, gts: Optional[List[Tree]]=None):
+    def export_tree_files(dir: Path, st: Tree=None, gts: Optional[List[Tree]]=None, suffix: str="") -> None:
         """Writes the trees to disk to allow inspection/resume, matching iter_mode.py."""
         if st:
-            st_path = dir / 'multree.tre'
+            st_path = dir / f'multree{suffix}.tre'
             with open(st_path, 'w') as f:
                 f.write(SmrtTree._to_str(st, internals=True) + '\n')
         if gts:
-            gt_path = dir / 'genetrees.txt'
+            gt_path = dir / f'genetrees{suffix}.txt'
             with open(gt_path, 'w') as f:
                 for gt in gts: f.write(SmrtTree._to_str(gt, internals=True) + '\n')
 
@@ -111,7 +111,7 @@ class TreeLoader:
     _SANITIZE_TRANS = str.maketrans('_.', '--') # Replace any chars in '_.' with '-'
 
     @staticmethod
-    def spec_tree(tcf: TaskConfig, logger: GranLogger) -> Optional[SmrtTree]:
+    def spec_tree(tcf: TaskConfig, logger: GranLogger, root_str: Optional[str] = None) -> Optional[SmrtTree]:
 
         if isinstance(tcf.st, SmrtTree):
             # Do nothing, already loaded
@@ -120,7 +120,9 @@ class TreeLoader:
             logger.report_step(step, "Success: species tree loaded")
             return tcf.st
 
-        step = "Reading species tree"
+        repair = True if tcf.repair in ('fast', 'best') else False
+        repair_str = " & repairing" if repair else ""
+        step = f"Reading{repair_str} species tree"
         logger.report_step(step, "In progress...")
 
         # Input Validation
@@ -144,14 +146,22 @@ class TreeLoader:
         except Exception as e:
             logger.log(f"reading species tree file: {e}", 'e')
 
-        # Topology Fixes & Checks (Polytomies, Rooting)
+        if root_str and not TreeLoader.root_on_str(t, root_str):
+            logger.log(f"Could not root species tree on provided root: '{root_str}' - skipping.", 'w')
+
+        # Fixes & Checks
         # We error on ST issues unless repair is requested, as ST must be robust.
-        is_valid, msg = TreeLoader._fix_and_validate_topology(t, tcf.repair)
+        is_valid, msg = TreeLoader._check_and_fix_names(t, repair, kind="st")
         if not is_valid:
             logger.log(f"Species tree invalid: {msg}", 'e')
 
-        if tcf.repair:
-            CommonOps.write_handoff_files(tcf.output_dir, st=t)
+        # Topology (Polytomies, Rooting)
+        is_valid, msg = TreeLoader._check_and_fix_topology(t, repair)
+        if not is_valid:
+            logger.log(f"Species tree invalid: {msg}", 'e')
+
+        if repair or root_str:
+            CommonOps.export_tree_files(tcf.output_dir, st=t, suffix="_repaired")
 
         logger.report_step(step, "Success: species tree read")
         st_wrapper = SmrtTree(tree_obj=t)
@@ -164,22 +174,35 @@ class TreeLoader:
         return st_wrapper
 
     @staticmethod
-    def gene_trees(tcf: TaskConfig, logger: GranLogger) -> Optional[Dict[int, SmrtTree]]:
+    def gene_trees(tcf: TaskConfig, logger: GranLogger, ref: SmrtTree,
+                registry: Optional[NameRegistry] = None) -> Optional[Dict[int, SmrtTree]]:
 
         if isinstance(tcf.gts, dict):
             step = "Loading gene trees from memory"
             logger.report_step(step, "In progress...")
             logger.report_step(step, f"Success: {len(tcf.gts)} gene trees loaded")
             return tcf.gts
-
-        step = "Reading gene trees"
+        
+        if tcf.repair in ('fast', 'best'):
+            repair = True
+            name_fixer = partial(TreeLoader._check_and_fix_names, repair=True, ref=ref)
+            if tcf.repair == 'best':
+                topo_fixer = partial(TreeLoader._check_and_fix_topology, repair=True, ref=ref, weights=tcf.weights, registry=registry)
+            else:
+                topo_fixer = partial(TreeLoader._check_and_fix_topology, repair=True)
+        else:
+            repair = False
+            name_fixer = partial(TreeLoader._check_and_fix_names, repair=False)
+            topo_fixer = partial(TreeLoader._check_and_fix_topology, repair=False)
+        repair_str = " & repairing" if repair else ""
+        step = f"Reading{repair_str} gene trees"
         logger.report_step(step, "In progress...")
 
         # Input Validation
         if tcf.gts is None:
-            if tcf.mode in ('build-mts', 'count-mts', 'label-sp'):
+            if tcf.mode in ('build-mts', 'count-mts', 'label-sp', 'repair'):
                 logger.report_step(step, f"Skipped: '{tcf.mode}' mode")
-                return {}
+                return None if tcf.mode == 'repair' else {}
             else:
                 logger.log(f"Gene trees input is missing. Required in all modes except 'build-mts' (here: '{tcf.mode}' mode).", 'e')
 
@@ -208,77 +231,267 @@ class TreeLoader:
                 logger.log(f"Error reading tree {origin}! -- Filtering.", 'w')
                 continue
 
-            # Topology Repair/Check
-            is_valid, msg = TreeLoader._fix_and_validate_topology(gt, tcf.repair)
+            # Label Repair/Check
+            is_valid, msg = name_fixer(gt)
             if not is_valid:
                 logger.log(f"Gene tree {origin}: {msg} -- Filtering.", 'w')
                 continue
 
-            # Tips Repair/Check } if tcf.repair
-            #TreeLoader._repair_tips(gt)
-
-            # Taxa Repair/Check } if tcf.repair
-            '''gt_taxa = set(gt.ete_tree.iter_leaf_names())
-            if not gt_taxa.issubset(st_taxa):
-                # Optionally, prune here if fixing is enabled? 
-                # For now, strict filtering based on prompts.
-                logger.write(f"Warning: Gene tree {origin} contains taxa not in Species Tree -- Filtering.")
-                continue'''
+            # Topology Repair/Check
+            is_valid, msg = topo_fixer(gt)
+            if not is_valid:
+                logger.log(f"Gene tree {origin}: {msg} -- Filtering.", 'w')
+                continue
 
             valid_gts.append(gt)
 
         if len(valid_gts) == 0:
             logger.log(f"No valid gene trees survived filtering (required in {tcf.mode} mode).", 'e')
         
-        if tcf.repair:
-            CommonOps.write_handoff_files(tcf.output_dir, gts=valid_gts)
+        if repair:
+            CommonOps.export_tree_files(tcf.output_dir, gts=valid_gts, suffix="_repaired")
                 
         logger.report_step(step, f"Success: {len(valid_gts)} gene trees read")
+        if tcf.mode == "repair":
+            logger.log("Repair Mode finished successfully: repaired trees have been exported. Exiting...", 'i')
+            return None
+
         return {idx: SmrtTree(tree_obj=gt) for idx, gt in enumerate(valid_gts)}
 
-    # --- Helpers ---
+    # --- Structural Repair Algorithms ---
 
     @staticmethod
-    def _fix_and_validate_topology(t: Tree, attempt_fix: bool) -> Tuple[bool, str]:
+    def remove_knuckles(t: Tree) -> None:
+        """Removes unary internal nodes to ensure pure bifurcations."""
+        def transfer_props_before_removal(n: Tree) -> None:
+            """Transfers properties from n1 to n2 if n2 is empty."""
+            p = n.up
+            if n.name and not p.name:
+                p.name = n.name
+            if n.dist not in (None, 0.0) and p.dist not in (None, 0.0):
+                p.dist += n.dist
+            if n.support and p.support:
+                p.support = min(n.support, p.support)
+
+        for n in list(t.traverse("postorder")):
+            if not n.is_leaf() and len(n.children) == 1 and not n.is_root():
+                # If has name, transfer to the parent (if has no name)
+                transfer_props_before_removal(n)
+                n.delete(prevent_nondicotomic=False)
+        
+        # Safely resolve root knuckle if present
+        if len(t.children) == 1:
+            transfer_props_before_removal(child)
+            child = t.children[0]
+            child.detach()
+            for c in list(child.children):
+                t.add_child(c.detach())
+
+    @staticmethod
+    def check_topology(t: Tree) -> bool:
+        """Checks bifurcation and root legality"""
+        if not t.is_root():
+            return False
+        has_defects = any(len(n.children) != 2 for n in t.traverse() if not n.is_leaf())
+        if has_defects:
+            return False
+        return True
+    
+    @staticmethod
+    def root_on_str(t: Tree, root: str) -> bool:
+        """Attempts to root on a candidate name, returns success."""
+        if ',' in root:
+            clade = root.split(',')
+            clade = [t.search_nodes(name=c.strip())[0] for c in clade if t.search_nodes(name=c.strip())]
+            if not clade:
+                return False
+            lca = t.get_common_ancestor(clade)
+            t.set_outgroup(lca)
+            return True
+        else:
+            clade = t.search_nodes(name=root.strip())
+            if clade:
+                t.set_outgroup(clade[0])
+                return True
+        return False
+
+    @staticmethod
+    def _check_and_fix_topology(t: Tree, repair: bool,
+                                   ref: Optional[SmrtTree] = None,
+                                   weights: Optional[Tuple[int, int]] = None,
+                                   registry: Optional[NameRegistry] = None) -> Tuple[bool, str]:
         """
         Checks for polytomies and unrooted-ness.
-        If attempt_fix is True, resolves polytomies and midpoint roots (if needed).
         """
+        # Standardize by removing knuckles
+        TreeLoader.remove_knuckles(t)
+
         # Rooting
         # ETE3 logic: unrooted trees often loaded as rooted with trifurcation at top.
         # If we just resolved polytomies, we might have arbitrarily binary-ized the root.
-        # A simple check: leaves = internal + 1 is true for any binary tree.
-        # We mainly ensure it effectively acts rooted.
-        if len(t.children) > 2 or not t.get_tree_root():
-            if attempt_fix:
-                # Quickest fix for unrooted top-level polytomy
-                t.resolve_polytomy() 
+        if len(t.children) > 2:
+            if repair:
+                if ref is not None:
+                    TreeLoader.root_by_recon(t, ref, weights, registry)
+                else:
+                    t.resolve_polytomy(recursive=False)
             else:
                 return False, "Tree root is not rooted"
 
-        # 2. Rooting via (Num Internal = Num Tips - 1)
-        # Note: ETE3 handles rooting differently, but strict bifurcating tree property holds:
-        # Leaves = N, Internal = N-1.
-        leaves = len(t)
-        internal = sum(not n.is_leaf() for n in t.traverse())
-        if internal != (leaves - 1):
-            # This usually happens if the root has only 2 children? 
-            # Actually for rooted bifurcating: N leaves -> N-1 internal (including root).
-            pass
-
         # Polytomies
-        has_poly = False
-        for n in t.traverse():
-            if len(n.children) > 2:
-                has_poly = True
-                break
-        if has_poly:
-            if attempt_fix:
-                t.resolve_polytomy(recursive=True)
+        has_polytomies = any(len(n.children) > 2 for n in t.traverse())
+        if has_polytomies:
+            if repair:
+                if ref is not None:
+                    TreeLoader.resolve_polytomies_by_recon(t, ref, weights, registry)
+                else:
+                    t.resolve_polytomy(recursive=True)
             else:
                 return False, "Tree contains non-bifurcating nodes"
 
         return True, ""
+
+    @staticmethod
+    def _score_topology(test_gt: Tree, st_wrapper: SmrtTree, dup_cost: int, loss_cost: int, registry: NameRegistry) -> int:
+        """
+        Leverages the highly optimized FlatTree engine in reconcile.py to score a topology.
+        MATHEMATICAL SAFEGUARD: Because recon_lca_optimized strictly assumes bifurcating trees,
+        we must temporarily binarize any remaining polytomies (e.g., ancestors when resolving bottom-up)
+        so the scoring engine doesn't silently ignore 3rd+ children and drop lineages.
+        """
+        from .reconcile import Reconciler  # Dynamic import avoids circular dependency
+        from .models import SmrtTree
+        
+        # Flatten the species tree once if it hasn't been already
+        if not st_wrapper.flat_tree:
+            st_wrapper.make_flat(registry)
+            
+        # 1. Create a sandbox copy to avoid modifying the actual permutation we are testing
+        temp_gt = test_gt.copy(method="cpickle")
+        
+        # 2. Force strictly bifurcating structure for the FlatTree array math
+        temp_gt.resolve_polytomy(recursive=True)
+        TreeLoader.remove_knuckles(temp_gt)
+        
+        # 3. Wrap, flatten, and score safely
+        temp_wrapper = SmrtTree(tree_obj=temp_gt)
+        temp_wrapper.make_flat(registry)
+        
+        return Reconciler.recon_lca_optimized(temp_wrapper.flat_tree, st_wrapper.flat_tree, dup_cost, loss_cost)
+
+    @staticmethod
+    def root_by_recon(gt: Tree, st_wrapper: SmrtTree, weights: Tuple[int, int], registry: NameRegistry) -> None:
+        """Notung Algorithm: Reroots unrooted GT by testing every edge and picking minimum D/L score."""
+        best_score = float('inf')
+        best_edge_node_id = None
+        
+        # Tag original nodes to track them across deep copies
+        for i, n in enumerate(gt.traverse()):
+            n.add_feature("temp_id", i)
+            
+        dup_cost, loss_cost = weights
+        root = gt.get_tree_root()
+        for edge_target in gt.traverse():
+            if edge_target == root: continue
+            
+            test_gt = gt.copy()
+            target_in_test = test_gt.search_nodes(temp_id=edge_target.temp_id)[0]
+            
+            # Reroot and clean
+            test_gt.set_outgroup(target_in_test)
+            TreeLoader.remove_knuckles(test_gt)
+            
+            # Score using reconcile.py
+            score = TreeLoader._score_topology(test_gt, st_wrapper, dup_cost, loss_cost, registry)
+            
+            if score < best_score:
+                best_score = score
+                best_edge_node_id = edge_target.temp_id
+                
+        # Apply the optimal root
+        if best_edge_node_id is not None:
+            best_target = gt.search_nodes(temp_id=best_edge_node_id)[0]
+            gt.set_outgroup(best_target)
+            TreeLoader.remove_knuckles(gt)
+            
+        for n in gt.traverse():
+            if hasattr(n, "temp_id"):
+                n.del_feature("temp_id")
+
+    @staticmethod
+    def resolve_polytomies_by_recon(gt: Tree, st_wrapper: SmrtTree, weights: Tuple[int, int], registry: NameRegistry) -> None:
+        """Notung Algorithm: Resolves polytomies by building all binary topologies and picking min D/L."""
+        def get_rooted_topologies(items):
+            if len(items) == 1: return [items[0]]
+            if len(items) == 2: return [(items[0], items[1])]
+            res = []
+            first = items[0]
+            rest = items[1:]
+            for i in range(len(rest)):
+                for left_rest in combinations(rest, i):
+                    left_set = [first] + list(left_rest)
+                    right_set = [x for x in rest if x not in left_set]
+                    if not right_set: continue
+                    for lt in get_rooted_topologies(left_set):
+                        for rt in get_rooted_topologies(right_set):
+                            res.append((lt, rt))
+            return res
+
+        def apply_topology(node, topology):
+            if not isinstance(topology, tuple):
+                node.add_child(topology)
+                return
+            left_node = Tree()
+            right_node = Tree()
+            node.add_child(left_node)
+            node.add_child(right_node)
+            apply_topology(left_node, topology[0])
+            apply_topology(right_node, topology[1])
+
+        dup_cost, loss_cost = weights
+        has_poly = True
+        while has_poly:
+            has_poly = False
+            poly_node = None
+            for n in gt.traverse("postorder"):
+                if len(n.children) > 2:
+                    poly_node = n
+                    break
+                    
+            if poly_node:
+                has_poly = True
+                children = list(poly_node.children)
+                # Safeguard: (2*6-3)!! > 10,000 possibilities. Fallback to arbitrary resolution.
+                if len(children) > 5:
+                    poly_node.resolve_polytomy(recursive=False)
+                    continue
+                    
+                best_score = float('inf')
+                best_topology = None
+                topologies = get_rooted_topologies(children)
+                
+                for topo in topologies:
+                    # Apply permutation
+                    for c in poly_node.children: c.detach()
+                    apply_topology(poly_node, topo)
+                    
+                    # Score using reconcile.py
+                    score = TreeLoader._score_topology(gt, st_wrapper, dup_cost, loss_cost, registry)
+                    
+                    if score < best_score:
+                        best_score = score
+                        best_topology = topo
+                        
+                    # Revert permutation
+                    for c in poly_node.children: c.detach()
+                    for c in children: poly_node.add_child(c)
+                        
+                # Apply optimal topology
+                if best_topology:
+                    for c in poly_node.children: c.detach()
+                    apply_topology(poly_node, best_topology)
+
+    # --- Specialized MUL-tree processing for iterative search ---
 
     @staticmethod
     def _shrink_ret_depths(predef_rets: dict) -> dict:
@@ -482,27 +695,180 @@ class TreeLoader:
 
         return t_line
 
+    # --- Name Parsing and Sanitization ---
+
     @staticmethod
     def _sanitize_line(s: str) -> str:
         # Remove everything between "'[" and "]'" (Astral cleaning)
         return re.sub(r"'\[.*?\]'", '', s)
     
     @staticmethod
-    def _repair_tips(t: Tree) -> None:
-        leaf_counts = {}
-        for node in t.traverse():
-            if node.name:
+    def _check_and_fix_names(t: Tree, repair: bool,
+                             ref: Optional[SmrtTree] = None, kind: str = "gt") -> Tuple[bool, str]:
+
+        table = str.maketrans('|', '.', '<>')
+        illegal_chars = set('|<>')
+
+        # ST-specific:
+        if kind == "st":
+            seen_st_nodes = set()
+            for node in t.traverse():
                 if node.is_leaf():
-                    clean_name = TreeLoader._sanitize_tip(node.name)
-                    # Ensure unique names
-                    leaf_counts[clean_name] = leaf_counts.get(clean_name, 0) + 1
-                    node.name = f'{leaf_counts[clean_name]}_{clean_name}'
+                    if not node.name:
+                        return False, "Species tree contains empty leaf names"
+
+                    if not repair:
+                        if any(c in node.name for c in illegal_chars):
+                            return False, f"Leaf name '{node.name}' contains illegal characters '|', '<', or '>'"
+                        
+                        # Uniqueness strictly enforced
+                        if node.name in seen_st_nodes:
+                            return False, f"Species tree contains duplicate leaf name: '{node.name}'"
+                        seen_st_nodes.add(node.name)
+                    else:
+                        # Translate FIRST, then check uniqueness
+                        node.name = node.name.translate(table)
+                        if node.name in seen_st_nodes:
+                            return False, f"Species tree contains duplicate leaf name (after repair): '{node.name}'"
+                        seen_st_nodes.add(node.name)                        
                 else:
-                    node.name = None
+                    # INTERNAL NODES
+                    if node.name:
+                        if not repair:
+                            if not (node.name.startswith("<") and node.name.endswith(">")):
+                                return False, f"Internal node names must be enclosed in angle brackets (e.g. '<Node1>'), but found '{node.name}'"
+                            if any(c in node.name[1:-1] for c in illegal_chars):
+                                return False, f"Internal node name '{node.name}' contains illegal characters inside brackets"
+                                
+                            # Uniqueness strictly enforced
+                            if node.name in seen_st_nodes:
+                                return False, f"Species tree contains duplicate internal name: '{node.name}'"
+                            seen_st_nodes.add(node.name)
+                        else:
+                            # Format and translate FIRST
+                            if not node.name.startswith("<"):
+                                node.name = "<" + node.name
+                            if not node.name.endswith(">"):
+                                node.name = node.name + ">"
+                            translated = node.name[1:-1].translate(table)
+                            new_name = f"<{translated}>"
+                            
+                            # Check for collisions safely
+                            if new_name in seen_st_nodes:
+                                node.name = None # Safely drop duplicate internal names
+                            else:
+                                node.name = new_name
+                                seen_st_nodes.add(node.name)
+            return True, ""
+
+        # GT-specific:
+        # Don't care about internal nodes
+        
+        st_leaf_names = set(ref.ete_tree.iter_leaf_names()) if ref else set()
+
+        seen_names = set()
+        base_counts = {}
+        to_prune = set()
+        
+        for node in t.traverse():
+            if not node.is_leaf():
+                node.name = None # Clear internal nodes safely
+                continue
+                
+            if not node.name:
+                to_prune.add(node)
+                continue
+
+            if not repair:
+                # Check Illegal Characters
+                if any(c in node.name for c in illegal_chars):
+                    return False, f"Leaf name '{node.name}' contains illegal characters '|', '<', or '>'"
+                    
+                # Check ST Membership
+                if node.name not in st_leaf_names and splitSpec(node.name) not in st_leaf_names:
+                    return False, f"Taxon '{node.name}' not found in species tree"
+                
+                # Check Uniqueness (using a properly tracking set)
+                if node.name in seen_names:
+                    return False, f"Leaf name '{node.name}' is not unique"
+                seen_names.add(node.name)
+            else:
+                # Sanitize raw characters
+                clean_name = node.name.translate(table)
+                
+                spec_id = None
+                gene_id = ""
+                
+                # Extract Species ID and Gene ID
+                # Case A: Entire name is an exact match to an ST leaf (missing gene ID)
+                if clean_name in st_leaf_names:
+                    spec_id = clean_name
+                    gene_id = "copy"
+                else:
+                    # Case B: Rely on configured splitSpec to find the ST leaf
+                    parsed_spec = splitSpec(clean_name)
+                    if parsed_spec in st_leaf_names:
+                        spec_id = parsed_spec
+                        # Extract the gene_id prefix by removing the spec_id and delimiter
+                        if clean_name.endswith("_" + spec_id):
+                            gene_id = clean_name[:-(len(spec_id) + 1)]
+                        else:
+                            gene_id = "copy"
+                    else:
+                        to_prune.add(node)
+                        continue
+                
+                # Format Gene ID to immunize against splitSpec parsing variations
+                # By converting internal '_' to '-', we guarantee that gene_id_spec_id 
+                # behaves identically whether split by first '_' or last '_'
+                gene_id = gene_id.replace("_", "-")
+                if not gene_id:
+                    gene_id = "copy"
+                    
+                # Reconstruct and Uniquify
+                base_new_name = f"{gene_id}_{spec_id}"
+                
+                # Fast O(1) counter lookup
+                count = base_counts.get(base_new_name, 0)
+                
+                if count == 0 and base_new_name not in seen_names:
+                    new_name = base_new_name
+                    base_counts[base_new_name] = 1
+                else:
+                    # Jump ahead using the dictionary to skip the while loop overhead
+                    count = max(1, count) 
+                    while True:
+                        count += 1
+                        new_name = f"{gene_id}{count}_{spec_id}"
+                        # The set protects against natural name collisions
+                        if new_name not in seen_names:
+                            break
+                    base_counts[base_new_name] = count
+                
+                node.name = new_name
+                seen_names.add(new_name)
+
+        # If repairing, prune any leaves that couldn't be matched to the ST after sanitization and counting
+        if to_prune:
+            if repair:
+                # Safely collect only valid leaves for ETE3 pruning
+                valid_leaves = [n for n in t.iter_leaves() if n not in to_prune]
+                if len(valid_leaves) >= 2:
+                    try:
+                        t.prune(valid_leaves, preserve_branch_length=True)
+                    except Exception:
+                        return False, "Pruning left tree in invalid state: cannot repair"
+                else:
+                    return False, "No taxa are in the species tree: cannot repair"
+            else:
+                return False, "Contains taxa not in Species Tree or has empty names"
+
+        return True, ""
 
     @staticmethod
     def _sanitize_tip(s: str) -> str:
         return s.translate(TreeLoader._SANITIZE_TRANS)
+    
 
 class MulTreeManager:
     __slots__ = ['tcf', 'st', 'logger', 'ploidies']
@@ -548,68 +914,68 @@ class MulTreeManager:
            into a single 'group' (e.g., (x,x,y) counts as one x-group of size 2).
         3. Nested Pure Groups: Only the maximal pure group is counted (e.g., ((x,x),x) is 1 group of size 3).
         """
-        # Data structure: species -> [count, max_size]
         counts: Dict[str, List[int]] = {}
+        node_states = {} # Cache: node -> (pure_species, size) or None
         
-        def update_counts(species: str, size: int) -> None:
-            if species not in counts:
-                counts[species] = [0, 0]
-            counts[species][0] += 1
-            counts[species][1] = max(counts[species][1], size)
-
-        def get_state(node: Tree) -> Optional[Tuple[str, int]]:
-            """
-            Returns (species, size) if the node represents a pure clade.
-            Returns None if the node is mixed.
-            """
+        for node in tree.traverse("postorder"):
             if node.is_leaf():
-                return (node.pure, 1)
-
-            # Get states of all children
-            child_states = [get_state(child) for child in node.children]
-
-            # Check purity: Are all children pure and of the same species?
+                node_states[node] = (node.pure, 1)
+                continue
+                
+            child_states = [node_states[c] for c in node.children]
             first_sp = child_states[0][0] if child_states and child_states[0] else None
+            
             all_same = True
             total_size = 0
             
             for state in child_states:
                 if state is None or state[0] != first_sp:
                     all_same = False
-                    break
-                total_size += state[1]
-
-            if all_same and first_sp is not None:
-                # This node extends a pure lineage
-                return (first_sp, total_size)
-            
-            # If mixed (or children have different species), finalize the pure children
-            # Aggregate by species to handle polytomies like (x, x, y)
-            current_level_groups: Dict[str, int] = {} # species -> total_size
-            
-            for state in child_states:
                 if state is not None:
-                    sp, size = state
-                    current_level_groups[sp] = current_level_groups.get(sp, 0) + size
-            
-            # Record these finalized groups
-            for sp, size in current_level_groups.items():
-                update_counts(sp, size)
+                    total_size += state[1]
+                    
+            if all_same and first_sp is not None:
+                node_states[node] = (first_sp, total_size)
+            else:
+                # Mixed clade: finalize pure children
+                current_level_groups: Dict[str, int] = {}
+                for state in child_states:
+                    if state is not None:
+                        sp, size = state
+                        current_level_groups[sp] = current_level_groups.get(sp, 0) + size
+                
+                # Update global counts
+                for sp, size in current_level_groups.items():
+                    if sp not in counts: counts[sp] = [0, 0]
+                    counts[sp][0] += 1
+                    if size > counts[sp][1]: counts[sp][1] = size
+                
+                node_states[node] = None
 
-            return None
-
-        # Start traversal from root
-        root_state = get_state(tree)
-
-        # Edge case: If the entire tree is pure (e.g., ((x,x),x)), 
-        # get_state returns a value for root that hasn't been recorded yet.
+        # Handle Root State
+        root_state = node_states.get(tree)
         if root_state is not None:
-            update_counts(root_state[0], root_state[1])
+            sp, size = root_state
+            if sp not in counts: counts[sp] = [0, 0]
+            counts[sp][0] += 1
+            if size > counts[sp][1]: counts[sp][1] = size
 
-        # Convert lists to tuples for return type consistency
         return {k: tuple(v) for k, v in counts.items()}
         
-    def _apply_ploidy_constraints(self, h1_candidates: List[str], bin_id: Optional[int], is_strict: bool) -> Tuple[List[str], Dict[str, float]]:
+    @staticmethod
+    def compute_ploidy_stats(st: SmrtTree, ploidies: Dict[str, int], is_strict: bool) -> Dict[str, Tuple[int, int]]:
+        if is_strict:
+            # Strict Mode
+            ploidy_stats = {}
+            for sp in ploidies.keys():
+                count = len(st.match(sp))
+                ploidy_stats[sp] = (count, 1 if count > 0 else 0)
+            return ploidy_stats
+        else:
+            # Lineage-Based Mode
+            return MulTreeManager._count_effective_lineages(st.ete_tree)
+        
+    def _apply_ploidy_constraints(self, h1_candidates: List[str], is_strict: bool) -> Tuple[List[str], Dict[str, float]]:
         """
         Filters H1 candidates and calculates how many NEW copies each can tolerate.
         Centralizes all ploidy math for Simple, Full, Split, and Mixed modes.
@@ -619,50 +985,72 @@ class MulTreeManager:
         filtered_h1: List[str] = []
         h1_allowances: Dict[str, float] = {}
 
-        # Determine Current Statistics based on Stricter Option vs Default
-        if is_strict:
-            # STRICT MODE: Count exactly how many disjoint pure matches currently exist in the tree
-            ploidy_stats = {}
-            for sp in self.ploidies.keys():
-                # Find a representative leaf to get the targets
-                rep_leaf = next((l for l in self.st.ete_tree.iter_leaves() if l.pure == sp), None)
-                if rep_leaf:
-                    ploidy_stats[sp] = (len(self.st.get_targets(rep_leaf)), 1)
-                else:
-                    ploidy_stats[sp] = (0, 0)
+        if self.tcf.global_ploidy_stats is not None:
+            ploidy_stats = self.tcf.global_ploidy_stats
         else:
-            # DEFAULT MODE: Complex topological aggregation
-            ploidy_stats = self.count_effective_lineages(self.st.ete_tree)
+            ploidy_stats = self.compute_ploidy_stats(self.st, self.ploidies, is_strict)
 
-        # Determine the depth multiplier (1 for Full/Mixed baseline, 2^N for inner splits)
-        multiplier = 1
-        if bin_id is not None:
-            # Number of 1s in the binary representation indicates how many copies of this lineage will exist
-            # after gluing, e.g., if the count is 2, this tree paricipated in 2 "inner" subproblems.
-            # Thus, it should have 2**2 = 4 copies (if glued) of what is **in the tree** (may be more than 1 in mixed mode, etc).
-            multiplier = 2 ** bin_id.bit_count()
+        global_st = self.tcf.global_spec_tree
         
+        # --- Calculate the Gluing Multiplier (Inner Case) ---
+        multiplier = 1
+        if global_st is not None:
+            try:
+                # Ask the global tree how many times our local root appears. 
+                # This is EXACTLY how many times our local grafts will be duplicated during gluing!
+                local_root_pure = self.st.ete_tree.pure
+                multiplier = len(global_st.match(local_root_pure))
+            except Exception:
+                pass
+        if multiplier == 0: multiplier = 1 # Safety fallback
+        # -------------------------------------------------
+
+        target_st = global_st if global_st is not None else self.st
+        clade_species_cache = target_st.clade_pure_counts
+
+        rejected_clades: Set[str] = set() 
+
         for node_name in h1_candidates:
-            node = self.st.get_node(node_name)
+
+            clade_species = clade_species_cache.get(node_name, {})
+
+            node = target_st.get_node(node_name)
+            if node is not None and not node.is_leaf():
+                if any(child.name in rejected_clades for child in node.children):
+                    rejected_clades.add(node_name)
+                    self.logger.log(f"Skipping H1 candidate '{node_name}': ancestor of excluded clade(s).", 'd')
+                    continue
+
+            min_allowance_grafts = float('inf')
             
-            clade_species = {l.replace("*", "").split('|')[0] for l in node.iter_leaf_names()}
-            min_allowance = float('inf')
+            for pure_sp, sp_copies_in_clade in clade_species.items():
+                limit = self.ploidies.get(pure_sp, 999) # Default to infinite if not in file           
+                current_count, max_group_size = ploidy_stats.get(pure_sp, (0,0))
             
-            for sp in clade_species:
-                limit = self.ploidies.get(sp, 999) # Default to infinite if not in file           
-                current_count, max_group_size = self.ploidy_stats.get(sp, (0,0))
+                # How many total new copies of this species are we allowed to add?
+                available = limit - current_count
                 
-                # Math: (Current + Allowed) * Multiplier <= Limit
-                # Therefore: Allowed <= (Limit // Multiplier) - Current
-                allowed = (limit // multiplier) - current_count
+                # How many GLOBAL copies does 1 local graft create?
+                global_cost_per_graft = sp_copies_in_clade * multiplier
+
+                # How many GRAFT EVENTS of this clade does that translate to?
+                # (Integer division normalizes the allowance by the cost of the graft)
+                allowed_grafts = available // global_cost_per_graft
                 
-                if allowed < min_allowance:
-                    min_allowance = allowed
+                if allowed_grafts < min_allowance_grafts:
+                    min_allowance_grafts = allowed_grafts
             
-            # If allowance is < 1, this H1 cannot participate in ANY grafts. Filter it out.
-            if min_allowance >= 1:
+            # If we are allowed to graft this clade at least 1 time, keep it.
+            if min_allowance_grafts >= 1:
                 filtered_h1.append(node_name)
-                h1_allowances[node_name] = float(min_allowance)
+                # Pass the NORMALIZED graft count directly to build()
+                h1_allowances[node_name] = float(min_allowance_grafts)
+
+                self.logger.log(f"Including H1 candidate '{node_name}' with species {clade_species}. Max allowed grafts: {min_allowance_grafts}", 'd')
+            
+            else:
+                rejected_clades.add(node_name)
+                self.logger.log(f"Excluding H1 candidate '{node_name}' with species {clade_species} due to insufficient allowance.", 'd')
 
         return filtered_h1, h1_allowances
 
@@ -693,7 +1081,6 @@ class MulTreeManager:
                 name_to_check = f"<{item}>" if item.isdigit() else item
                 if not self.st.get_node(name_to_check):
                     self.logger.log(f"Node {name_to_check} not found in tree (specified in -{h_type}).", 'e')
-                    sys.exit(1)
                 cleaned_clade.append(name_to_check)
 
             if len(cleaned_clade) == 1:
@@ -761,14 +1148,13 @@ class MulTreeManager:
             # but this is not a bug! It can still graft above itself... And the root node is not effected...
             # Allow_redundant (false by default) is for recreating this **wrong** behavior if desired or for testing.
             
+            # Mark as seen regardless of ploidy / redundancy check results - to block the entire subtree
+            if nesting == 'model': processed_targets.add(h2_node.pure)
+            
             # Ploidy check and redundancy blocking
             if is_redundant or len(matches) > allowance:
-                if nesting == 'model': processed_targets.add(h2_node.pure)
                 continue
                     
-            if nesting == 'model':
-                processed_targets.add(h2_node.pure)
-                
             valid_match_groups.append(matches)
             
         return valid_match_groups
@@ -827,7 +1213,7 @@ class MulTreeManager:
         if self.ploidies:
             step = "Applying ploidy constraints"
             self.logger.report_step(step, "In progress...")
-            h1_resolved, h1_allowances = self._apply_ploidy_constraints(h1_resolved_original, self.tcf.binary_id, strict_constraint)
+            h1_resolved, h1_allowances = self._apply_ploidy_constraints(h1_resolved_original, strict_constraint)
             self.logger.log(f"After ploidy filtering, {len(h1_resolved)} H1 candidates remain: {h1_resolved}", 'd')
             self.logger.report_step(step, "Success: identified compatible H nodes")
         else:

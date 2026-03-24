@@ -398,7 +398,7 @@ class FlowManager:
         self.logger.report_step(step, "In progress...")
 
         # Write handoff files for resume support
-        CommonOps.write_handoff_files(iter_out.parent, next_mt.mt.ete_tree, [gt.ete_tree for gt in next_gts.values()])
+        CommonOps.export_tree_files(iter_out.parent, next_mt.mt.ete_tree, [gt.ete_tree for gt in next_gts.values()])
 
         if self.ctx.nesting in {"rectify", "strict_rectify"} and targets:
             success_msg = f"ready for task {i}.{j+1}"
@@ -584,7 +584,7 @@ class FlowManager:
             task_strs.append(task_str)
             task_out = iter_out.parent / task_str
             task_out.mkdir(parents=True, exist_ok=True)
-            CommonOps.write_handoff_files(task_out, task_st.ete_tree, [gt.ete_tree for gt in task_gts.values()])
+            CommonOps.export_tree_files(task_out, task_st.ete_tree, [gt.ete_tree for gt in task_gts.values()])
 
         if task_strs:
             self.logger.report_step(step, f"Success: ready for tasks {', '.join(task_strs)}")
@@ -593,16 +593,21 @@ class FlowManager:
         self.logger = backup_logger
         return next_tasks
 
-    def glue_split_results(self, root_id: Tuple[int, int] = (0, 0)) -> SmrtTree:
+    def glue_split_results(self, root_id: Tuple[int, int] = (0, 0), is_silent: bool = False) -> SmrtTree:
         """
         Recombines results by recursively diving to the innermost subproblems.
         """
+        if is_silent:
+            original_logger = self.logger
+            self.logger = GranLogger.dummy()
         self.logger.title_banner("Recombining Split Results")
         self.logger.log("Merging subproblem trees...", 'i')
 
         ft_wrapper = self._iterative_glue(root_id)
         
         self.logger.log("Success: All subproblems merged successfully.", 's')
+        if is_silent:
+            self.logger = original_logger
         return ft_wrapper
 
     def _iterative_glue(self, root_task_id: Tuple[int, int]) -> SmrtTree:

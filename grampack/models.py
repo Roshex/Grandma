@@ -9,9 +9,9 @@ from dataclasses import dataclass, field
 
 from Reticulate_Tree.reticulate_tree import ReticulateTree
 
-# Grampa does:                  raw.split("_")[-1]     // split by last underscore
-# Grandma will eventually do:   raw.split("_", 1)[-1]  // split by first underscore, to preserve species names with underscores
-splitSpec = lambda raw: raw.split("_")[-1] if "_" in raw else raw
+# Grampa does:                  raw.rsplit("_", 1)[-1]  // split by last underscore
+# Grandma will eventually do:   raw.split("_", 1)[-1]   // split by first underscore, to preserve species names with underscores
+splitSpec = lambda raw: raw.rsplit("_", 1)[-1] if "_" in raw else raw
 
 class NameRegistry:
     """
@@ -517,6 +517,24 @@ class SmrtTree:
                 desc_set.update(pure_desc_cache.get(child, set()))
             pure_desc_cache[node] = desc_set
         return pure_desc_cache
+
+    @property
+    def clade_pure_counts(self) -> Dict[str, Dict[str, int]]:
+        """
+        O(N) bottom-up traversal. Returns the exact count of each pure species 
+        under every node. Format: Dict[node_name, Dict[pure_sp, count]].
+        """
+        counts_cache = {}
+        for node in self.ete_tree.traverse("postorder"):
+            if node.is_leaf():
+                counts_cache[node.name] = {node.pure: 1}
+            else:
+                merged = {}
+                for child in node.children:
+                    for sp, count in counts_cache.get(child.name, {}).items():
+                        merged[sp] = merged.get(sp, 0) + count
+                counts_cache[node.name] = merged
+        return counts_cache
 
     @property
     def node_order(self) -> List[str]:

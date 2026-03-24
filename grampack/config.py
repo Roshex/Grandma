@@ -32,7 +32,7 @@ class GranMetadata:
     github: str = "https://github.com/Roshex/Grandma"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "3.0.8"
+    version: str = "3.0.9"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -70,6 +70,7 @@ class GlobalContext:
     max_iter: Union[int, float] = 0
     start_pt: int = 0
     mixed_switch: int = 0
+    root_spec: Optional[str] = None
     cutoff: Tuple[str, Optional[Union[int, float]]] = ("auto", None)
     # For full mode
     # replaces ignore_nesting: bool = False -> ignore (False), rectify (True), strict_rectify (New), model (New)
@@ -101,7 +102,7 @@ class GlobalContext:
         # Certain fields should not be allowed to be changed
         forbidden_keys = {"seed", "pickles", "maps", "plot", "norun", "nolog", "bench", "sample",
         "orth_opt", "max_iter", "start_pt", "mixed_switch", "nesting", "min_gt_lvs", "min_st_lvs",
-        "strict_max", "allow_redun", "root_dir", "log_file", "history"}
+        "root_spec", "strict_max", "allow_redun", "root_dir", "log_file", "history"}
         # Safety check to ensure we aren't inventing new fields
         valid_fields = {f.name for f in fields(self)}
         for key in changes:
@@ -125,24 +126,29 @@ class TaskConfig:
     gts: Optional[Union[str, Path, Dict[int, SmrtTree]]] = None
     output_dir: Path = field(default_factory=lambda: Path(get_default_outdir()))
     run_prefix: str = "grandma"
-    repair: bool = False
+    repair: str = 'none'
     overwrite: bool = False
 
     # Mode Target
     mode: str = "single"
-    
+
     # Algorithm Tunables
     h1_nodes: Optional[Union[str, List[str]]] = None
     h2_nodes: Optional[Union[str, List[str]]] = None
     ploidies: Optional[Union[Path, str, Dict[str, int]]] = None
-    binary_id: Optional[int] = None # For split mode, identifies the current subproblem (the j number)
-    predefined_rets: Dict[int, List[Tuple[str, str]]] = field(default_factory=dict)
     group_cap: int = 8
     weights: Tuple[int, int] = (1, 1) # (w_dup, w_loss)
     max_select: int = 1 # max mts to select for processing per Run (non-overlapping H clades & scoring above ST)
 
     # Legacy Flags
     is_mul_input: bool = False
+
+    # --- Global State Tracking ---
+    # For Split/Mixed mode ploidy constraints
+    global_ploidy_stats: Optional[Dict[str, Tuple[int, int]]] = None
+    global_spec_tree: Optional[SmrtTree] = None
+    # For MulTree inputs with pre-defined reconciliations
+    predefined_rets: Dict[int, List[Tuple[str, str]]] = field(default_factory=dict)
 
     @property
     def pickle_dir(self) -> Path:
@@ -458,8 +464,9 @@ class InitParser:
             help="Output directory. If it does not exist, it will be created. Default = 'grandma_out_' + timestamp.")
         g_general.add_argument("-f", "--prefix", default="grandma", type=str,
             help="A string prepended to all output files. Default = 'grandma'.")
-        g_general.add_argument('-r', '--repair', action='store_true',
-            help="If set, attempt to repair input files by forcing bifurcating trees, rooting, valid tip names, and more.")
+        g_general.add_argument('-r', '--repair', nargs='?', const='best', default='none', choices=['fast', 'f', 'best', 'b', 'none', 'n'],
+            help="If set, attempt to repair input files by forcing bifurcating trees, rooting, valid tip names, and more. "
+                 "If used without arguments, defaults to 'best' (Notung-like optimal rooting and polytomy resolution).")
         g_general.add_argument("-p", "--procs", type=int, default=1,
             help="Number of processes to use for parallelizable tasks. Default = 1. Non-positive to autodetect and " 
                  "use all available cores.")
@@ -524,6 +531,7 @@ class InitParser:
                  "split: Binary split search reducing each depth into outer/inner subproblems [cheap; supports subproblem parallelism]. "
                  "mixed-<int>: Start with full mode, then switch to split mode after <int> iterations [default w/o int: mixed-3]. "
                  "label-sp: Only label input species tree internal nodes. "
+                 "repair: Load and repair input trees (defaults to '-r best'), export them, and exit. "
                  "count-mts: Count possible MUL-trees only. "
                  "build-mts: Build MUL-trees only. "
                  "check-nums: Count groups only. "
@@ -537,6 +545,8 @@ class InitParser:
             help="Stopping condition when comparing MP scores. For Split mode or the first iter of Full, score is compared to the input ST "
                  "score. For subsequent iters of Full, score is compared to the previous iter's best score. Can be 'abs:<int>' for absolute "
                  "difference, 'rel:<float>' for relative difference, or 'auto' as a shorthand for 'abs:0' [default].")
+        g_flow.add_argument("--root", type=str, default=None,
+            help="Root the species tree on the specified node/leaf string or comma-separated clade.")
         g_flow.add_argument("--orthologies", action="store_true",
             help="If set, will output an additional file containing the pairwise orthology "
                  "relationships for each gene tree to the lowest scoring MUL-tree.")
@@ -647,12 +657,12 @@ class InitParser:
                 lgflags['st-only'] = True
             elif mode in {"no-st", "no_st"}:
                 lgflags['no-st'] = True
-            elif mode not in {"single", "split", "full"}:
+            elif mode not in {"single", "split", "full", "repair"}:
                 self.logger.log(f"Unknown mode '{mode}': using fallback to 'single' or a set legacy flag.", 'w')
                 mode = "single"
 
         # Standardize the final output string based on precedence
-        if mode in {"mixed", "split", "full"}:
+        if mode in {"mixed", "split", "full", "repair"}:
             # Major computational modes override all legacy booleans
             pass 
         else:
@@ -671,11 +681,18 @@ class InitParser:
     @staticmethod
     def resolve_nesting(val: str) -> str:
         if val in ['ignore', 'i']: return 'ignore'
-        if val in ['rectify', 'r']: return 'rectify'
+        # if val in ['rectify', 'r']: return 'rectify'
         if val in ['strict_rectify', 's']: return 'strict_rectify'
         if val in ['model', 'm']: return 'model'
         return 'rectify'
-        
+
+    @staticmethod
+    def resolve_repair(val: str) -> str:
+        if val in ['best', 'b']: return 'best'
+        if val in ['fast', 'f']: return 'fast'
+        # if val in ['none', 'n']: return 'none'
+        return 'none'
+
     def plot_and_exit(self):
         # plot hardcoded data here for convinience of testing
 
@@ -1010,6 +1027,11 @@ class InitParser:
         }
         mode, mixed_switch = self.resolve_mode_logic(args.mode, legacy_mode_flags)
 
+        repair = self.resolve_repair(args.repair)
+        if mode == 'repair' and repair == 'none':
+            self.logger.log("Mode 'repair' selected without choosing a level from --repair. Defaulting to 'best'.", 'i')
+            repair = 'best'
+
         nesting = self.resolve_nesting(args.nesting)
 
         # Handle folder deletion and history loading BEFORE the engine starts
@@ -1081,6 +1103,7 @@ class InitParser:
             max_iter      = check_loop_length(args.iter, i, None, history, self.logger),
             start_pt      = i,
             mixed_switch  = mixed_switch,
+            root_spec     = args.root,
             cutoff        = self.parse_cutoff(args.cutoff),
             nesting       = nesting,
             min_gt_lvs    = args.min_gt_lvs,
@@ -1098,7 +1121,7 @@ class InitParser:
             gts           = args.genes_input,
             output_dir    = ctx.root_dir,
             run_prefix    = args.prefix,
-            repair        = args.repair,
+            repair        = repair,
             overwrite     = args.overwrite,
             mode          = mode,
             h1_nodes      = args.h1,

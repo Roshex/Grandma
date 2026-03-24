@@ -226,7 +226,7 @@ class DatasetGenerator:
                         gt_wrapper.ete_tree.prune(survivors, preserve_branch_length=True)
                         
                         # 5. Repair Tips
-                        TreeLoader._repair_tips(gt_wrapper.ete_tree)
+                        TreeLoader._check_and_fix_names(gt_wrapper.ete_tree)
                         all_simulated_gts.append(gt_wrapper.ete_tree.write(format=9))
                         generated_count += 1
                     except Exception:

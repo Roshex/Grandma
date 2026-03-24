@@ -69,7 +69,7 @@ if __name__ == "__main__":
             o_old = path_manual / 'o_old'
             o_new = path_manual / 'o_new'
 
-            run_str_new = f"python {new_tool} -g {g} -s {s} --debug --plot -v 3 -p 10 -o"#
+            run_str_new = f"python {new_tool} -g {g} -s {s} --debug --plot -v 3 -p 10 -x E:\\Repos\\Grandma\\test\\test_data\\generator\\ex\\o_new2\\M12\\ploidies.txt --strict_constraint -o"#
             run_str_old = f"python {old_tool} -g {g} -s {s} --overwrite -o"
 
             #time_tool(f"{run_str_new} {o_new}/", "new") # --debug --plot -w 1 50

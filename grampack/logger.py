@@ -196,7 +196,8 @@ class GranLogger:
             # Flush buffered warnings if any before exiting
             if self.step_buffer:
                 print("\n".join(self.step_buffer))
-            sys.exit(1)
+            #sys.exit(1)
+            raise RuntimeError(msg)
 
     # check the original code for when it was screen printing!
     # combine level and key but make required
@@ -217,7 +218,7 @@ class GranLogger:
             tb_string = "".join(tb_lines)
 
             # Log the crash using your custom file-flushing 'e' state
-            self.log(f"UNEXPECTED FATAL EXCEPTION:\n{tb_string}", 'e')
+            self.log(f"FATAL EXCEPTION:\n{tb_string}", 'e')
 
         # Bind the custom handler to Python's global hook
         sys.excepthook = handle_exception
@@ -460,7 +461,7 @@ class GranLogger:
             log_(space("Max iterations:", pad) + iter_text)
             log_(space("Start iteration:", pad) + str(ctx.start_pt))
         if not is_task or ctx.debug:
-            log_(space("Automatic tree repair:", pad) + str("On" if tcf.repair else "Off"))
+            log_(space("Automatic tree repair:", pad) + str("Off" if tcf.repair == 'none' else tcf.repair.capitalize()))
         if not is_task and mode not in ("label-sp", "count-mts", "build-mts", "check-nums"):
             log_(space("Orthology labeling analysis:", pad) + str("On" if ctx.orth_opt else "Off"))
 
@@ -482,7 +483,7 @@ class GranLogger:
                     log_(space("Ploidy constraint input:", pad) + ploidies_str)
                     log_(space("Ploidy constraint behavior:", pad) + "Strict" if ctx.strict_max else "Lineage-based")
                     if is_task and mode in ("split", "mixed"):
-                        log_(space("Depth ploidy constraint:", pad) + str(tcf.binary_id))
+                        log_(space("Global ploidy stats:", pad) + str("On" if tcf.global_ploidy_stats is not None else "Off"))
                 log_(space("Redundant MT filter:", pad) + str("Off" if ctx.allow_redun else "On"))
                 if ctx.nesting == "model" and mode not in ("full", "mixed"):
                     log_(space("Nestedness behavior:", pad) + str(ctx.nesting).capitalize())

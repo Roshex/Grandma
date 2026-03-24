@@ -69,14 +69,8 @@ def task_worker(
     # Note: pickle_dir is a property of TaskConfig derived from output_dir, 
     # so we don't set it via replace.
 
-    # Temp fix
-    if config.mode == "split":
-        binary_id = idx - context.mixed_switch
-    else:
-        binary_id = None
-
     # Create local TaskConfig for this step
-    iter_tcf = config.update(output_dir=out, st=st, gts=gts, binary_id=binary_id)
+    iter_tcf = config.update(output_dir=out, st=st, gts=gts)
 
     # Create local GlobalContext (e.g., to override verbosity for workers)
     iter_ctx = context.update(verbosity=verbosity)
@@ -136,24 +130,27 @@ class Task:
         self.logger.report_step("", "", start=True, enable_benchmark=self.ctx.bench)
 
         # Load Species Tree
-        self.spec_tree = TreeLoader.spec_tree(tcf, self.logger)
+        self.spec_tree = TreeLoader.spec_tree(tcf, self.logger, root_str=self.ctx.root_spec)
 
         # If the ST is None, terminal label-sp mode successfully finished or a warning was logged. Exit smoothly.
         if not self.spec_tree:
             return self.logger.end_report(), {}
         
-        # Re-init component with current task
-        self.mul_mgr = MulTreeManager(tcf, self.spec_tree, self.logger)
+        if tcf.mode != "repair":
+            # Re-init component with current task
+            self.mul_mgr = MulTreeManager(tcf, self.spec_tree, self.logger)
 
-        # Build MUL-Trees
-        self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(self.ctx.nesting, self.ctx.strict_max, self.ctx.allow_redun)
+            # Build MUL-Trees
+            self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(self.ctx.nesting, self.ctx.strict_max, self.ctx.allow_redun)
 
-        # If build() returns an empty dict, a terminal mode (count-mts or build-mts) successfully finished or a warning was logged. Exit smoothly.
-        if not self.mul_trees:
+            # If build() returns an empty dict, a terminal mode (count-mts or build-mts) successfully finished or a warning was logged. Exit smoothly.
+            if not self.mul_trees:
+                return self.logger.end_report(), {}
+
+        # Load Gene Trees, returns None only in Repair Mode
+        self.gene_trees = TreeLoader.gene_trees(tcf, self.logger, self.spec_tree, registry=self.registry)
+        if self.gene_trees is None:
             return self.logger.end_report(), {}
-
-        # Load Gene Trees
-        self.gene_trees = TreeLoader.gene_trees(tcf, self.logger)
 
         # Re-init component with current task
         self.reconciler = Reconciler(tcf, self.logger, self.ctx.num_processes, self.ctx.pickles, self.ctx.maps, self.ctx.optim)
@@ -202,7 +199,7 @@ class Task:
             'ploidies': ploidies,
             #'h1_nodes': h1_nodes, to be supported later
             #'h2_nodes': h2_nodes, to be supported later
-            'repair': False # Disable repair for subsequent runs
+            'repair': 'none' # Disable repair for subsequent runs
         }
 
         return step_result, tcf_updates
@@ -504,6 +501,17 @@ class Engine:
         # Adjust depth display if resuming deep
         depth = current_tasks[0][2][0] if current_tasks else 0
 
+        # --- NEW: Hydrate Global State on Resume ---
+        if depth > 0 and perm_tcf.ploidies:
+            self.flow_logger.log(f"Resume detected at depth {depth}. Reconstructing global state...", 'i')
+            current_global_tree = self.flow_mgr.glue_split_results(root_task_id, is_silent=True)
+            global_ploidy_stats = MulTreeManager.compute_ploidy_stats(current_global_tree, perm_tcf.ploidies, self.ctx.strict_max)
+            perm_tcf = perm_tcf.update(
+                global_ploidy_stats=global_ploidy_stats,
+                global_spec_tree=current_global_tree
+            )
+        # -----------------------------------------
+
         max_iter = self.ctx.max_iter
         iter_labeller = lambda it: f"Branch {it[0]}.{it[1]}"
 
@@ -606,7 +614,6 @@ class Engine:
 
                 iter_logger.end_report(min_score, min_idx, min_mult_str)
 
-
                 if extracts is None:
                     continue # No events found, no new tasks
                 else:
@@ -618,11 +625,33 @@ class Engine:
             # Done after the loop guarantees a SmrtTree object for sorting!
             next_tasks.sort(key=lambda x: len(x[0].ete_tree), reverse=True)
             # Debug: print task IDs and sizes
-            self.flow_logger.log(f"Generated {len(next_tasks)} tasks for Depth {depth + 1}.", 'd')
+            self.flow_logger.log(f"Generated {len(next_tasks)} tasks at Depth {depth}", 'd')
             for t in next_tasks:
                 self.flow_logger.log(f"  Task ID: {t[2]}, Number of Species Leaves: {len(t[0].ete_tree)}", 'd')
 
             current_tasks = next_tasks
+
+            # --- NEW: Intermediate Gluing for Exact Ploidy & Debugging ---
+            if current_tasks and perm_tcf.ploidies:
+                self.flow_logger.log(f"Reconstructing global tree at depth {depth} for exact ploidy tracking", 'd')
+                
+                current_global_tree = self.flow_mgr.glue_split_results(root_task_id, is_silent=True)
+                
+                # Save intermediate glued tree for debugging
+                '''debug_path = self.ctx.root_dir / f"depth_{depth}_glued_debug.tre"
+                with open(debug_path, 'w') as f:
+                    f.write(current_global_tree.to_str(internals=True) + "\n")'''
+                self.flow_logger.log(current_global_tree.ete_tree.get_ascii(show_internal=True, attributes=['name', 'pure']), 'd')
+                
+                # Update perm_tcf so the next depth workers get the global stats
+                global_ploidy_stats = MulTreeManager.compute_ploidy_stats(current_global_tree, perm_tcf.ploidies, self.ctx.strict_max)
+                if self.ctx.debug:
+                    self.flow_logger.log(f"Global Ploidy Stats at Depth {depth}:\n{global_ploidy_stats}", 'd')
+                perm_tcf = perm_tcf.update(
+                    global_ploidy_stats=global_ploidy_stats,
+                    global_spec_tree=current_global_tree
+                )
+
             depth += 1
 
         final_tree = self.flow_mgr.glue_split_results(root_id=root_task_id)
