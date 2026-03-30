@@ -300,13 +300,13 @@ class SmrtTree:
 
     __slots__ = ['ete_tree', 'node_map', 'match_map', 'flat_tree']
 
-    def __init__(self, newick: str = None, tree_obj: Tree = None):
+    def __init__(self, tree_obj: Tree = None, newick: str = None, frmt: int = 0, kw_root_attrs: dict = {}):
         if tree_obj:
             self.ete_tree = tree_obj
         else:
             if newick and not newick.strip().endswith(";"):
                 newick += ";"
-            self.ete_tree = Tree(newick, format=0) 
+            self.ete_tree = Tree(newick, format=frmt, **kw_root_attrs)
             
         self.node_map: Dict[str, TreeNode] = {}
         self.match_map: Dict[str, List[TreeNode]] = {}
@@ -731,7 +731,7 @@ class SmrtTree:
         self._clear_dead(dead_keys)
 
         # Check cleaning vs trimming consistency
-        self.assert_len()
+        self.assert_len
 
         if not retain:
             if not is_outer: self.destroy() # Clean-up
@@ -1005,9 +1005,16 @@ class SmrtTree:
         self.match_map.clear()
         self.flat_tree = None
 
+    @property
     def assert_len(self):
         assert len(self) == len(self.ete_tree), f"Length mismatch: {len(self)} by names vs {len(self.ete_tree)} by tree leaves"
-    
+
+    @property
+    def assert_topology(self):
+        """Checks bifurcation and root legality"""
+        assert self.ete_tree.is_root(), "Tree is not rooted to None"
+        assert not any(len(n.children) not in (0, 2) for n in self.ete_tree.traverse()), "Tree has non-bifurcating nodes"
+
     def __len__(self):
         # Returns the number of leaves
         # Assume bifurcating tree with unique names, so num_nodes = 2 * num_leaves - 1

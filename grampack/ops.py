@@ -6,6 +6,7 @@ import tempfile
 import multiprocessing as mp
 from tqdm import tqdm
 from pathlib import Path
+from collections import defaultdict
 from shutil import rmtree, make_archive, unpack_archive
 from itertools import chain, combinations
 from functools import partial
@@ -142,7 +143,8 @@ class TreeLoader:
         # Parse
         try:
             # Format 1 allows internal node names, which we might need
-            t = Tree(line, format=0)
+            # But it also reads support vals as names!!!
+            t = Tree(line, format=1)
         except Exception as e:
             logger.log(f"reading species tree file: {e}", 'e')
 
@@ -160,11 +162,13 @@ class TreeLoader:
         if not is_valid:
             logger.log(f"Species tree invalid: {msg}", 'e')
 
-        if repair or root_str:
-            CommonOps.export_tree_files(tcf.output_dir, st=t, suffix="_repaired")
-
         logger.report_step(step, "Success: species tree read")
         st_wrapper = SmrtTree(tree_obj=t)
+
+        st_wrapper.assert_len
+
+        if repair or root_str:
+            CommonOps.export_tree_files(tcf.output_dir, st=st_wrapper.ete_tree, suffix="_repaired")
 
         if tcf.mode == "label-sp":
             logger.log(f"The input species tree with internal nodes labeled:", 'i')
@@ -192,7 +196,7 @@ class TreeLoader:
                 topo_fixer = partial(TreeLoader._check_and_fix_topology, repair=True)
         else:
             repair = False
-            name_fixer = partial(TreeLoader._check_and_fix_names, repair=False)
+            name_fixer = partial(TreeLoader._check_and_fix_names, repair=False, ref=ref)
             topo_fixer = partial(TreeLoader._check_and_fix_topology, repair=False)
         repair_str = " & repairing" if repair else ""
         step = f"Reading{repair_str} gene trees"
@@ -226,6 +230,7 @@ class TreeLoader:
 
             # Parse
             try:
+                # Format 0 allows for support values (and branch lengths) - no internal names allowed for gts
                 gt = Tree(line, format=0)
             except Exception:
                 logger.log(f"Error reading tree {origin}! -- Filtering.", 'w')
@@ -247,6 +252,13 @@ class TreeLoader:
 
         if len(valid_gts) == 0:
             logger.log(f"No valid gene trees survived filtering (required in {tcf.mode} mode).", 'e')
+
+        # Make sure to index first
+        gt_dict = {idx: SmrtTree(tree_obj=gt) for idx, gt in enumerate(valid_gts)}
+
+        # Most important validation
+        for _, gt in gt_dict.items():
+            gt.assert_len
         
         if repair:
             CommonOps.export_tree_files(tcf.output_dir, gts=valid_gts, suffix="_repaired")
@@ -256,7 +268,7 @@ class TreeLoader:
             logger.log("Repair Mode finished successfully: repaired trees have been exported. Exiting...", 'i')
             return None
 
-        return {idx: SmrtTree(tree_obj=gt) for idx, gt in enumerate(valid_gts)}
+        return gt_dict
 
     # --- Structural Repair Algorithms ---
 
@@ -281,21 +293,11 @@ class TreeLoader:
         
         # Safely resolve root knuckle if present
         if len(t.children) == 1:
-            transfer_props_before_removal(child)
             child = t.children[0]
+            transfer_props_before_removal(child)
             child.detach()
             for c in list(child.children):
                 t.add_child(c.detach())
-
-    @staticmethod
-    def check_topology(t: Tree) -> bool:
-        """Checks bifurcation and root legality"""
-        if not t.is_root():
-            return False
-        has_defects = any(len(n.children) != 2 for n in t.traverse() if not n.is_leaf())
-        if has_defects:
-            return False
-        return True
     
     @staticmethod
     def root_on_str(t: Tree, root: str) -> bool:
@@ -313,6 +315,7 @@ class TreeLoader:
             if clade:
                 t.set_outgroup(clade[0])
                 return True
+        print("clade", clade, root.strip(), t.write(format=1)) ##
         return False
 
     @staticmethod
@@ -332,7 +335,9 @@ class TreeLoader:
         if len(t.children) > 2:
             if repair:
                 if ref is not None:
+                    print(t.write(format=0)) ##
                     TreeLoader.root_by_recon(t, ref, weights, registry)
+                    print(t.write(format=0)) ##
                 else:
                     t.resolve_polytomy(recursive=False)
             else:
@@ -343,7 +348,9 @@ class TreeLoader:
         if has_polytomies:
             if repair:
                 if ref is not None:
+                    print(t.write(format=0)) ##
                     TreeLoader.resolve_polytomies_by_recon(t, ref, weights, registry)
+                    print(t.write(format=0)) #t.get_ascii(show_internal=True)) ##
                 else:
                     t.resolve_polytomy(recursive=True)
             else:
@@ -377,7 +384,7 @@ class TreeLoader:
         temp_wrapper = SmrtTree(tree_obj=temp_gt)
         temp_wrapper.make_flat(registry)
         
-        return Reconciler.recon_lca_optimized(temp_wrapper.flat_tree, st_wrapper.flat_tree, dup_cost, loss_cost)
+        return Reconciler.recon_lca_optimized(temp_wrapper.flat_tree, st_wrapper.flat_tree, dup_cost, loss_cost, registry=registry)
 
     @staticmethod
     def root_by_recon(gt: Tree, st_wrapper: SmrtTree, weights: Tuple[int, int], registry: NameRegistry) -> None:
@@ -419,8 +426,105 @@ class TreeLoader:
                 n.del_feature("temp_id")
 
     @staticmethod
-    def resolve_polytomies_by_recon(gt: Tree, st_wrapper: SmrtTree, weights: Tuple[int, int], registry: NameRegistry) -> None:
-        """Notung Algorithm: Resolves polytomies by building all binary topologies and picking min D/L."""
+    def resolve_polytomies_by_recon(gt: Tree, st_wrapper: SmrtTree, weights: Tuple[int, int], registry: NameRegistry, polytomy_size_limit: int = 6) -> None:
+        """
+        Notung Algorithm: Resolves polytomies by building all binary topologies and picking min D/L.
+        Because the number of binary resolutions grows super-exponentially with polytomy size, we solve one polytomy at a time.
+        The polytomies are solved in postorder to ensure score remains relativelt invariant to the resolution of polytomies upstream.
+        Polytomy formula: (2k-3)!!
+        E.g., for k=3: 3, k=4: 15, k=5: 105, k=6: 945, k=7: 10395, k=8: 135135 ...
+        Hence, we put a safeguard cap at polytomy_size_limit to avoid combinatorial explosion, and simply resolve arbitrarily beyond that.
+        """
+        def build_balanced_tree(nodes: List[Tree]) -> Tree:
+            """Helper to arbitrarily resolve paralogs/in-paralogs into a clean binary tree."""
+            if not nodes: return None
+            if len(nodes) == 1: return nodes[0]
+            while len(nodes) > 1:
+                nxt = []
+                for i in range(0, len(nodes), 2):
+                    if i + 1 < len(nodes):
+                        parent = Tree(name="<R>")
+                        parent.add_child(nodes[i])
+                        parent.add_child(nodes[i+1])
+                        nxt.append(parent)
+                    else:
+                        nxt.append(nodes[i])
+                nodes = nxt
+            return nodes[0]
+
+        def resolve_large_polytomy(poly_node: Tree) -> None:
+            """Species-Tree-Guided bottom-up heuristic for large polytomies."""
+            from .reconcile import Reconciler
+            st_bins = defaultdict(list)
+            
+            # 1. Map each child to its ST LCA using exact Reconciliation (Flawless MUL-tree handling)
+            for c in list(poly_node.children):
+                c_detached = c.detach()
+                
+                # Assign a temp name to the root of this clade so we can reliably fetch its mapping
+                original_name = c_detached.name
+                temp_name = original_name if original_name else f"<TR_{id(c_detached)}>"
+                c_detached.name = temp_name
+                
+                # Flatten the standalone clade
+                c_wrapper = SmrtTree(tree_obj=c_detached)
+                c_wrapper.make_flat(registry)
+                
+                st_lca = None
+                try:
+                    # Run the DP LCA algorithm to find the mathematically optimal mapping!
+                    res = Reconciler.recon_lca_optimized(
+                        c_wrapper.flat_tree, 
+                        st_wrapper.flat_tree, 
+                        dup_cost, 
+                        loss_cost, 
+                        registry=registry, 
+                        retmap=True
+                    )
+                    if res and res.maps:
+                        mapped_st_name = res.maps[0].cor[temp_name][0]
+                        st_lca = st_wrapper.get_node(mapped_st_name)
+                except Exception as e:
+                    raise
+                    #pass # Safety catch, st_lca remains None
+                
+                # Restore original name
+                if not original_name:
+                    c_detached.name = ""
+                    
+                if not st_lca:
+                    st_lca = st_wrapper.ete_tree # Fallback to ST root if heavily pruned
+                    
+                st_bins[st_lca].append(c_detached)
+                
+            # 2. Bottom-up postorder merge along the ST topology
+            accumulated = defaultdict(list)
+            for st_node in st_wrapper.ete_tree.traverse("postorder"):
+                child_gts = []
+                for st_child in st_node.children:
+                    if accumulated[st_child]:
+                        merged = build_balanced_tree(accumulated[st_child])
+                        if merged: child_gts.append(merged)
+                        
+                if len(child_gts) > 1:
+                    accumulated[st_node].append(build_balanced_tree(child_gts))
+                elif len(child_gts) == 1:
+                    accumulated[st_node].append(child_gts[0])
+                    
+                if st_node in st_bins:
+                    accumulated[st_node].extend(st_bins[st_node])
+                    
+            # 3. Apply the final resolved binary structure
+            final_nodes = accumulated[st_wrapper.ete_tree]
+            resolved_root = build_balanced_tree(final_nodes)
+            
+            if resolved_root:
+                if resolved_root.name == "<R>":
+                    for c in list(resolved_root.children):
+                        poly_node.add_child(c.detach())
+                else:
+                    poly_node.add_child(resolved_root.detach())
+
         def get_rooted_topologies(items):
             if len(items) == 1: return [items[0]]
             if len(items) == 2: return [(items[0], items[1])]
@@ -441,8 +545,8 @@ class TreeLoader:
             if not isinstance(topology, tuple):
                 node.add_child(topology)
                 return
-            left_node = Tree()
-            right_node = Tree()
+            left_node = Tree(name="<L>")
+            right_node = Tree(name="<R>")
             node.add_child(left_node)
             node.add_child(right_node)
             apply_topology(left_node, topology[0])
@@ -460,35 +564,49 @@ class TreeLoader:
                     
             if poly_node:
                 has_poly = True
+
+                # Remeber to iterating over a static copy
                 children = list(poly_node.children)
-                # Safeguard: (2*6-3)!! > 10,000 possibilities. Fallback to arbitrary resolution.
-                if len(children) > 5:
-                    poly_node.resolve_polytomy(recursive=False)
+
+                # Safeguard: (2*polytomy_size_limit-3)!! possibilities. Fallback to arbitrary resolution.
+                if len(children) > polytomy_size_limit:
+                    resolve_large_polytomy(poly_node)
+                    # poly_node.resolve_polytomy(recursive=False)
                     continue
                     
                 best_score = float('inf')
                 best_topology = None
                 topologies = get_rooted_topologies(children)
+
+                print(f"Resolving polytomy with {len(children)} children and {len(topologies)} topologies to evaluate...") ##
+                scores = []
                 
                 for topo in topologies:
                     # Apply permutation
-                    for c in poly_node.children: c.detach()
+                    for c in list(poly_node.children): c.detach()
                     apply_topology(poly_node, topo)
                     
                     # Score using reconcile.py
+                    #print(gt.write(format=0)) ##
+                    #print(st_wrapper.to_str(internals=True)) ##
+                    #print(poly_node.get_ascii(show_internal=True)) ##
                     score = TreeLoader._score_topology(gt, st_wrapper, dup_cost, loss_cost, registry)
+                    scores.append(score)
                     
                     if score < best_score:
                         best_score = score
                         best_topology = topo
                         
                     # Revert permutation
-                    for c in poly_node.children: c.detach()
+                    for c in list(poly_node.children): c.detach()
                     for c in children: poly_node.add_child(c)
+
+                print(f"Best score for this polytomy: {best_score}") ##
+                print(f"Scores for this polytomy: {scores}") ##
                         
                 # Apply optimal topology
                 if best_topology:
-                    for c in poly_node.children: c.detach()
+                    for c in list(poly_node.children): c.detach()
                     apply_topology(poly_node, best_topology)
 
     # --- Specialized MUL-tree processing for iterative search ---
@@ -698,6 +816,14 @@ class TreeLoader:
     # --- Name Parsing and Sanitization ---
 
     @staticmethod
+    def is_number(s):
+        try:
+            float(s)
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
     def _sanitize_line(s: str) -> str:
         # Remove everything between "'[" and "]'" (Astral cleaning)
         return re.sub(r"'\[.*?\]'", '', s)
@@ -734,10 +860,16 @@ class TreeLoader:
                 else:
                     # INTERNAL NODES
                     if node.name:
+                        # Branch len read as internal node name, which is not allowed (e.g. '(A:0.1,B:0.2)0.3;')
+                        if TreeLoader.is_number(node.name):
+                            node.name = None
+                            continue
+
                         if not repair:
                             if not (node.name.startswith("<") and node.name.endswith(">")):
                                 return False, f"Internal node names must be enclosed in angle brackets (e.g. '<Node1>'), but found '{node.name}'"
-                            if any(c in node.name[1:-1] for c in illegal_chars):
+                            internal_ = node.name[1:-1]
+                            if any(c in internal_ for c in illegal_chars) or internal_.startswith('P*'):
                                 return False, f"Internal node name '{node.name}' contains illegal characters inside brackets"
                                 
                             # Uniqueness strictly enforced
@@ -751,6 +883,8 @@ class TreeLoader:
                             if not node.name.endswith(">"):
                                 node.name = node.name + ">"
                             translated = node.name[1:-1].translate(table)
+                            if translated.startswith('P'):
+                                translated = translated.replace('P', 'p').replace('*', '.') # Additional safeguard against P* prefix after translation
                             new_name = f"<{translated}>"
                             
                             # Check for collisions safely
@@ -786,7 +920,7 @@ class TreeLoader:
                     
                 # Check ST Membership
                 if node.name not in st_leaf_names and splitSpec(node.name) not in st_leaf_names:
-                    return False, f"Taxon '{node.name}' not found in species tree"
+                    return False, f"Taxon '{node.name}' or '{splitSpec(node.name)}' not found in species tree"
                 
                 # Check Uniqueness (using a properly tracking set)
                 if node.name in seen_names:
@@ -803,7 +937,6 @@ class TreeLoader:
                 # Case A: Entire name is an exact match to an ST leaf (missing gene ID)
                 if clean_name in st_leaf_names:
                     spec_id = clean_name
-                    gene_id = "copy"
                 else:
                     # Case B: Rely on configured splitSpec to find the ST leaf
                     parsed_spec = splitSpec(clean_name)
@@ -812,34 +945,34 @@ class TreeLoader:
                         # Extract the gene_id prefix by removing the spec_id and delimiter
                         if clean_name.endswith("_" + spec_id):
                             gene_id = clean_name[:-(len(spec_id) + 1)]
-                        else:
-                            gene_id = "copy"
                     else:
                         to_prune.add(node)
                         continue
                 
                 # Format Gene ID to immunize against splitSpec parsing variations
-                # By converting internal '_' to '-', we guarantee that gene_id_spec_id 
+                # By converting internal '_' to '.', we guarantee that gene_id_spec_id 
                 # behaves identically whether split by first '_' or last '_'
-                gene_id = gene_id.replace("_", "-")
+                gene_id = gene_id.replace("_", ".")
                 if not gene_id:
-                    gene_id = "copy"
+                    gene_id = ""
                     
                 # Reconstruct and Uniquify
                 base_new_name = f"{gene_id}_{spec_id}"
                 
                 # Fast O(1) counter lookup
                 count = base_counts.get(base_new_name, 0)
+
+                infix = '.' if gene_id and gene_id[-1].isnumeric() else ''
                 
-                if count == 0 and base_new_name not in seen_names:
+                if count == 0 and base_new_name not in seen_names and not base_new_name.startswith('_'):
                     new_name = base_new_name
-                    base_counts[base_new_name] = 1
+                    base_counts[base_new_name] = 0
                 else:
                     # Jump ahead using the dictionary to skip the while loop overhead
-                    count = max(1, count) 
+                    count = max(0, count) 
                     while True:
                         count += 1
-                        new_name = f"{gene_id}{count}_{spec_id}"
+                        new_name = f"{gene_id}{infix}{count}_{spec_id}"
                         # The set protects against natural name collisions
                         if new_name not in seen_names:
                             break

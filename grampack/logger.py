@@ -453,7 +453,7 @@ class GranLogger:
             log_(space("Output directory:", pad) + str(tcf.output_dir))
             logging_str = "Off" if ctx.nolog else str(tcf.output_dir / "grandma.log")
             log_(space("Log file:", pad) + logging_str)
-            if mode not in ("label-sp", "count-mts", "build-mts"):
+            if mode not in ("label-sp", "repair", "count-mts", "build-mts"):
                 if mode != "check-nums":
                     log_(space("Score file:", pad) + str(tcf.output_dir / f"{tcf.run_prefix}-scores.txt"))
                 log_(space("Filtered gene trees:", pad) + str(tcf.output_dir / f"{tcf.run_prefix}-trees-filtered.txt"))
@@ -489,14 +489,18 @@ class GranLogger:
             log_(space("Start iteration:", pad) + str(ctx.start_pt))
         if not is_task or ctx.debug:
             log_(space("Automatic tree repair:", pad) + str("Off" if tcf.repair == 'none' else tcf.repair.capitalize()))
-        if not is_task and mode not in ("label-sp", "count-mts", "build-mts", "check-nums"):
+            if ctx.root_spec:
+                log_(space("Species Tree Root:", pad) + ctx.root_spec)
+        if not is_task and mode not in ("label-sp", "repair", "count-mts", "build-mts", "check-nums"):
             log_(space("Orthology labeling analysis:", pad) + str("On" if ctx.orth_opt else "Off"))
 
         # --- Algorithmic Settings ---
 
-        if mode != "label-sp":
+        if mode not in ("label-sp", "repair") or (tcf.repair == 'best' and mode == "repair"):
             log_("-" * 125)
             log_("ALGORITHMIC SETTINGS:")
+            if mode == "repair":
+                log_(space("Parsimony penalty weights:", pad) + f"Dup: {tcf.weights[0]}, Loss: {tcf.weights[1]}")
             if mode != "st-only":
                 if is_terminal:
                     if tcf.predefined_rets:
@@ -535,7 +539,7 @@ class GranLogger:
             log_(space("Outputs prefix:", pad) + str(tcf.run_prefix))
         log_(space("Parallel processes:", pad) + str(ctx.num_processes))
         log_(space("Verbosity level:", pad) + str(self.verbosity))
-        if not is_task and mode not in ("label-sp", "count-mts", "build-mts"):
+        if not is_task and mode not in ("label-sp", "repair", "count-mts", "build-mts"):
             log_(space("Pickle directory handling:", pad) + str(ctx.pickles).capitalize())
             if mode != "check-nums":
                 log_(space("Detailed maps output:", pad) + str("On" if ctx.maps else "Off"))

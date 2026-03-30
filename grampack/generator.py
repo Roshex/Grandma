@@ -275,8 +275,8 @@ class DatasetGenerator:
             # We copy the *children* to the new nodes, effectively duplicating the subtree structure
             # But since we are bottom-up, the children are already processed/expanded.
             
-            # Detach current children
-            children = [c.detach() for c in node.children]
+            # Detach current children, using a static snapshot for duplication
+            children = [c.detach() for c in list(node.children)]
             
             # Create two copies of the branch point
             left = TreeNode(); left.dist = 0; left.name = node.name
