@@ -860,7 +860,7 @@ class TreeLoader:
                 else:
                     # INTERNAL NODES
                     if node.name:
-                        # Branch len read as internal node name, which is not allowed (e.g. '(A:0.1,B:0.2)0.3;')
+                        # Branch support read as internal node name, which is not allowed (e.g. '(A:0.1,B:0.2)0.5:0.3;')
                         if TreeLoader.is_number(node.name):
                             node.name = None
                             continue
