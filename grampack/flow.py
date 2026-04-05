@@ -91,14 +91,12 @@ class FlowManager:
         """Returns the index of the best non-input MulTree."""
         # If input is best (idx 0), return idx of the second-best tree (rank 1)
         # Else, return idx of the best tree (rank 0)
-        return 1 if res.mt_idx() == 0 else 0
+        nonin_rank = 1 if res.mt_idx() == 0 else 0
+        if nonin_rank not in res.mul_trees:
+            nonin_rank = None
+        return nonin_rank
     
-    def _get_nonin_idx(self, res: TaskResult) -> int:
-        """Returns the MulTree index of the best non-input MulTree."""
-        nonin_rank = self._get_nonin_rank(res)
-        return res.mt_idx(nonin_rank)
-
-    def judge_event(self, i: int, j: int, res: TaskResult, transform: Optional[Callable] = None) -> Tuple[bool, int, MulTree, Optional[Any]]:
+    def judge_event(self, i: int, j: int, res: TaskResult, transform: Optional[Callable] = None) -> Tuple[bool, Optional[int], Optional[MulTree], Optional[Any]]:
         """
         Judges whether the current event passes the parsimony cutoff and prepares data for the next iteration.
         Logs the input and best, or, if input is best, input and second-best MulTree data for history tracking.
@@ -108,15 +106,32 @@ class FlowManager:
 
         best_idx = res.mt_idx()
         best_mt = res.mul_trees[best_idx]
-        best_mt_str = best_mt.mt.to_str(internals=True) # Before renaming if == nonin_mt
+        best_mt_str = best_mt.mt.to_str(internals=True) # Cache before renaming if == nonin_mt
+        input_score = res.input_score
 
         nonin_rank = self._get_nonin_rank(res)
+        if nonin_rank is None:
+            passed = False
+            self.logger.report_step(step, "Failed.: no non-input tree to assess")
+
+            step = "Logging event data to history"
+            self.logger.report_step(step, "In progress...")
+            self.ctx.history[(i, j)] = {
+                'best_mt': best_mt_str,
+                'num_gts': len(res.gene_trees),
+                'input_score': input_score,
+                'nonin_score': 'N/A',
+                'passed': passed,
+            }
+            self.update_history()
+            self.logger.report_step(step, "Success")
+
+            return passed, None, None, None
+        
         nonin_idx = res.mt_idx(nonin_rank)
         nonin_score = res.mt_score(nonin_rank)
         nonin_mt = res.mul_trees[nonin_idx]
         h_nodes = [nonin_mt.h1_node] + nonin_mt.hx_nodes
-
-        input_score = res.input_score
 
         if self.ctx.debug:
             hx_str = [f'{n.name} (H{x+2})' for x, n in enumerate(h_nodes[1:])]
@@ -130,11 +145,11 @@ class FlowManager:
 
         if passed:
             if self.mode == "full" and j > 0:
-                self.logger.report_step(step, f"Skip...: deferred by nested assessment")
+                self.logger.report_step(step, "Skip...: deferred by nested assessment")
             else:
                 self.logger.report_step(step, f"Success: event accepted w/ score {nonin_score}")
         else:
-            self.logger.report_step(step, f"Failed.: parsimony cutoff not met")
+            self.logger.report_step(step, "Failed.: parsimony cutoff not met")
 
         # --- Prepare data for history logging regardless of pass/fail ---
 
@@ -994,8 +1009,10 @@ class FlowManager:
             i, j = key
             
             # --- Metrics Calculation ---
-            out_taxa = get_taxa_count(val['nonin_mt'])
             out_score = val['nonin_score']
+            if out_score == 'N/A':
+                continue # Skip if no non-input tree existed
+            out_taxa = get_taxa_count(val['nonin_mt'])
             h_lvs = len(val.get('h_leaves', []))
             h_copies = len(val.get('h_locs', []))
             in_taxa = max(0, out_taxa - h_lvs*(h_copies-1 if h_copies > 0 else 0)) # Adjust for hybrid leaves that don't add taxa
