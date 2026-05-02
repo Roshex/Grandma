@@ -20,25 +20,26 @@ def _worker_reconcile_single(
     loss_cost: int,
     registry: NameRegistry, 
     pickle_dir: str, 
-    run_prefix: str, 
+    run_prefix: str,
+    gt_weights: Dict[int, float],
     retmap: bool = False,
     optim: bool = False
-) -> Tuple[int, int, Optional[Dict[int, ReconResult]]]:
+) -> Tuple[int, Union[int, float], Optional[Dict[int, ReconResult]]]:
     
     mul_idx, flat_mul = mul_item
-    total_score = 0
+    total_score: Union[int, float] = 0.0
     gt_results = {} if retmap else None
         
     # Case A: Species Tree 
     if mul_idx == 0:
         for g_num, gt_flat in flat_gts.items():
-            res = Reconciler.recon_lca_optimized(gt_flat, flat_mul, dup_cost, loss_cost, registry=registry if retmap else None, retmap=retmap)
+            res_score, res_maps = Reconciler.recon_lca_optimized(gt_flat, flat_mul, dup_cost, loss_cost, registry=registry if retmap else None, retmap=retmap)
+            weight = gt_weights.get(g_num, 1.0)
+            scaled_score = res_score * weight if weight != 1.0 else res_score
+            total_score += scaled_score
             if retmap:
-                total_score += res.score
-                gt_results[g_num] = res
-            else:
-                total_score += res
-            
+                gt_results[g_num] = ReconResult(scaled_score, res_maps)
+
     # Case B: MUL-Tree
     else:
         cur_groups = {}
@@ -54,15 +55,14 @@ def _worker_reconcile_single(
             if g_num not in cur_groups: continue
             
             group_data = cur_groups[g_num]
-            res = Reconciler.reconcile_permutation(gt_flat, flat_mul, dup_cost, loss_cost, registry, group_data, target_map, retmap=retmap, optim=optim)
-            
+            res_score, res_maps = Reconciler.reconcile_permutation(gt_flat, flat_mul, dup_cost, loss_cost, registry, group_data, target_map, retmap=retmap, optim=optim)
+            weight = gt_weights.get(g_num, 1.0)
+            scaled_score = res_score * weight if weight != 1.0 else res_score
+            total_score += scaled_score
             if retmap:
-                total_score += res.score
-                gt_results[g_num] = res
-            else:
-                total_score += res
+                gt_results[g_num] = ReconResult(scaled_score, res_maps)
 
-    return mul_idx, total_score, gt_results
+    return mul_idx, round(total_score, 3), gt_results
 
 class Reconciler:
     def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1, pickle_action: str = 'archive', to_map: bool = False, optim: bool = False):
@@ -144,7 +144,7 @@ class Reconciler:
                             dup_cost: int, loss_cost: int,
                             registry: NameRegistry = None, 
                             precalc_map: Dict[int, int] = None, 
-                            retmap=False) -> Union[int, ReconResult]:
+                            retmap=False) -> Tuple[int, List[Map]]:
         """
         O(1) LCA + Integer Array Reconciliation.
         """
@@ -250,18 +250,15 @@ class Reconciler:
                 if u in node_dups: final_dups_str[u_full_name] = node_dups[u]
                 if u in node_losses: final_losses_str[u_full_name] = node_losses[u]
                 
-            return ReconResult(
-                score=score, 
-                maps=[Map(
+            return score, [Map(
                     n_dups=sum(final_dups_str.values()), 
                     n_losses=sum(final_losses_str.values()), 
                     cor=final_maps_str, 
                     dups=final_dups_str, 
                     losses=final_losses_str
-                )]
-            )
+            )]
             
-        return score
+        return score, None
 
     # --------------------------------------------------------------------------
     # DIRTY RECONCILIATION LOGIC
@@ -398,7 +395,7 @@ class Reconciler:
     @staticmethod
     def reconcile_permutation_optim(gt_flat: FlatTree, mul_flat: FlatTree, dup_cost: int, loss_cost: int,
                             registry: NameRegistry, group_data: GroupData, target_map: Dict[int, List[int]],
-                            retmap: bool = False) -> Union[int, ReconResult]:
+                            retmap: bool = False) -> Tuple[int, List[Map]]:
         
         # Translate Groups
         ambig_groups, fixed_groups = Reconciler.translate_groups_to_ids(gt_flat, group_data)
@@ -490,12 +487,12 @@ class Reconciler:
 
             if retmap:
                 # Full recalculation for safety on return map (speed less critical here, happens once)
-                res = Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, registry, lca_maps, True)
-                if res.score < best_score:
-                    best_score = res.score
-                    all_maps = res.maps
-                elif res.score == best_score:
-                    all_maps.extend(res.maps)
+                res_score, res_maps = Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, registry, lca_maps, True)
+                if res_score < best_score:
+                    best_score = res_score
+                    all_maps = res_maps
+                elif res_score == best_score:
+                    all_maps.extend(res_maps)
             else:
                 # Optimized Scoring
                 score = Reconciler.recon_dirty_optimized(gt_flat, mul_flat, dup_cost, loss_cost, dirty_postorder, dirty_mask, static_score, lca_maps)
@@ -503,8 +500,8 @@ class Reconciler:
                     best_score = score
         
         if retmap:
-            return ReconResult(best_score, all_maps)
-        return best_score
+            return best_score, all_maps
+        return best_score, None
     
     # --------------------------------------------------------------------------
     # RECONCILIATION LOGIC
@@ -513,7 +510,7 @@ class Reconciler:
     @staticmethod
     def reconcile_permutation_old(gt_flat: FlatTree, mul_flat: FlatTree, dup_cost: int, loss_cost: int,
                             registry: NameRegistry, group_data: GroupData, target_map: Dict[int, List[int]],
-                            retmap: bool = False) -> Union[int, ReconResult]:
+                            retmap: bool = False) -> Tuple[int, List[Map]]:
         
         # Translate Groups
         ambig_groups, fixed_groups = Reconciler.translate_groups_to_ids(gt_flat, group_data)
@@ -561,20 +558,20 @@ class Reconciler:
                     current_map[u] = targets[0]
             
             if retmap:
-                res = Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, registry, current_map, True)
-                if res.score < best_score:
-                    best_score = res.score
-                    all_maps = res.maps
-                elif res.score == best_score:
-                    all_maps.extend(res.maps)
+                res_score, res_maps = Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, registry, current_map, True)
+                if res_score < best_score:
+                    best_score = res_score
+                    all_maps = res_maps
+                elif res_score == best_score:
+                    all_maps.extend(res_maps)
             else:
-                score = Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, precalc_map=current_map, retmap=False)
+                score, _ = Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, precalc_map=current_map, retmap=False)
                 if score < best_score:
                     best_score = score
         
         if retmap:
-            return ReconResult(best_score, all_maps)
-        return best_score
+            return best_score, all_maps
+        return best_score, None
 
     def recon_all(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree],
                   registry: NameRegistry, retmap: bool = False) -> Tuple[List[Tuple[int, int]], Dict[int, Dict[int, ReconResult]]]:
@@ -596,17 +593,21 @@ class Reconciler:
         tasks = list(mul_trees.items())
         gene_trees_flat_dict = {k: v.flat_tree for k, v in gene_trees.items()}
         dup_cost, loss_cost = self.tcf.weights
+
+        gt_weights = {idx: (gt.Q if self.tcf.quota_gts == 'harmonic' else 1.0) for idx, gt in gene_trees.items()}
         
-        worker_func = partial(_worker_reconcile_single, 
-                              flat_gts=gene_trees_flat_dict,
-                              dup_cost=dup_cost,
-                              loss_cost=loss_cost,
-                              registry=registry, 
-                              pickle_dir=str(self.tcf.pickle_dir), 
-                              run_prefix=self.tcf.run_prefix,
-                              retmap=retmap, 
-                              optim=self.optim
-                            )
+        worker_func = partial(
+            _worker_reconcile_single, 
+            flat_gts=gene_trees_flat_dict,
+            dup_cost=dup_cost,
+            loss_cost=loss_cost,
+            registry=registry, 
+            pickle_dir=str(self.tcf.pickle_dir), 
+            run_prefix=self.tcf.run_prefix,
+            gt_weights=gt_weights,
+            retmap=retmap, 
+            optim=self.optim
+        )
         
         if self.n_procs > 1:
             with mp.Pool(processes=self.n_procs) as pool:
@@ -664,15 +665,17 @@ class Reconciler:
             
             gt_results = {}
             for g_num, gt_flat in gt_flat_dict.items():
+
                 if idx == 0:
                     # ST case
-                    res = Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, registry, retmap=True)
+                    res_score, res_maps = Reconciler.recon_lca_optimized(gt_flat, mul_flat, dup_cost, loss_cost, registry, retmap=True)
                 else:
                     # MUL case
                     group_data = cur_groups.get(g_num, GroupData([], []))
-                    res = Reconciler.reconcile_permutation(gt_flat, mul_flat, dup_cost, loss_cost, registry, group_data, target_map, retmap=True, optim=self.optim)
+                    res_score, res_maps = Reconciler.reconcile_permutation(gt_flat, mul_flat, dup_cost, loss_cost, registry, group_data, target_map, retmap=True, optim=self.optim)
                 
-                gt_results[g_num] = res
+                weight = gene_trees[g_num].Q if self.tcf.quota_gts == 'harmonic' else 1.0
+                gt_results[g_num] = ReconResult(res_score * weight, res_maps)
             
             detailed_res[idx] = gt_results
             
@@ -760,6 +763,12 @@ class Reconciler:
     # WRITER LOGIC
     # --------------------------------------------------------------------------
 
+    @staticmethod
+    def score_to_str(score) -> str:
+        if isinstance(score, float):
+            return f"{score:.3f}"
+        return str(score)
+
     def write_detailed(self, detailed_res: dict, gene_trees: dict):
 
         def map_formatter(name: str, maps: dict, dups: dict) -> str:
@@ -804,11 +813,12 @@ class Reconciler:
                                 name_formatter=map_formatter,
                                 maps=map_obj.cor,
                                 dups=map_obj.dups
-                                )
+                            )
                             map_str = '\t' + map_str.replace("<|", "[").replace("|>", "]") # Avoid Newick issues with angle brackets
                         else:
                             map_str = ''
-                        f.write(f"{mul_idx}\t{gene_idx+1}\t{map_obj.n_dups}\t{map_obj.n_losses}\t{res.score}{map_str}\n")
+                        score_str = self.score_to_str(res.score)
+                        f.write(f"{mul_idx}\t{gene_idx+1}\t{map_obj.n_dups}\t{map_obj.n_losses}\t{score_str}{map_str}\n")
                                  
         self.logger.report_step(step, f"Success: recorded {len(detailed_res)} MTs{' with maps' if self.to_map else ''}")
 
@@ -825,8 +835,9 @@ class Reconciler:
                 tree_str = mul_data.to_marked_str()
                 h1_name = mul_data.h1_node.name if mul_data.h1_node else "NA"
                 # Handle single or multiple Hx targets
-                hx_names = ",".join([n.name for n in mul_data.hx_sisters]) if mul_data.hx_sisters else "NA"  
-                f.write(f"{idx}\t{h1_name}\t{hx_names}\t{score}\t{tree_str}\n")
+                hx_names = ",".join([n.name for n in mul_data.hx_sisters]) if mul_data.hx_sisters else "NA"
+                score_str = self.score_to_str(score)
+                f.write(f"{idx}\t{h1_name}\t{hx_names}\t{score_str}\t{tree_str}\n")
 
         self.write_dup_loss(detailed_res, mul_trees)
 

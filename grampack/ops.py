@@ -184,6 +184,11 @@ class TreeLoader:
         if isinstance(tcf.gts, dict):
             step = "Loading gene trees from memory"
             logger.report_step(step, "In progress...")
+
+            # --- Q block ---
+            quotas_path = tcf.output_dir / f"{tcf.run_prefix}-gt-quotas.tsv"
+            TreeLoader.proc_harmonic_quota(tcf.quota_gts, tcf.gts, ref, logger, quotas_path)
+
             logger.report_step(step, f"Success: {len(tcf.gts)} gene trees loaded")
             return tcf.gts
         
@@ -259,7 +264,11 @@ class TreeLoader:
         # Most important validation
         for _, gt in gt_dict.items():
             gt.assert_len
-        
+
+        # --- Q block ---
+        quotas_path = tcf.output_dir / f"{tcf.run_prefix}-gt-quotas.tsv"
+        TreeLoader.proc_harmonic_quota(tcf.quota_gts, gt_dict, ref, logger, quotas_path)
+
         if repair:
             CommonOps.export_tree_files(tcf.output_dir, gts=valid_gts, suffix="_repaired")
                 
@@ -269,6 +278,33 @@ class TreeLoader:
             return None
 
         return gt_dict
+
+    @staticmethod
+    def proc_harmonic_quota(
+            quota_gts: str, gt_dict: Dict[int, SmrtTree], ref: Optional[SmrtTree], logger: GranLogger, quotas_path: Path
+    ) -> None:
+
+        if quota_gts == 'harmonic' and ref is not None:
+            # Extract total unique species directly from the ST
+            total_species = len(set(n.pure for n in ref.ete_tree.iter_leaves()))
+            
+            debug_file = None
+            if logger.debug:
+                try:
+                    debug_file = open(quotas_path, 'w')
+                    debug_file.write("gt_idx\tO\tR\tQ\n")
+                except Exception as e:
+                    logger.log(f"Could not open debug file for GT quotas: {e}", 'w')
+
+            for g_idx, gt in gt_dict.items():
+                O, R, Q, has_support = gt.calculate_Q(total_species)
+                if debug_file:
+                    debug_file.write(f"{g_idx+1}\t{O:.4f}\t{R:.4f}\t{Q:.4f}\n")
+                    if not has_support:
+                        logger.log(f"GT-{g_idx+1} has no support values", 'w')
+            
+            if debug_file:
+                debug_file.close()
 
     # --- Structural Repair Algorithms ---
 

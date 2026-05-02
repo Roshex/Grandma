@@ -298,7 +298,7 @@ class GroupData:
 class SmrtTree:
     """Wrapper around ETE3 Tree to provide GRAMPA-specific functionality."""
 
-    __slots__ = ['ete_tree', 'node_map', 'match_map', 'flat_tree']
+    __slots__ = ['ete_tree', 'node_map', 'match_map', 'flat_tree', 'Q']
 
     def __init__(self, tree_obj: Tree = None, newick: str = None, frmt: int = 0, kw_root_attrs: dict = {}):
         if tree_obj:
@@ -311,6 +311,7 @@ class SmrtTree:
         self.node_map: Dict[str, TreeNode] = {}
         self.match_map: Dict[str, List[TreeNode]] = {}
         self.flat_tree: Optional[FlatTree] = None
+        self.Q: float = 1.0
         
         self._index_nodes()
 
@@ -373,6 +374,53 @@ class SmrtTree:
         self._index_nodes()
         self.match_map = {}
         self.flat_tree = None # Invalidate flat tree on structural change
+        self.Q = 1.0 # Reset Q on structural change
+
+    def calculate_Q(self, total_species: int) -> Tuple[float, float, float, bool]:
+        """Calculates harmonic mean Q of topology occupancy (O) and resolved support (R)."""
+        leaves = list(self.ete_tree.iter_leaves())
+        s = len(set(leaf.pure for leaf in leaves))
+        l = len(leaves)
+        O = s / total_species if total_species > 0 else 0
+        
+        # Safely exclude root and leaves
+        internal_nodes = [node for node in self.ete_tree.traverse() if not node.is_leaf() and not node.is_root()]
+        
+        c_sum = 0.0
+        normalizer = 1.0  # Normalize 0-100 to 0.0-1.0
+        has_support = False
+        for node in internal_nodes:
+            val = getattr(node, 'support', 1.0)
+            if val != 1.0 and val != 100.0: has_support = True
+            if val > 1.0: normalizer = 100.0
+            c_sum += val
+        c_sum /= normalizer
+            
+        B_max = l - 2
+        R = c_sum / B_max if B_max > 0 else (1.0 if l <= 2 else 0.0)
+        self.Q = 2 * O * R / (O + R) if (O + R) > 0 else 0.0
+        return O, R, self.Q, has_support
+
+    """
+    def calculate_Q(t: Tree, N: int) -> float:
+        # O = s/N := taxon occupancy
+        # s := number of species in the GT; N := total number of species [species, not leaves!]
+        # R = Sum(c_i)/B_max := resolved support
+        # c_i := support value of each internal node (in %); B_max := maximum possible number of internal branches for that GT (i.e., fully bifurcating)
+        # B_max = l - 2 for rooted trees, l - 3 for unrooted trees (but we assume rooted due to repair), where l is the number of leaves in the GT.
+        # Returns Q = 2*O*R/(O+R), the harmonic mean of O and R.
+
+        # LOGIC TO BE CHECKED !!! #
+        leaves = t.get_leaves()
+        s = len(set(leaf.pure for leaf in leaves))
+        l = len(leaves)
+        O = s / N if N > 0 else 0
+        c_sum = sum(node.support/100 for node in t.traverse() if not node.is_leaf())
+        B_max = l - 2 if t.is_rooted else l - 3
+        R = c_sum / B_max if B_max > 0 else 0
+        Q = 2 * O * R / (O + R) if (O + R) > 0 else 0
+        return Q, O, R
+    """
 
     def are_all_nodes_unique(self) -> bool:
         """Checks if all nodes have unique names (not pure)."""
@@ -1399,7 +1447,7 @@ class Map:
     
 @dataclass(slots=True, frozen=True)
 class ReconResult:
-    score: int
+    score: Union[int, float]
     maps: List[Map]
 
 @dataclass(slots=True, frozen=True)
@@ -1407,7 +1455,7 @@ class TaskResult:
     """Return payload from a GRAMPA step."""
     
     # List of (MulTreeID, Score) tuples, sorted by Score ASC
-    sorted_scores: List[Tuple[int, int]]
+    sorted_scores: List[Tuple[int, Union[int, float]]]
     
     # Map: MulTreeID -> MulTree Object
     mul_trees: Dict[int, MulTree]
@@ -1437,19 +1485,19 @@ class TaskResult:
         """Returns the ID of the best performing mt."""
         return self.sorted_scores[rank][0] # Tuple is (Index, Score)
 
-    def mt_score(self, rank=0) -> int:
+    def mt_score(self, rank=0) -> Union[int, float]:
         """Returns the score of the best performing mt."""
         return self.sorted_scores[rank][1]
 
     @property
-    def input_score(self) -> int:
+    def input_score(self) -> Union[int, float]:
         """O(1) retrieval of the input species tree score."""
         if self._input_rank == -1: return float('inf')
         # Return tuple item [1] (score), as [0] (index) is always 0
         return self.sorted_scores[self._input_rank][1]
     
     @property
-    def unpacked_min_mt(self) -> Tuple[int, int, MulTree]:
+    def unpacked_min_mt(self) -> Tuple[Union[int, float], int, MulTree]:
         """Returns a tuple of (score, mt_id, mt_object) for easy unpacking of the best performing mt (incl. input)."""
         min_score = self.mt_score()
         min_idx = self.mt_idx()

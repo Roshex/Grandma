@@ -463,6 +463,9 @@ class GranLogger:
                     log_(space("Duplication count file:", pad) + str(tcf.output_dir / f"{tcf.run_prefix}-dup-counts.txt"))
             if ctx.bench:
                 log_(space("Benchmarks file:", pad) + str(tcf.output_dir / f"{tcf.run_prefix}-benchmarks.txt"))
+
+            if ctx.debug and tcf.quota_gts == 'harmonic' and mode not in ("label-sp", "repair", "count-mts", "build-mts", "check-nums"):
+                log_(space("GT quota debug file:", pad) + str(tcf.output_dir / f"{tcf.run_prefix}-gt-quotas.tsv"))
         else:
             log_(space("Root output directory:", pad) + str(ctx.root_dir))
             logging_str = "Off" if ctx.nolog else str(ctx.root_dir / "grandma.log")
@@ -522,6 +525,7 @@ class GranLogger:
                 log_(space("GT polyploid group cap:", pad) + str(tcf.group_cap))
                 if mode != "check-nums":
                     log_(space("Optimized reconciliation:", pad) + str("On" if ctx.optim else "Off"))
+                    log_(space("Gene tree quotas:", pad) + tcf.quota_gts.capitalize())
                     log_(space("Parsimony penalty weights:", pad) + f"Dup: {tcf.weights[0]}, Loss: {tcf.weights[1]}")
                     max_select_str = str(tcf.max_select) if tcf.max_select > 0 else ("Up to input ST (inclusive)" if not tcf.max_select else "All")
                     if mode != "st-only":

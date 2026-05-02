@@ -137,6 +137,7 @@ class TaskConfig:
     h2_nodes: Optional[Union[str, List[str]]] = None
     ploidies: Optional[Union[Path, str, Dict[str, int]]] = None
     group_cap: int = 8
+    quota_gts: str = "equal"
     weights: Tuple[int, int] = (1, 1) # (w_dup, w_loss)
     max_select: int = 1 # max mts to select for processing per Run (non-overlapping H clades & scoring above ST)
 
@@ -165,7 +166,7 @@ class TaskConfig:
         Validates that keys exist to prevent silent errors.
         """
         # Certain fields should not be allowed to be changed
-        forbidden_keys = {'group_cap', 'weights', 'max_select', 'run_prefix'}
+        forbidden_keys = {'group_cap', "quota_gts", 'weights', 'max_select', 'run_prefix'}
         # Safety check to ensure we aren't inventing new fields
         valid_fields = {f.name for f in fields(self)}
         for key in changes:
@@ -495,6 +496,26 @@ class InitParser:
         g_algo.add_argument("-n", "--max_select", type=int, default=1,
             help="Maximum MUL-trees to select per run for postprocessing and detailed outputs. Default: 1, i.e., only the best "
                  "scoring MT is considered per iteration (Default: 1, All_until_input_st_inclusive: 0, ALL: any negative int).")
+
+        # new to be implemented later:
+
+        # -- lookahead --
+        # greedy search when selecting n MTs - each selected MT is a branch in the search,
+        # lookahead determines how many depths forward to evaluate the search-branches...
+        g_algo.add_argument("-l", "--lookahead", type=int, default=0,
+            help="Number of iterations to look ahead when selecting MTs for postprocessing. Only relevant for iterative modes "
+            "where more than one tree is selected. Default: 0 (no lookahead), Unbounded: any negative int.")
+        
+        # -- gt balanching --
+        # How to balance the influance of the gts during reconciliation
+        # Options: no balancing (default), balance by harmonic mean of gt toplogy and support values (new), apply supports while reconciling (new)
+        g_algo.add_argument("-q", "--quota_gts", type=str, choices=['equal', 'e', 'harmonic', 'h', 'per-clade', 'p'], default='equal',
+            help="Method for balancing the influence of gene trees during reconciliation. "
+                 "(e)qual: No balancing; all GTs contribute equally to the parsimony score [default]. "
+                 "(h)armonic: Balance by the harmonic mean Q of topology and support. GTs with Q will have less influence. "
+                 "(p)er-clade: Balance directly during reconciliation. Clades with low support will have less influence.")
+
+
         g_algo.add_argument("--min_st_lvs", type=int, default=1,
             help="Minimum species tree leaves for a species tree to be considered valid. Specifically relevant for the "
                  "split mode. Default: 1.")
@@ -691,6 +712,12 @@ class InitParser:
         if val in ['fast', 'f']: return 'fast'
         # if val in ['none', 'n']: return 'none'
         return 'none'
+
+    @staticmethod
+    def resolve_quota(val: str) -> str:
+        if val in ['harmonic', 'h']: return 'harmonic'
+        if val in ['per-clade', 'p']: return 'per-clade'
+        return 'equal'
 
     def plot_and_exit(self):
         # plot hardcoded data here for convinience of testing
@@ -1018,6 +1045,11 @@ class InitParser:
         # after parsing args: log sanitized args in tcf - when running the Task
         ###
 
+        quota_gts = self.resolve_quota(args.quota_gts) # <--- ADDED
+        
+        if quota_gts == 'per-clade': # <--- ADDED
+            raise NotImplementedError("The 'per-clade' balancing option is not yet implemented.")
+
         # --- Resolve Argument Logistics ---
         legacy_mode_flags = {
             'label-sp': args.labeltree, 'count-mts': args.numtrees,
@@ -1127,6 +1159,7 @@ class InitParser:
             h2_nodes      = args.h2,
             ploidies      = args.ploidy,
             group_cap     = args.cap,
+            quota_gts     = quota_gts,
             weights       = tuple(args.weights),
             max_select    = args.max_select,
             is_mul_input  = args.is_mul_input,
