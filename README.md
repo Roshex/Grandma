@@ -23,9 +23,9 @@ By utilizing flattened array-based tree structures and $O(1)$ Lowest Common Ance
 
 ## 📥 Installation
 
-### Option 1: Conda (Recommended)
+### Option 1: Conda (Recommended) [UNDER DEVELOPMENT]
 
-The easiest way to install GRANDMA and its dependencies is via the Bioconda channel:
+The easiest way to install GRANDMA and its dependencies will be via the Bioconda channel:
 
 ```bash
 conda install -c bioconda grandma
