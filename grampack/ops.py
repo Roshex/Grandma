@@ -14,7 +14,7 @@ from typing import Tuple, List, Optional, Dict, Union, Set
 
 from .config import TaskConfig
 from .logger import GranLogger
-from .models import Tree, SmrtTree, TreeCache, MulTree, GroupData, NameRegistry, splitSpec
+from .models import Tree, SmrtTree, TreeCache, MulTree, GroupData, NameRegistry, splitSpec, decode_optim
 
 class CommonOps:
     @staticmethod
@@ -296,12 +296,17 @@ class TreeLoader:
                 except Exception as e:
                     logger.log(f"Could not open debug file for GT quotas: {e}", 'w')
 
+            all_R_are_one = True
             for g_idx, gt in gt_dict.items():
                 O, R, Q, has_support = gt.calculate_Q(total_species)
                 if debug_file:
                     debug_file.write(f"{g_idx+1}\t{O:.4f}\t{R:.4f}\t{Q:.4f}\n")
                     if not has_support:
                         logger.log(f"GT-{g_idx+1} has no support values", 'w')
+                if R != 1.0:
+                    all_R_are_one = False
+            if all_R_are_one:
+                logger.log("All GTs have R=1.0, indicating no support values or all support values are 1.0. Consider disabling quotas ('-q equal').", 'w')
             
             if debug_file:
                 debug_file.close()
@@ -420,7 +425,7 @@ class TreeLoader:
         temp_wrapper = SmrtTree(tree_obj=temp_gt)
         temp_wrapper.make_flat(registry)
         
-        return Reconciler.recon_lca_optimized(temp_wrapper.flat_tree, st_wrapper.flat_tree, dup_cost, loss_cost, registry=registry)
+        return Reconciler.reconcile_sl(temp_wrapper.flat_tree, st_wrapper.flat_tree, dup_cost, loss_cost, registry=registry)
 
     @staticmethod
     def root_by_recon(gt: Tree, st_wrapper: SmrtTree, weights: Tuple[int, int], registry: NameRegistry) -> None:
@@ -509,7 +514,7 @@ class TreeLoader:
                 st_lca = None
                 try:
                     # Run the DP LCA algorithm to find the mathematically optimal mapping!
-                    res = Reconciler.recon_lca_optimized(
+                    res = Reconciler.reconcile_sl(
                         c_wrapper.flat_tree, 
                         st_wrapper.flat_tree, 
                         dup_cost, 
@@ -1046,10 +1051,10 @@ class MulTreeManager:
         self.tcf = config
         self.st = st
         self.logger = logger
-        self.ploidies: Dict[str, int] = self._parse_ploidy_file(self.tcf.ploidies, logger)
+        self.ploidies: Dict[str, int] = self._parse_ploidy_file(self.tcf.ploidies, st, logger)
 
     @staticmethod
-    def _parse_ploidy_file(ploidies: Optional[Union[Path, str, Dict[str, int]]], logger: GranLogger) -> Dict[str, int]:
+    def _parse_ploidy_file(ploidies: Optional[Union[Path, str, Dict[str, int]]], st: SmrtTree, logger: GranLogger) -> Dict[str, int]:
         # No need to reload
         if isinstance(ploidies, dict):
             return ploidies
@@ -1059,14 +1064,29 @@ class MulTreeManager:
         logger.report_step(step, "In progress...")
         ploidy_content = CommonOps._load_single_content(ploidies, "ploidies", logger, key="e")
         ploidy_dict: Dict[str, int] = {}
-        try:
-            for line in ploidy_content.splitlines():
-                parts = line.strip().split()
-                if len(parts) == 2:
-                    species, ploidy = parts
-                    ploidy_dict[species] = int(ploidy)
-        except Exception as e:
-            logger.log(f"reading ploidy file: {e}", 'e')
+        allowed_species = st.node_map.keys()
+        for line in ploidy_content.splitlines():
+            parts = line.strip().split()
+            # Allow comments and skip empty lines
+            if parts[0].startswith('#') or not parts:
+                continue
+            if len(parts) != 2:
+                logger.log(f"Invalid ploidy file line format: '{line}'. Expected 'species_name positive_int_ploidy', i.e., singly whitespace separated. Skipping.", 'w')
+                continue
+            species, ploidy = parts
+            if species not in allowed_species:
+                logger.log(f"Species '{species}' in ploidy file not found in species tree. CHECK THE INPUT FILES. Skipping.", 'w')
+                continue
+            if species in ploidy_dict:
+                logger.log(f"Duplicate entry for species '{species}' in ploidy file. CHECK THE INPUT FILES. Skipping.", 'w')
+                continue
+            try:
+                x = float(ploidy)
+                assert x.is_integer() and x > 0
+            except (ValueError, AssertionError):
+                logger.log(f"Invalid ploidy value for species '{species}': '{ploidy}'. Expected a positive integer. Skipping.", 'w')
+                continue
+            ploidy_dict[species] = int(x)
         if not ploidy_dict:
             logger.log("Ploidy file is empty or invalid.", 'w')
         logger.report_step(step, f"Success: Loaded ploidies for {len(ploidy_dict)} species")
@@ -1261,7 +1281,8 @@ class MulTreeManager:
     def build(self,
               nesting: str='model',
               strict_constraint: bool=False,
-              allow_redundant_mts: bool=False) -> Tuple[Dict[int, MulTree], List[str], List[str], Dict[str, int]]:
+              allow_redundant_mts: bool=False,
+              sweep_mode: bool=False) -> Tuple[Dict[int, MulTree], List[str], List[str], Dict[str, int]]:
         mul_trees: Dict[int, MulTree] = {}
 
         # --- ADD SPECIES TREE (INDEX 0) ---
@@ -1359,6 +1380,10 @@ class MulTreeManager:
         if self.tcf.mode == "count-mts":
             self.report_mt_count(self.st.ete_tree, h1_resolved_original, h2_resolved, num_mul_trees, nesting, bool(self.ploidies), allow_redundant_mts)
             return {}, [], [], {} # Returns empty dict to signal main.py to exit
+
+        if sweep_mode:
+            self.logger.log("Sweep mode enabled: skipping MUL-tree building step.", 'i')
+            return valid_pairings, h1_resolved, [], self.ploidies
  
         # --- BUILDING STEP ---
         step = "Building MUL-trees"
@@ -1439,50 +1464,94 @@ class MulTreeManager:
 # --- Multiprocessing Workers ---
 
 # --- Global Holders for Worker Processes ---
-_worker_gene_trees = {}
-_worker_registry = None
+_worker_gene_trees: Dict[int, SmrtTree] = {}
+_worker_registry: Optional[NameRegistry] = None
+_worker_group_cap: int = 8
+_worker_want_counts: bool = False
+_worker_dedup: bool = False
 
-def _init_collapse_worker(data_path: Optional[Union[Path, str]] = None) -> None:
-    """
-    Universal Initializer:
-    Loads data from the temporary dump file.
-    """
+def _init_collapse_worker(data_path: Optional[Union[Path, str]] = None,
+                          group_cap: int = 8, want_counts: bool = False,
+                          dedup: bool = False) -> None:
+    """Universal initializer: loads the gene trees + registry from the temp dump and
+    installs the per-run switches."""
     global _worker_gene_trees, _worker_registry
-    
-    # Load Data (Trees & Registry)
+    global _worker_group_cap, _worker_want_counts, _worker_dedup
+
+    _worker_group_cap, _worker_want_counts, _worker_dedup = group_cap, want_counts, dedup
+
     if data_path:
         try:
-            # Determine how to open based on path type
-            # (pathlib objects work in open(), but safety cast doesn't hurt)
             with open(str(data_path), 'rb') as f:
                 data_payload = pickle.load(f)
-            
             _worker_gene_trees = data_payload['trees']
             _worker_registry = data_payload['registry']
-            
         except Exception as e:
-            # Critical failure reporting
-            print(f"CRITICAL: Worker process failed to load temp data from {data_path}: {e}", file=sys.stderr)
+            print(f"CRITICAL: Worker process failed to load temp data from {data_path}: {e}",
+                  file=sys.stderr)
             raise e
 
-def _collapse_worker(payload: Tuple[int, MulTree]) -> Tuple[int, Dict[int, GroupData]]:
+def _collapse_worker(payload: Tuple[int, MulTree]):
     """
-    Standard worker logic using global data.
+    Compute the groups of every gene tree against one MUL-tree.
+
+    Returns (m_idx, groups, fails, counts).
+
+    With dedup on (--optim 1 / 3): gene trees that are isomorphic as species-labelled
+    trees have isomorphic GroupData against ANY MUL-tree, because compute_groups reads
+    only the topology, the leaf species and the MUL-tree's sister sets - gene-copy
+    identifiers enter solely at the final registry.get_ids(). So compute_groups runs once
+    per class and the units are transported to the other members through the canonical
+    leaf order.
+
+    `fails` and `counts` are produced here because the numbers the filtering stage needs
+    are already in hand; re-reading every pickle afterwards to recover them was a second
+    full I/O pass over what we had just written.
     """
     m_idx, m_data = payload
-    
-    # Access globals
     h1_sis, hx_sis_list = m_data.get_sister_clades()
-    
-    current_mt_groups = {}
-    for g_idx, gt_obj in _worker_gene_trees.items():
-        group_data = gt_obj.compute_groups(m_data, _worker_registry, h1_sis, hx_sis_list)
-        current_mt_groups[g_idx] = group_data
-    
-    return m_idx, current_mt_groups
+    cap, want_counts, dedup = _worker_group_cap, _worker_want_counts, _worker_dedup
 
-# --- Worker for parallel filtering ---
-def _check_and_write_worker(payload: Tuple[int, str, str, str], sorted_gene_ids: List[int] = None, group_cap: int = 8) -> Tuple[int, str, Dict[int, List[int]]]:
+    groups_out: Dict[int, GroupData] = {}
+    fails: List[int] = []
+    counts: Optional[Dict[int, Tuple[int, int]]] = {} if want_counts else None
+    by_sig: Dict[bytes, tuple] = {} if dedup else None
+
+    for g_idx, gt_obj in _worker_gene_trees.items():
+        if dedup:
+            sig = gt_obj.canon_sig
+            cached = by_sig.get(sig)
+            if cached is None:
+                group_data = gt_obj.compute_groups(m_data, _worker_registry, h1_sis, hx_sis_list)
+                by_sig[sig] = gt_obj.groups_to_positions(group_data)
+            else:
+                group_data = gt_obj.groups_from_positions(cached)
+        else:
+            group_data = gt_obj.compute_groups(m_data, _worker_registry, h1_sis, hx_sis_list)
+
+        groups_out[g_idx] = group_data
+        n_amb = len(group_data.ambiguous_groups)
+        if n_amb > cap:
+            fails.append(g_idx)
+        if want_counts:
+            counts[g_idx] = (n_amb, len(group_data.fixed_groups))
+
+    return m_idx, groups_out, fails, counts
+
+class ___WorkPool:
+    """Start-method-aware worker pool with cheap, correct state transport.
+    fork  : state registered in a module global before the pool is created (free).
+    spawn : state written once to a file; tasks carry a (token, path) key; the pool
+            is state-independent, so it is created once and reused for the whole run.
+    """
+    #use_pool = self.n_procs > 1 and len('tasks##########') >= 2 * self.n_procs
+    pass
+    #def publish(self, state) -> key
+    #def map_unordered(self, func, items, desc, key) -> Iterator
+    #def cleanup(self)
+
+# --- Worker for parallel filtering (to be deleted) ---
+def ____check_and_write_worker(payload: Tuple[int, str, str, str], sorted_gene_ids: List[int] = None, group_cap: int = 8) -> Tuple[int, str, Dict[int, List[int]]]:
     """
     Worker to process a single MUL-tree's checknums logic.
     Payload: (m_idx, mt_str, h_info, pickle_path)
@@ -1527,17 +1596,22 @@ def _check_and_write_worker(payload: Tuple[int, str, str, str], sorted_gene_ids:
     return m_idx, "".join(buffer), local_failures
 
 class GeneTreeManager:
-    def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1, pickle_action: str = 'archive'):
+    def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1,
+                 pickle_action: str = 'archive', optim: int = 0):
         self.tcf = config
         self.logger = logger
         self.n_procs = num_processes
         self.pickle_action = pickle_action
+        # bit 0 of --optim: reuse groups across isomorphic gene trees (1 and 3)
+        self.dedup_gts, _, _ = decode_optim(optim)
 
     def cull(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry) -> bool:
+
+        fails_by_mt, counts_by_mt, reused = {}, {}, []
         if self.tcf.mode != "st-only":
-            self.collapse_groups(mul_trees, gene_trees, registry)
+            fails_by_mt, counts_by_mt, reused = self.collapse_groups(mul_trees, gene_trees, registry)
         original_count = max(gene_trees.keys()) + 1 if gene_trees else 0
-        gt_failures = self.filter_and_check(mul_trees, gene_trees)
+        gt_failures = self.filter_and_check(mul_trees, gene_trees, fails_by_mt, counts_by_mt, reused)
         self.write_filtered_trees(gene_trees, gt_failures, original_count)
         if self.tcf.mode != "check-nums":
             return True
@@ -1611,183 +1685,170 @@ class GeneTreeManager:
             except Exception as e:
                 self.logger.log(f"Failed to unpack archive: {e}", 'w')
 
+    def _want_checknums_file(self) -> bool:
+        """The checknums file holds one line per (MUL-tree, gene tree) pair - millions of
+        lines on a large run, formatted and written every time for a diagnostic that only
+        check-nums mode consumes."""
+        return self.tcf.mode == "check-nums" or getattr(self.tcf, 'write_checknums', False)
+
     def collapse_groups(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry):
         """
-        Computes groups for all MUL-trees using registry-optimized logic and DUMPS to pickle immediately.
-        Does NOT retain data in memory.
+        Computes groups for all MUL-trees and dumps them to pickle immediately.
+        Returns (fails_by_mt, counts_by_mt, reused_mt_ids); the counts feed
+        filter_and_check directly so it never has to read the pickles back.
         """
         pickle_dir = self.tcf.pickle_dir
-        self.unpack_archive(pickle_dir) # Handle archived pickles if needed
+        self.unpack_archive(pickle_dir)
         pickle_dir.mkdir(parents=True, exist_ok=True)
-     
+
         step = "Collapsing gene tree groupings"
         self.logger.report_step(step, "In progress...")
 
-        # --- PRIME REGISTRY ---
-        # We must register all gene tree taxa in the main registry BEFORE forking.
-        # Otherwise, workers create divergent ID mappings (e.g., 'TaxonA' is ID 5 in Worker 1, but ID 8 in Main).
-        # We assume compute_groups uses registry.get_id(name). 
-        # By iterating and 'touching' names here, we lock the IDs globally.
-        if self.n_procs > 1:
-            # Optimization: Use C-level iteration to collect all keys at once
-            # Note: iterating a dict (gt.node_map) yields its keys automatically
-            all_names = set(chain.from_iterable(gt.node_map for gt in gene_trees.values()))
-            # Register all at once
-            for name in all_names:
-                registry.get_id(name)
-        
+        # --- PRIME CACHES BEFORE FORKING ------------------------------------------
+        # linearize() registers every species name, full leaf name and internal name, so
+        # flattening here also locks the registry IDs globally (workers must not invent
+        # divergent ones). The gene-tree flats carry no Euler tour / sparse table: they
+        # are only ever traversed, never LCA-queried. Reconciliation reuses them as-is.
+        for gt in gene_trees.values():
+            gt.make_flat(registry)
+        if self.dedup_gts:
+            # canon is computed from the flat tree, which __getstate__ does not ship;
+            # priming it here is what lets the workers use it without rebuilding.
+            for gt in gene_trees.values():
+                gt.canon
+
         registry_path = pickle_dir / f"{self.tcf.run_prefix}_registry.pickle"
         force_regenerate = self._check_registry_safety(registry_path, registry)
 
-        # Prepare Tasks (skip 0)
-        # Only process if pickle doesn't exist or forced
-        tasks = []
+        tasks, reused = [], []
         for m_idx, m_data in mul_trees.items():
-            if m_idx == 0: continue
-            
+            if m_idx == 0:
+                continue
             pickle_path = pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
             if pickle_path.exists() and not self.tcf.overwrite and not force_regenerate:
+                reused.append(m_idx)             # counts for these must come from disk
                 continue
             tasks.append((m_idx, m_data))
 
-        # --- Parallel Execution ---
-        
+        want_counts = self._want_checknums_file()
+        cap = self.tcf.group_cap
+        fails_by_mt: Dict[int, List[int]] = {}
+        counts_by_mt: Dict[int, Dict[int, Tuple[int, int]]] = {}
+
         def save_result(res):
-            m_idx, groups = res
+            m_idx, groups, fails, counts = res
             pickle_path = pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
             try:
                 with open(pickle_path, 'wb') as f:
-                    pickle.dump(groups, f)
+                    pickle.dump(groups, f, protocol=pickle.HIGHEST_PROTOCOL)
             except Exception as e:
                 self.logger.log(f"saving pickle {pickle_path}: {e}", 'e')
+            if fails:
+                fails_by_mt[m_idx] = fails
+            if want_counts:
+                counts_by_mt[m_idx] = counts
 
-        if tasks:
-            if self.n_procs > 1:
-                # Create a temporary file to hold the massive data
-                # delete=False is safer for Windows (prevents access errors if opened twice)
-                # We manually unlink later.
-                fd, temp_file_path = tempfile.mkstemp(suffix=".pkl", prefix="grandma_worker_data_")
-                os.close(fd) 
+        # A pool costs interpreter start-up (~0.3 s for 8 workers under spawn) plus a full
+        # serialisation of every gene tree. Below this threshold it never repays itself.
+        use_pool = self.n_procs > 1 and len(tasks) >= 2 * self.n_procs
 
-                try:
-                    # Dump data once
-                    #self.logger.log("Serializing worker data to temp file...", 'd')
-                    payload = {'trees': gene_trees, 'registry': registry}
-                    with open(temp_file_path, 'wb') as f:
-                        pickle.dump(payload, f)
-                    
-                    # Init Workers pointing to file
-                    # This works on ALL OSs
-                    with mp.Pool(processes=self.n_procs, initializer=_init_collapse_worker, initargs=(temp_file_path,)) as pool:
-                        for res in tqdm(pool.imap_unordered(_collapse_worker, tasks), total=len(tasks), desc="# Collapsing", unit="mt", 
-                                      disable=self.logger.disable_tqdm, ncols=177):
-                            save_result(res)
-                            
-                finally:
-                    # Cleanup Temp File
-                    if os.path.exists(temp_file_path):
-                        try:
-                            os.remove(temp_file_path)
-                            #self.logger.log(f"Cleaned up temp file {temp_file_path}", 'd')
-                        except OSError as e:
-                            self.logger.log(f"Failed to delete temp file {temp_file_path}: {e}", 'w')
+        if tasks and use_pool:
+            fd, temp_file_path = tempfile.mkstemp(suffix=".pkl", prefix="grandma_worker_data_")
+            os.close(fd)
+            try:
+                payload = {'trees': gene_trees, 'registry': registry}
+                with open(temp_file_path, 'wb') as f:
+                    pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-            else:
-                # Serial Execution (Single Core)
-                # Manually set globals to avoid rewriting worker logic
-                global _worker_gene_trees, _worker_registry
-                _worker_gene_trees = gene_trees
-                _worker_registry = registry
-                
-                # We don't need init function, just call worker directly
-                for item in tqdm(tasks, desc="# Collapsing", unit="mt", disable=self.logger.disable_tqdm, ncols=177):
-                    res = _collapse_worker(item)
-                    save_result(res)
-                
-                # Cleanup globals
+                with mp.Pool(processes=self.n_procs, initializer=_init_collapse_worker,
+                             initargs=(temp_file_path, cap, want_counts, self.dedup_gts)) as pool:
+                    for res in tqdm(pool.imap_unordered(_collapse_worker, tasks),
+                                    total=len(tasks), desc="# Collapsing", unit="mt",
+                                    disable=self.logger.disable_tqdm, ncols=177):
+                        save_result(res)
+            finally:
+                if os.path.exists(temp_file_path):
+                    try:
+                        os.remove(temp_file_path)
+                    except OSError as e:
+                        self.logger.log(f"Failed to delete temp file {temp_file_path}: {e}", 'w')
+
+        elif tasks:
+            # Serial: no temp dump, no pool. Set the globals the worker reads.
+            global _worker_gene_trees, _worker_registry
+            _worker_gene_trees = gene_trees
+            _worker_registry = registry
+            _init_collapse_worker(None, cap, want_counts, self.dedup_gts)
+            try:
+                for item in tqdm(tasks, desc="# Collapsing", unit="mt",
+                                 disable=self.logger.disable_tqdm, ncols=177):
+                    save_result(_collapse_worker(item))
+            finally:
                 _worker_gene_trees = {}
                 _worker_registry = None
-            
-        # Save the registry state so the next run can interpret the IDs in the group pickles
+
         try:
             with open(registry_path, 'wb') as f:
                 pickle.dump(registry.get_state(), f)
         except Exception as e:
             self.logger.log(f"saving registry pickle: {e}", 'e')
-            
-        self.logger.report_step(step, "Success", full_update=True)
 
-    def filter_and_check(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree]) -> Dict[int, int]:
+        self.logger.report_step(step, "Success", full_update=True)
+        return fails_by_mt, counts_by_mt, reused
+
+    def _counts_and_fails_from_pickle(self, m_idx: int, cap: int, want_counts: bool) -> Tuple[List[int], Optional[Dict[int, Tuple[int, int]]]]:
+        """Only for MUL-trees whose group pickle was REUSED from a previous run."""
+        p = self.tcf.pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
+        fails, counts = [], ({} if want_counts else None)
+        try:
+            with open(p, 'rb') as f:
+                groups = pickle.load(f)
+        except OSError as e:
+            raise RuntimeError(f"MUL-tree {m_idx}: cannot read reused group data '{p}': {e}")
+        for g_idx, gd in groups.items():
+            n_amb = len(gd.ambiguous_groups)
+            if n_amb > cap:
+                fails.append(g_idx)
+            if want_counts:
+                counts[g_idx] = (n_amb, len(gd.fixed_groups))
+        return fails, counts
+
+    def filter_and_check(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree],
+                         fails_by_mt=None, counts_by_mt=None, reused=()) -> Dict[int, int]:
         """
-        Writes checknums file and filters trees exceeding group cap.
+        Applies the group cap. The counts come from collapse_groups, which already had
+        them, so there is no second worker pool and no second pass over the pickles.
         """
         step = "Filtering gene trees over group cap"
         self.logger.report_step(step, "In progress...")
-        
-        check_path = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-checknums.txt"
-        
-        gt_failures = {} 
-        sorted_mul_ids = sorted(mul_trees.keys())
-        sorted_gene_ids = sorted(gene_trees.keys())
 
-        # Prepare Tasks
-        tasks = []
-        for m_idx in sorted_mul_ids:
-            if m_idx == 0: continue
-            
-            m_data = mul_trees[m_idx]
-            pickle_path = self.tcf.pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
-            
-            # String Formatting
-            mt_str = m_data.to_marked_str()
-            h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
-            hx_sisters = m_data.hx_sisters
-            if hx_sisters:
-                hx_str = "\t".join([f'H{i+2} Node:{hx.name}' for i, hx in enumerate(hx_sisters)])
-            else:
-                hx_str = "Hx Nodes:NA"
-            h_info = f"\tH1 Node:{h1_name}\t{hx_str}"
-            
-            tasks.append((m_idx, mt_str, h_info, str(pickle_path)))
-        
-        # Results container: Map m_idx -> string buffer
-        results_map = {}
+        cap = self.tcf.group_cap
+        want_counts = self._want_checknums_file()
+        fails_by_mt = dict(fails_by_mt or {})
+        counts_by_mt = dict(counts_by_mt or {})
 
-        # Bind repetitive arguments to avoid sending them per-task
-        worker_func = partial(_check_and_write_worker, sorted_gene_ids=sorted_gene_ids, group_cap=self.tcf.group_cap)
+        for m_idx in reused:
+            f, c = self._counts_and_fails_from_pickle(m_idx, cap, want_counts)
+            if f:
+                fails_by_mt[m_idx] = f
+            if want_counts:
+                counts_by_mt[m_idx] = c
 
-        if tasks:
-            if self.n_procs > 1:
-                with mp.Pool(processes=self.n_procs) as pool:
-                    iterator = pool.imap_unordered(worker_func, tasks)
-                    for res in tqdm(iterator, total=len(tasks), desc="# Filtering ", unit="mt", disable=self.logger.disable_tqdm, ncols=177):
-                        m_idx, buf, fails = res
-                        results_map[m_idx] = buf
-                        # Merge failures
-                        for g_idx, failures in fails.items():
-                            if g_idx not in gt_failures: gt_failures[g_idx] = []
-                            gt_failures[g_idx].extend(failures)
-            else:
-                for task in tqdm(tasks, desc="# Filtering ", unit="mt", disable=self.logger.disable_tqdm, ncols=177):
-                    m_idx, buf, fails = worker_func(task)
-                    results_map[m_idx] = buf
-                    for g_idx, failures in fails.items():
-                        if g_idx not in gt_failures: gt_failures[g_idx] = []
-                        gt_failures[g_idx].extend(failures)
+        gt_failures: Dict[int, int] = {}
+        for fails in fails_by_mt.values():
+            for g_idx in fails:
+                gt_failures[g_idx] = gt_failures.get(g_idx, 0) + 1
 
-        # Write to file (Sequential, in order)
-        with open(check_path, 'w') as f:
-            f.write("mul.tree\tgene.tree\tgroups\tfixed\tcombinations\tover.cap.filtered\n")
-            for m_idx in sorted_mul_ids:
-                if m_idx in results_map:
-                    f.write(results_map[m_idx])
+        if want_counts:
+            self._write_checknums(mul_trees, gene_trees, counts_by_mt, cap)
 
-        self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap", full_update=True)
-        
-        for g_idx in sorted(gt_failures.keys()):
+        self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap",
+                                full_update=True)
+
+        for g_idx in sorted(gt_failures):
             if g_idx in gene_trees:
-                gt_failures[g_idx] = len(gt_failures[g_idx])
-                self.logger.log(f"Gene tree on line {g_idx+1} is over the group cap in {gt_failures[g_idx]} MTs and will be filtered.", 'w')
+                self.logger.log(f"Gene tree on line {g_idx+1} is over the group cap in "
+                                f"{gt_failures[g_idx]} MTs and will be filtered.", 'w')
                 del gene_trees[g_idx]
         return gt_failures
                 
@@ -1810,3 +1871,27 @@ class GeneTreeManager:
                     f.write(f"# Already filtered out\n")
                 
         self.logger.report_step(step, f"Success: {count} gene trees written")
+
+    def _write_checknums(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], counts_by_mt: Dict[int, Dict[int, Tuple[int, int]]], cap: int) -> None:
+        check_path = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-checknums.txt"
+        sorted_gene_ids = sorted(gene_trees.keys())
+        with open(check_path, 'w') as f:
+            f.write("mul.tree\tgene.tree\tgroups\tfixed\tcombinations\tover.cap.filtered\n")
+            for m_idx in sorted(mul_trees.keys()):
+                if m_idx == 0 or m_idx not in counts_by_mt:
+                    continue
+                m_data = mul_trees[m_idx]
+                h1_name = m_data.h1_node.name if m_data.h1_node else "NA"
+                hx_sisters = m_data.hx_sisters
+                hx_str = ("\t".join(f'H{i+2} Node:{hx.name}' for i, hx in enumerate(hx_sisters))
+                          if hx_sisters else "Hx Nodes:NA")
+                f.write(f"# MT-{m_idx}:{m_data.to_marked_str()}\tH1 Node:{h1_name}\t{hx_str}\n")
+                counts = counts_by_mt[m_idx]
+                for g_idx in sorted_gene_ids:
+                    c = counts.get(g_idx)
+                    if c is None:
+                        continue
+                    n_amb, n_fix = c
+                    f.write(f"{m_idx}\t{g_idx+1}\t{n_amb + n_fix}\t{n_fix}\t"
+                            f"{1 << n_amb}\t{'Y' if n_amb > cap else 'N'}\n")
+                f.write("# ----------------------------------\n")

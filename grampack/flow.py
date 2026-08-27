@@ -1,5 +1,6 @@
 import json
 import random
+import shutil
 from typing import Tuple, List, Optional, Dict, Set, Callable, Any
 from collections import defaultdict
 from pathlib import Path
@@ -7,9 +8,663 @@ from functools import partial
 from dataclasses import dataclass, field
 
 from .config import GlobalContext
-from .models import Tree, TreeNode, SmrtTree, TaskResult, MulTree, Map, HistoryType, ConcurrTask, GraftRecord
+from .models import Tree, TreeNode, SmrtTree, TaskResult, MulTree, Map, ConcurrTask, GraftRecord, ProtectedDict, HistoryType
 from .ops import CommonOps
 from .logger import GranLogger
+
+class BeamTracker:
+    """Manages the Beam Search Tree as a JSON-backed Adjacency List for O(1) tracking."""
+    def __init__(self, filepath: Path):
+        self.filepath = filepath
+        # node_id -> {"mt_idx": int, "task": "i.j", "parent": parent_id, "children": [child_ids]}
+        initial_state = {"S0": {"mt_idx": 0, "task": "0.0", "parent": None, "children": []}}
+        self.state = {
+            "next_id": 1,
+            "nodes": ProtectedDict(initial_state)
+        }
+        self.fake_to_real = {}
+        self.symlink_anchors = set()
+        self.load()
+
+    def load(self):
+        if self.filepath.exists():
+            with open(self.filepath, 'r') as f:
+                data = json.load(f)
+                self.state['next_id'] = data['next_id']
+                # Load JSON and wrap nodes in protection
+                self.state['nodes'] = ProtectedDict(data['nodes'])
+
+    def save(self):
+        with open(self.filepath, 'w') as f:
+            json.dump(self.state, f, indent=4)
+
+    def spawn_child(self, parent_id: str, task: str, mt_idx: int) -> str:
+        """Registers a new branch in the search space and returns its unique ID (e.g. 'S42')."""
+        child_id = f"S{self.state['next_id']}"
+        self.state['next_id'] += 1
+        
+        self.state['nodes'][child_id] = {
+            "mt_idx": mt_idx,
+            "task": task, # strictly string "i.j"
+            "parent": parent_id,
+            "children": []
+        }
+        if parent_id in self.state['nodes']:
+            self.state['nodes'][parent_id]['children'].append(child_id)
+            
+        self.save()
+        return child_id
+
+    def get_descendants(self, node_id: str) -> List[str]:
+        """O(V) Fast iterative DFS to fetch all downstream search branches for pruning."""
+        descendants = []
+        stack = list(self.state['nodes'][node_id]["children"])
+        while stack:
+            curr = stack.pop()
+            descendants.append(curr)
+            stack.extend(self.state['nodes'][curr]["children"])
+        return descendants
+
+    def get_leaves(self, node_id: str) -> List[str]:
+        """Returns all terminal leaf nodes for a given search branch."""
+        if node_id not in self.state['nodes']: return []
+        leaves = []
+        stack = [node_id]
+        while stack:
+            curr = stack.pop()
+            children = self.state['nodes'][curr]["children"]
+            if not children:
+                leaves.append(curr)
+            else:
+                stack.extend(children)
+        return leaves
+    
+    def block_branch(self, node_id: str) -> Set[str]:
+        """Marks node as blocked natively in the BeamTracker."""
+        nodes = self.state['nodes']
+        if node_id in nodes:
+            nodes[node_id]['blocked'] = True
+            self.save()
+            
+        bad_descendants = set(self.get_descendants(node_id))
+        bad_descendants.add(node_id)
+        return bad_descendants
+
+    def build_virtual_graph(self, history: HistoryType):
+        """Cross-references History to generate missing symmetric nodes for downstream DP math."""
+        self.fake_to_real.clear()
+        self.symlink_anchors.clear()
+        nodes = self.state['nodes']
+        
+        # Restore mapping from previously generated & saved fake nodes
+        for nid, ndata in list(nodes.items()):
+            if ndata.get('is_copy'):
+                p = ndata['parent']
+                if p and not nodes[p].get('is_copy'):
+                    self.symlink_anchors.add(p)
+                if 'real_source' in ndata:
+                    self.fake_to_real[nid] = ndata['real_source']
+                    
+        # Find all symlinks recorded in history
+        symlinks = []
+        for task_tuple, parent_dict in history.items():
+            for p_id, events in parent_dict.items():
+                if isinstance(events, dict) and "__symlink__" in events:
+                    symlinks.append((task_tuple, p_id, events["__symlink__"]))
+                    self.symlink_anchors.add(p_id)
+
+        # Sort from Highest Depth (Deepest) to Lowest Depth (Root)
+        # x[0] is the task_tuple (depth, idx). x[0][0] is the depth.
+        symlinks.sort(key=lambda x: x[0][0], reverse=True)
+
+        def clone_subtree(real_node_id, new_parent_id):
+            fake_id = f"S{self.state['next_id']}"
+            self.state['next_id'] += 1
+
+            # Resolve the ultimate real source for chained copies
+            # If the node we are copying is already a copy, grab its original source
+            ultimate_source = nodes[real_node_id].get('real_source', real_node_id)
+            
+            self.fake_to_real[fake_id] = ultimate_source
+            
+            real_node = nodes[real_node_id]
+            fake_node = real_node.copy()
+            fake_node['parent'] = new_parent_id
+            fake_node['children'] = []
+            fake_node['is_copy'] = True
+            fake_node['real_source'] = ultimate_source 
+            nodes[fake_id] = fake_node
+            
+            if new_parent_id in nodes:
+                nodes[new_parent_id]['children'].append(fake_id)
+                
+            for child_id in real_node.get('children', []):
+                clone_subtree(child_id, fake_id)
+
+        # Generate missing fake nodes dynamically
+        graph_modified = False
+        for task_tuple, sym_parent, src_parent in symlinks:
+            sym_parent_node = nodes[sym_parent]
+            
+            task_str = f"{task_tuple[0]}.{task_tuple[1]}"
+            
+            already_generated = any(
+                nodes[cid].get('is_copy') and nodes[cid]['task'] == task_str
+                for cid in sym_parent_node['children']
+            )
+            if already_generated: continue
+
+            self.symlink_anchors.add(sym_parent)
+            src_node = nodes[src_parent]
+            
+            for child_id in src_node['children']:
+                child_node = nodes[child_id]
+                if child_node['task'] == task_str:
+                    clone_subtree(child_id, sym_parent)
+                    graph_modified = True
+                        
+        if graph_modified:
+            self.save()
+
+class PathNavigator:
+    """Handles all Dynamic Programming, Greedy Pathing, and Graph Visualizations."""
+    def __init__(self, tracker: BeamTracker, history: HistoryType, out_dir: Path, switch: str, logger: GranLogger, max_combs: int = 500):
+        self.tracker = tracker
+        self.history = history
+        self.out_dir = out_dir
+        self.switch = switch
+        self.logger = logger
+        self.max_combs = max_combs
+        # Prep happens strictly here
+        self.tracker.build_virtual_graph(self.history)
+
+    def _parse_task(self, task_str: str) -> Tuple[int, int]:
+        """Helper to standardize task string formatting."""
+        return tuple(map(int, task_str.split('.')))
+
+    def _get_hist_node(self, task_tuple: Tuple[int, int], parent_id: str, node_id: str) -> dict:
+        """Safely fetches history data natively from HistoryType."""
+        if task_tuple not in self.history: return {}
+        
+        real_parent = self.tracker.fake_to_real.get(parent_id, parent_id)
+        real_node = self.tracker.fake_to_real.get(node_id, node_id)
+        
+        parent_data = self.history[task_tuple].get(real_parent, {})
+        
+        if "__symlink__" in parent_data:
+            src_parent = parent_data["__symlink__"]
+            return self.history[task_tuple][src_parent][real_node]
+            
+        return parent_data.get(real_node, {})
+
+    def compute_all_universes(self, start_node: str = "S0", max_depth: Optional[int] = None) -> Tuple[List[Tuple[float, Set[str], str]], Dict[str, float]]:
+        """
+        Computes all combinatorial paths optimally using Delta Scoring (Parsimony Savings).
+        Returns a sorted list of: (Absolute Score, Set of Node IDs, Formatted Lineage String)
+        """
+        from itertools import product
+        from collections import defaultdict
+        import heapq
+        
+        nodes = self.tracker.state['nodes']
+        memo = {}
+        
+        def traverse(node_id: str) -> List[Tuple[float, Set[str], str]]:
+            node = nodes[node_id]
+            
+            task = self._parse_task(node['task'])
+            parent_id = node['parent']
+            current_depth = task[0]
+            
+            # --- Calculate Local Delta (Parsimony Savings) ---
+            passed = True
+            blocked = node.get('blocked', False)
+            local_delta = 0.0
+            
+            if parent_id:
+                ev = self._get_hist_node(task, parent_id, node_id)
+                in_data = self._get_hist_node(task, parent_id, "In")
+                in_score = in_data['score']
+                passed = ev.get('passed', True)
+                
+                if passed:
+                    out_score = ev['score']
+                    # Delta is negative if parsimony improves (score drops)
+                    local_delta = out_score - in_score
+                else:
+                    local_delta = 0.0
+
+            # --- Base Case: Forced Leaf ---
+            if not passed or blocked or (max_depth is not None and current_depth >= max_depth):
+                memo[node_id] = local_delta
+                return [(local_delta, {node_id}, node_id)]
+
+            # --- Identify Surviving Children in the Graph ---
+            children = node['children']
+            groups = defaultdict(list)
+            for cid in children:
+                c_node = nodes[cid]
+                groups[c_node['task']].append(cid)
+
+            # --- Identify Expected Tasks from History ---
+            expected_tasks = []
+            for t_tuple, parent_dict in self.history.items():
+                real_node = self.tracker.fake_to_real.get(node_id, node_id)
+                if real_node in parent_dict or node_id in parent_dict:
+                    t_str = f"{t_tuple[0]}.{t_tuple[1]}"
+                    expected_tasks.append((t_tuple, t_str))
+
+            # --- Base Case: Natural Leaf ---
+            if not expected_tasks and not children:
+                memo[node_id] = local_delta
+                return [(local_delta, {node_id}, node_id)]
+
+            # --- Build Options for ALL Expected Branches ---
+            task_options = []
+            for t_tuple, t_str in expected_tasks:
+                if t_str in groups and groups[t_str]:
+                    # Branch survived: Traverse its children
+                    options = []
+                    for cid in groups[t_str]:
+                        options.extend(traverse(cid))
+                    task_options.append(options)
+                else:
+                    # Branch failed entirely: Delta is exactly 0.0
+                    task_options.append([(0.0, set(), f"FAIL({t_str})")])
+
+            # --- Dynamic Yielding (Memory Optimization) ---
+            def combo_generator():
+                for combo in product(*task_options):
+                    # Universe Delta = My Delta + Sum of Children Deltas
+                    delta_sum = local_delta + sum(c[0] for c in combo)
+                    
+                    combined_nodes = {node_id}
+                    for c in combo:
+                        combined_nodes.update(c[1])
+                    
+                    if len(combo) == 1:
+                        lineage_str = f"{node_id} -> {combo[0][2]}"
+                    else:
+                        branches = " & ".join(f"({c[2]})" for c in combo)
+                        lineage_str = f"{node_id} -> [{branches}]"
+                        
+                    yield (delta_sum, combined_nodes, lineage_str)
+            
+            # Keep Top max_combs combinations based on best (lowest/most negative) delta
+            pruned = heapq.nsmallest(self.max_combs, combo_generator(), key=lambda x: x[0])
+            
+            memo[node_id] = pruned[0][0] if pruned else float('inf')
+            return pruned
+
+        # Run traversal to get delta-based universes
+        delta_universes = traverse(start_node)
+        
+        # --- Convert Deltas back to Absolute Scores ---
+        final_universes = []
+        for delta, nodes_set, lineage in delta_universes:
+            final_universes.append((delta, nodes_set, lineage))
+
+        return final_universes, memo
+        
+    def _get_greedy_universe(self, start_node: str = "S0", max_depth: Optional[int] = None) -> Set[str]:
+        """Fast, top-down extraction of the purely greedy path, ignoring DP lookahead."""
+        nodes = self.tracker.state['nodes']
+        greedy_states = set()
+        active = [start_node]
+        
+        while active:
+            next_active = []
+            for node_id in active:
+                greedy_states.add(node_id)
+                node = nodes[node_id]
+                
+                task = self._parse_task(node['task'])
+                if max_depth is not None and task[0] >= max_depth:
+                    continue
+                
+                children = node['children']
+                if not children: continue
+                
+                # Group children by task (AND logic for splits)
+                groups = defaultdict(list)
+                for cid in children:
+                    c_node = nodes[cid]
+                    groups[c_node['task']].append(cid)
+                        
+                # For each required sub-task, greedily pick the lowest *immediate* score
+                for t_str, cids in groups.items():
+                    best_score = float('inf')
+                    best_cid = None
+                    for cid in cids:
+                        c_node = nodes[cid]
+                        c_task = self._parse_task(c_node['task'])
+                        
+                        ev = self._get_hist_node(c_task, node_id, cid)
+                        passed = ev.get('passed', True)
+                        
+                        if passed:
+                            s = ev['score']
+                        else:
+                            in_data = self._get_hist_node(c_task, node_id, "In")
+                            s = in_data['score']
+                            
+                        if s < best_score:
+                            best_score = s
+                            best_cid = cid
+                            
+                    if best_cid:
+                        next_active.append(best_cid)
+            active = next_active
+            
+        return greedy_states
+
+    def _flatten_history(self, state_ids: Set[str], nodes: Dict[str, Dict]) -> Dict[Tuple[int, int], Dict]:
+        """Extracts and formats the flat history sequence from a set of state IDs."""
+        flat_hist = {}
+        
+        for state_id in state_ids:
+            if state_id == "S0": continue
+            node = nodes.get(state_id)
+            if not node: continue
+            
+            parent_id = node['parent']
+            task = self._parse_task(node['task'])
+            
+            ev = self._get_hist_node(task, parent_id, state_id).copy()
+            if not ev: continue
+                
+            in_data = self._get_hist_node(task, parent_id, "In")
+            if in_data:
+                ev['in_score'] = in_data.get('score')
+                ev['in_tree']  = in_data.get('sp_tree')
+                ev['num_gts']  = in_data.get('num_gts')
+                
+            flat_hist[task] = ev
+
+        return dict(sorted(flat_hist.items()))
+
+    def get_bulk_histories(self, target_states: Set[str]) -> Dict[str, Tuple[Dict, str]]:
+        """Computes DP math exactly ONCE, then extracts flat histories for multiple target states."""
+        self.tracker.build_virtual_graph(self.history)
+        all_universes, _ = self.compute_all_universes(start_node="S0")
+        nodes = self.tracker.state['nodes']
+        
+        results = {}
+        
+        for s_id in target_states:
+            # Instantly filter the pre-computed math
+            valid_universes = [u for u in all_universes if s_id in u[1]]
+            if not valid_universes: continue
+                
+            # Extract the nodes for this specific target
+            _, best_states, lineage_str = valid_universes[0]
+            
+            flat_hist = self._flatten_history(best_states, nodes)
+                
+            results[s_id] = (flat_hist, lineage_str)
+            
+        return results
+
+    def get_multiverse_history(self, target_state_id: Optional[str] = None, start_node: str = "S0", max_depth: Optional[int] = None) -> Tuple[Dict[Tuple[int, int], Dict], str]:
+
+        self.tracker.build_virtual_graph(self.history)
+        all_universes, memo = self.compute_all_universes(start_node=start_node, max_depth=max_depth)
+        
+        valid_universes = all_universes
+        if target_state_id:
+            valid_universes = [u for u in all_universes if target_state_id in u[1]]
+            
+        if not valid_universes:
+            self.logger.log(f"No valid universes found (Target: {target_state_id})", 'w')
+            return {}, ""
+            
+        # Unpack the new 3-tuple
+        root_score, best_universe_states, lineage_str = valid_universes[0]
+        
+        self.logger.log("--- Universe Evaluation ---", 'i')
+        self.logger.log(f"Total Universe Score: {root_score}", 'i')
+        self.logger.log(f"Selected Lineage: {lineage_str}", 'd')
+
+        nodes = self.tracker.state['nodes']
+        flat_hist = self._flatten_history(best_universe_states, nodes)
+
+        greedy_paths = []
+
+        for opt_state in best_universe_states:
+            # Get the greedy suffix starting from this optimal node
+            greedy_suffix = self._get_greedy_universe(start_node=opt_state, max_depth=max_depth)
+            
+            # Build the full root-to-leaf path for the score plot highlighting
+            prefix = set()
+            curr = opt_state
+            while curr:
+                prefix.add(curr)
+                curr = nodes[curr]['parent']
+                
+            greedy_paths.append(prefix | greedy_suffix)
+        
+        debug_file = self.out_dir / f"best_history.json"
+        try:
+            import json
+            with open(debug_file, 'w') as f:
+                json.dump({str(k): v for k, v in flat_hist.items()}, f, indent=4)
+        except Exception as e:
+            self.logger.log(f"Failed to save Universe History: {e}", 'w')
+
+        self.plot_multiverse_evolution(best_universe_states, greedy_paths, memo)
+        self.plot_multiverse_rankings(all_universes, best_universe_states, greedy_paths)
+                
+        return flat_hist, lineage_str
+
+    def plot_multiverse_evolution(self, best_universe_states: Set[str], greedy_paths: List[Set[str]], memo: Dict[str, float], show_copies: bool = False):
+        """
+        Plots the multiverse search graph using a hierarchical, crossing-free layout with color-coded nodes and edges.
+        Displayed scores represent the optimal cumulative downstream parsimony (from the leaves up to that node), rather than isolated root-to-leaf
+        path totals. As a result, only the states comprising the globally optimal universe will display all constituent scores of that universe.
+        """
+        try:
+            import networkx as nx
+            import matplotlib.pyplot as plt
+            from matplotlib.lines import Line2D
+            
+            nodes = self.tracker.state['nodes']
+            G = nx.DiGraph()
+            labels, node_colors = {}, []
+            switch = self.switch
+            
+            # Helper to definitively identify branch intention based on active mode
+            def get_branch_type(task_tuple) -> str:
+                i, j = task_tuple
+                if i < switch:
+                    # Full mode regime
+                    return 'nested' if j > 0 else 'standard'
+                else:
+                    # Split mode regime
+                    return 'inner' if j % 2 == 1 else 'outer'
+
+            # Build the graph and assign edge colors dynamically
+            for n_id, n_data in nodes.items():
+                if not show_copies and n_data.get('is_copy'): continue
+                
+                G.add_node(n_id)
+                parent = n_data['parent']
+                if parent:
+                    if not show_copies and nodes[parent].get('is_copy'): continue
+                    
+                    task = self._parse_task(n_data['task'])
+                    b_type = get_branch_type(task)
+                    
+                    if b_type == 'inner': e_color = 'dodgerblue'
+                    elif b_type == 'outer': e_color = 'saddlebrown'
+                    elif b_type == 'nested': e_color = 'dimgray'
+                    else: e_color = 'gray'
+                        
+                    G.add_edge(parent, n_id, color=e_color)
+                    
+            # Determine Topological Depth (Y-axis)
+            depths = {}
+            def get_depth(node):
+                if node not in depths:
+                    parent = nodes[node]['parent']
+                    # Safer parent check since we might have hidden the parent
+                    if parent and parent in G.nodes():
+                        depths[node] = get_depth(parent) + 1
+                    else:
+                        depths[node] = 0
+                return depths[node]
+                
+            for n_id in G.nodes(): get_depth(n_id)
+
+            # Determine Horizontal Position (X-axis) via DFS
+            x_positions = {}
+            leaf_counter = 0
+
+            def assign_x(node):
+                nonlocal leaf_counter
+                children = list(G.successors(node))
+                
+                # Sort numerically (e.g., S1 before S2) for predictable left-to-right ordering
+                children.sort(key=lambda x: int(x.replace('S', '')) if x.startswith('S') and x[1:].isdigit() else x)
+                
+                if not children:
+                    x_positions[node] = leaf_counter
+                    leaf_counter += 1
+                else:
+                    for child in children:
+                        assign_x(child)
+                    x_positions[node] = sum(x_positions[c] for c in children) / len(children)
+
+            roots = [n for n, d in G.in_degree() if d == 0]
+            if roots:
+                assign_x(roots[0])
+            else:
+                for n in G.nodes():
+                    if n not in x_positions: assign_x(n)
+
+            pos = {node: (x_positions[node] * 2, -depths[node]) for node in G.nodes()}
+            
+            # Build visuals
+            greedy_universe_states = set().union(*greedy_paths) if greedy_paths else set()
+            for n_id in G.nodes():
+
+                score = memo.get(n_id, None)
+                if score is not None:
+                    score_str = f"{score:.0f}"
+                else:
+                    # Differentiate between actual parsimony failures and blocked searches
+                    passed = True
+                    p_id = nodes[n_id]['parent']
+                    if p_id:
+                        task = self._parse_task(nodes[n_id]['task'])
+                        ev = self._get_hist_node(task, p_id, n_id)
+                        passed = ev.get('passed', True)
+                    score_str = "0" if not passed else "BLOCK"
+
+                labels[n_id] = f"{n_id}\n({score_str})"
+
+                if getattr(self.tracker, 'symlink_anchors', None) and n_id in self.tracker.symlink_anchors:
+                    node_colors.append('orange') # It's a symlink anchor
+                elif n_id in best_universe_states:
+                    node_colors.append('lightgreen')
+                elif n_id in greedy_universe_states: 
+                    node_colors.append('lightcoral')
+                else:
+                    node_colors.append('lightgrey')
+
+            edge_colors = [G[u][v]['color'] for u, v in G.edges()]
+                    
+            plt.figure(figsize=(16, 10))
+            nx.draw(G, pos, with_labels=True, labels=labels, node_color=node_colors, 
+                    node_size=2400, font_size=8, font_weight="bold", 
+                    edge_color=edge_colors, width=1.5, arrows=True)
+            
+            legend_elements = [
+                Line2D([0], [0], color='w', marker='o', markerfacecolor='lightgreen', markersize=12, label='Optimal Universe'),
+                Line2D([0], [0], color='w', marker='o', markerfacecolor='orange', markersize=12, label='Deduplication Nodes'),
+                Line2D([0], [0], color='w', marker='o', markerfacecolor='lightcoral', markersize=12, label='Greedy Path Divergence'),
+                Line2D([0], [0], color='gray', lw=2, label='Sequential'),
+                Line2D([0], [0], color='saddlebrown', lw=2, label='Outer Split'),
+                Line2D([0], [0], color='dodgerblue', lw=2, label='Inner Split')
+            ]
+            plt.legend(handles=legend_elements, loc='upper left', fontsize=10, 
+                       title="Branch Types", title_fontsize='11', framealpha=0.9)
+            
+            plt.title("Multiverse Evolution:\nHierarchical Layout of All Search Paths", fontsize=14)
+            out_file = self.out_dir / "multiverse_evolution.png"
+            plt.savefig(out_file, dpi=600, bbox_inches='tight')
+            plt.close()
+            self.logger.log(f"Saved Multiverse Evolution plot to {out_file}", 'd')
+            
+        except ImportError:
+            self.logger.log("NetworkX or Matplotlib not installed. Skipping multiverse evolution plot.", 'w')
+
+    def plot_multiverse_rankings(self, all_universes: List[Tuple[float, Set[str], str]], best_universe_states: Set[str], greedy_paths: List[Set[str]]):
+        """
+        Plots a comparison ranking of all complete root-to-leaf universes evaluated.
+        Scores are the absolute total parsimony savings (lower is better): each bar is an entire universe.
+        Colors are green for the optimal universe, red for any universe that shares nodes with any of the greedy paths, and blue for others.
+        """
+        try:
+            import matplotlib.pyplot as plt
+            
+            valid_universes = [u for u in all_universes if u[0] != float('inf')]
+            len_universes = len(valid_universes)
+            if not valid_universes or len_universes < 2: return
+            if len_universes > 30:
+                self.logger.log(f"Too many universes to plot ({len_universes}). Top 30 will be shown.", 'i')
+                valid_universes = valid_universes[:30]
+            
+            u_labels = []
+            s_vals = []
+            colors = []
+            
+            for rank, (score, combined_nodes, lineage_str) in enumerate(valid_universes):
+                # Truncate string if it gets too long for plotting
+                if len(lineage_str) > 35:
+                    label = lineage_str[:32] + "..."
+                else:
+                    label = lineage_str
+                    
+                label = f"{label} (#{rank+1})"
+                u_labels.append(label)
+                s_vals.append(score)
+
+                # Highlight logic (Winner takes priority)
+                is_winner = combined_nodes == best_universe_states
+                is_greedy = any(combined_nodes.issubset(g_path) for g_path in greedy_paths)
+                
+                if is_winner:
+                    colors.append('lightgreen')
+                elif is_greedy:
+                    colors.append('lightcoral')
+                else:
+                    colors.append('skyblue')
+
+            fig_width = max(12, len(u_labels) * 0.35)
+            plt.figure(figsize=(fig_width, 7))
+            
+            bars = plt.bar(u_labels, s_vals, color=colors)
+            
+            plt.ylabel("Total Score-Loss (Lower is better)")
+            plt.xlabel("Universe Traversal Path (Root -> Leaves)")
+            plt.title(f"All Complete Universes Ranked by Score Improvement (Top {len(valid_universes)})")
+            
+            plt.xticks(rotation=45, ha='right', fontsize=8)
+            
+            if len(bars) <= 60:
+                for bar in bars:
+                    plt.text(bar.get_x() + bar.get_width()/2.0, bar.get_height(), 
+                             f'{bar.get_height():.1f}', va='bottom', ha='center', 
+                             fontsize=8, rotation=90)
+                
+            plt.tight_layout()
+            out_file = self.out_dir / "multiverse_rankings.png"
+            plt.savefig(out_file, dpi=600)
+            plt.close()
+            self.logger.log(f"Saved Multiverse Ranking plot to {out_file}", 'd')
+            
+        except ImportError:
+            self.logger.log("Matplotlib not installed. Skipping multiverse scores plot.", 'w')
 
 class FlowManager:
     def __init__(self, ctx: GlobalContext, mode: str, logger: GranLogger):
@@ -17,7 +672,10 @@ class FlowManager:
         self.mode = mode
         self.sample = self.set_sampling_func(ctx.sample)
         self.logger = logger
-        
+        self.tracker = BeamTracker(self.ctx.beam_file)
+        self.navigator = PathNavigator(self.tracker, self.ctx.history, self.ctx.root_dir, self._infer_switch(), self.logger)
+        self.best_history = None
+       
     # --- Init Methods ---
 
     def set_sampling_func(self, n: int) -> callable:
@@ -43,49 +701,42 @@ class FlowManager:
 
     # --- Overlapping Methods for Full and Split Modes ---
 
-    def _check_if_passed(self, i: int, j: int, curr_event: dict) -> bool:
-        """Returns True if the event should be accepted."""
-        cut_type, cut_val = self.ctx.cutoff
+    def _check_if_passed__(self, i: int, j: int, scores: dict, search_state_id: str, valleys: Tuple[float, float, float]) -> bool:
+        """Returns True if the event should be accepted based on the cutoff rules."""
+        ref_type, diff_func, offset = self.ctx.cutoff
+        switch = self._infer_switch()
 
-        # --- Determine which score to compare against ---
+        if ref_type == 'none': return True
+        if i < switch and j > 0: return True # Nested-fix always passes
 
-        # In split mode / the first iteration of full mode: compare to the input score of the current event
-        if self.mode == 'split' or i == 0:
-            comp_score = curr_event['input_score']
-        # The rest are full mode iterations after the first one
-        elif j > 0:
-            # Nested fix always passes
-            return True
-        else:
-            # Look-back: compare to the non-input score of the previous event
-            # (i.e., the score of the tree we are modifying, before re-evaluation in the current iteration)
-            prev_event = self._get_prev_event(i, j)
-            comp_score = prev_event['nonin_score']
+        # Determine the Base Reference Score
+        if ref_type == 'input':
+            if i >= switch or i == 0: # Split regime or first iteration of full mode
+                comp_score = scores['input']
+            else: # Full mode after first iteration: look back to parent event's non-input score
+                comp_score = self._get_prev_score(i, j, search_state_id)
+        elif ref_type == 'fvall': comp_score = valleys[0]
+        elif ref_type == 'lvall': comp_score = valleys[1]
+        elif ref_type == 'rvall': comp_score = valleys[2]
+        else:                     self.logger.log(f"Unknown cutoff reference type: {ref_type}.", 'e')
             
-        # --- Apply type of cutoff ---
-        if cut_type == 'rel': cut_val *= comp_score
-            
-        return cut_val < (comp_score - curr_event['nonin_score'])
+        # Apply the cutoff
+        if diff_func == 'rel': offset *= comp_score
+        return offset < (comp_score - scores['own'])
 
-    def _get_prev_event(self, i: int, j: int) -> Optional[dict]:
+    def _get_prev_score__(self, i: int, j: int, search_state_id: str) -> float:
         """
-        Retrieves the previous event data from history.
+        Retrieves the previous event's own score from history.
+        Uses the PathNavigator to safely resolve any symlink paths.
         """
-        if i == 0:
-            return None
-        else:
-            if self.mode == 'split':
-                # In the split mode, the depth i and index j represent binary recursion
-                return self.ctx.history.get((i-1, j//2))
-            else:
-                if self.ctx.cutoff[0] == 'auto' and j == 0:
-                    prev_event = self.ctx.history.get((i-1, 0))
-                else:
-                    if j > 0:
-                        prev_event = self.ctx.history.get((i, j-1))
-                    else:
-                        prev_event = self.ctx.history.get((i-1, 0))
-        return prev_event
+        parent_id = self.tracker.state['nodes'][search_state_id]['parent']
+        parent_node = self.tracker.state['nodes'][parent_id]
+        p_task = self.navigator._parse_task(parent_node['task'])
+        
+        # Safely fetch the historical event, correctly resolving virtual/symlinked nodes
+        ev = self.navigator._get_hist_node(p_task, parent_id, search_state_id)
+
+        return ev['score']        
 
     def _get_nonin_rank(self, res: TaskResult) -> int:
         """Returns the index of the best non-input MulTree."""
@@ -96,107 +747,142 @@ class FlowManager:
             nonin_rank = None
         return nonin_rank
     
-    def judge_event(self, i: int, j: int, res: TaskResult, transform: Optional[Callable] = None) -> Tuple[bool, Optional[int], Optional[MulTree], Optional[Any]]:
+    def save_events(self, i: int, j: int,
+                     res: TaskResult,
+                     search_state_id: str,
+                     transform: Optional[Callable] = None) -> List[Tuple[int, MulTree, str, Optional[Any], float]]:
+        
+        self.ctx.history[(i, j)][search_state_id]["In"] = {
+            'num_gts': len(res.gene_trees),
+            'sp_tree': res.mul_trees[0].mt.to_str(internals=True) if 0 in res.mul_trees else "NA",
+            'score': res.input_score
+        }
+
+        passed_events = []
+        
+        # Kept scores are in res.passed_events
+        kept_idxs = [idx for idx in res.passed_events.keys() if idx != 0]
+        kept_scores = [(idx, score) for idx, score in res.sorted_scores if idx in kept_idxs]
+
+        if not kept_scores or search_state_id is None:
+            self.ctx.history.save()
+            return []
+
+        for nonin_idx, nonin_score in kept_scores:
+            nonin_mt = res.mul_trees[nonin_idx]
+            passed = res.passed_events[nonin_idx]
+
+            h_nodes = [nonin_mt.h1_node] + nonin_mt.hx_nodes
+            transform_result = transform(nonin_mt, i, j) if transform else None
+            sister_nodes = [nonin_mt.mt.get_sis(n) for n in h_nodes]
+            new_state_id = self.tracker.spawn_child(search_state_id, f"{i}.{j}", nonin_idx)
+
+            self.ctx.history[(i, j)][search_state_id][new_state_id] = {
+                'mt_idx': nonin_idx,
+                'mt_tree': nonin_mt.mt.to_str(internals=True),
+                'h_name': nonin_mt.h1_node.name,
+                'h_locs': [n.name if n is not None else 'None' for n in sister_nodes],
+                'h_leaves': nonin_mt.h1_node.get_leaf_names(),
+                'score': nonin_score,
+                'passed': passed,
+            }
+
+            if passed:
+                passed_events.append((nonin_idx, nonin_mt, new_state_id, transform_result, nonin_score))
+
+        self.ctx.history.save()
+        return passed_events
+        
+    def judge_events__(self, i: int, j: int,
+                     res: TaskResult,
+                     search_state_id: str,
+                     transform: Optional[Callable] = None) -> List[Tuple[int, MulTree, str, Optional[Any]]]:
         """
-        Judges whether the current event passes the parsimony cutoff and prepares data for the next iteration.
+        Judges whether the current events pass the parsimony cutoff and prepares data for the next iteration.
         Logs the input and best, or, if input is best, input and second-best MulTree data for history tracking.
         """
-        step = "Assessing event parsimony"
+        step = "Assessing events parsimony"
         self.logger.report_step(step, "In progress...")
 
         best_idx = res.mt_idx()
-        best_mt = res.mul_trees[best_idx]
-        best_mt_str = best_mt.mt.to_str(internals=True) # Cache before renaming if == nonin_mt
+        best_mt_str = res.mul_trees[best_idx].mt.to_str(internals=True)
         input_score = res.input_score
+        valleys = res.valleys
 
-        nonin_rank = self._get_nonin_rank(res)
-        if nonin_rank is None:
-            passed = False
-            self.logger.report_step(step, "Failed.: no non-input tree to assess")
-
-            step = "Logging event data to history"
-            self.logger.report_step(step, "In progress...")
-            self.ctx.history[(i, j)] = {
-                'best_mt': best_mt_str,
+        # Safely init nested dictionaries with the first entry refering to common event-level data
+        '''self.ctx.history.setdefault((i, j), {}).setdefault(search_state_id, {
+            "In": {
                 'num_gts': len(res.gene_trees),
+                'sp_tree': res.mul_trees[0].mt.to_str(internals=True),
+                'score': input_score
+            }
+        })'''
+
+        # NEW: Automatically creates (i, j) and search_state_id if they don't exist.
+        # If "In" already exists, this WILL raise a KeyError, protecting your data!
+        self.ctx.history[(i, j)][search_state_id]["In"] = {
+            'num_gts': len(res.gene_trees),
+            'sp_tree': res.mul_trees[0].mt.to_str(internals=True),
+            'score': input_score
+        }
+
+        passed_events = []
+        
+        # Kept maps dictate which MTs were evaluated completely (already bounded by max_select)
+        kept_idxs = [idx for idx in res.kept_mul_maps.keys() if idx != 0]
+        # Scores are already sorted in ascending order to process best trees first
+        kept_scores = [(idx, score) for idx, score in res.sorted_scores if idx in kept_idxs]
+
+        if not kept_scores:
+            self.logger.report_step(step, "Failed: no non-input trees to assess")
+            """self.ctx.history[(i, j)][search_state_id][-1] = {
+                'best_mt': best_mt_str,
+                #'num_gts': len(res.gene_trees),
                 'input_score': input_score,
                 'nonin_score': 'N/A',
+                'passed': False,
+            }"""
+            self.ctx.history.save()
+            return []
+
+        for nonin_idx, nonin_score in kept_scores:
+            nonin_mt = res.mul_trees[nonin_idx]
+            
+            curr_event = {'input': input_score, 'own': nonin_score}
+            passed = self._check_if_passed(i, j, curr_event, search_state_id, valleys)
+
+            h_nodes = [nonin_mt.h1_node] + nonin_mt.hx_nodes
+
+            # Apply operations which must take place BEFORE saving history!
+            transform_result = transform(nonin_mt, i, j) if transform else None
+
+            sister_nodes = [nonin_mt.mt.get_sis(n) for n in h_nodes]
+
+            new_state_id = self.tracker.spawn_child(search_state_id, f"{i}.{j}", nonin_idx)
+
+            self.ctx.history[(i, j)][search_state_id][new_state_id] = {
+                'mt_idx': nonin_idx,
+                'mt_tree': nonin_mt.mt.to_str(internals=True),
+                'h_name': nonin_mt.h1_node.name,
+                'h_locs': [n.name if n is not None else 'None' for n in sister_nodes],
+                'h_leaves': nonin_mt.h1_node.get_leaf_names(),
+                #'num_gts': len(res.gene_trees),
+                #'input_score': input_score,
+                'score': nonin_score,
                 'passed': passed,
             }
-            self.update_history()
-            self.logger.report_step(step, "Success")
 
-            return passed, None, None, None
-        
-        nonin_idx = res.mt_idx(nonin_rank)
-        nonin_score = res.mt_score(nonin_rank)
-        nonin_mt = res.mul_trees[nonin_idx]
-        h_nodes = [nonin_mt.h1_node] + nonin_mt.hx_nodes
+            if passed:
+                passed_events.append((nonin_idx, nonin_mt, new_state_id, transform_result))
 
-        if self.ctx.debug:
-            hx_str = [f'{n.name} (H{x+2})' for x, n in enumerate(h_nodes[1:])]
-            kind = "Splitting" if self.mode == "split" else "Renaming"
-            self._debug_tree(f"{kind} Context: {h_nodes[0].name} (H1) | {' | '.join(hx_str)}", nonin_mt.mt.ete_tree, other_attr=['pure'])
+        self.ctx.history.save()
 
-        self.logger.log(f"Best non-input index: {nonin_idx}; Best index: {best_idx}", 'd')
-        self.logger.log(f"Input tree score: {input_score}; Best non-input tree score: {nonin_score}", 'd')
-
-        passed = self._check_if_passed(i, j, {'input_score': input_score, 'nonin_score': nonin_score})
-
-        if passed:
-            if self.mode == "full" and j > 0:
-                self.logger.report_step(step, "Skip...: deferred by nested assessment")
-            else:
-                self.logger.report_step(step, f"Success: event accepted w/ score {nonin_score}")
+        if passed_events:
+            self.logger.report_step(step, f"Success: {len(passed_events)} events accepted")
         else:
-            self.logger.report_step(step, "Failed.: parsimony cutoff not met")
+            self.logger.report_step(step, "Failed: parsimony cutoff not met")
 
-        # --- Prepare data for history logging regardless of pass/fail ---
-
-        nonin_mt = res.mul_trees[nonin_idx]
-
-        # Apply operations which must take place BEFORE saving history!
-        transform_result = transform(nonin_mt, i, j) if transform else None
-
-        step = "Logging event data to history"
-        self.logger.report_step(step, "In progress...")
-
-        sister_nodes = [nonin_mt.mt.get_sis(n) for n in h_nodes]
-        # Save event data to history regardless of pass/fail
-        self.ctx.history[(i, j)] = {
-            'best_mt': best_mt_str,
-            'nonin_mt': nonin_mt.mt.to_str(internals=True),
-            'h_name': nonin_mt.h1_node.name,
-            'h_locs': [n.name if n is not None else 'None' for n in sister_nodes], # H nodes or sisters cannot be the root node! But may be None in source STs
-            'h_leaves': nonin_mt.h1_node.get_leaf_names(),
-            'num_gts': len(res.gene_trees),
-            'input_score': input_score,
-            'nonin_score': nonin_score,
-            'passed': passed,
-        }
-        self.update_history()
-
-        self.logger.report_step(step, "Success")
-
-        return passed, nonin_idx, nonin_mt, transform_result
-    
-    def update_history(self):
-        #sis_nodes = self._get_sis_nodes(nonin_mt.h1_node, nonin_mt.h2_node)
-
-        # Embed an attr H in each sis_node
-        #for n in sis_nodes:
-        #    if n is None: continue
-        #    if not hasattr(n, 'H'):
-        #        n.add_feature('H', [])
-        #    n.H.append(str((i, j))) # Track which events this node was involved in for nested detection / gluing logic
-
-        #if self.logger.debug:
-        #    # No longer needed to parse iterations, but is very useful for debugging
-        #    track_dict = {n.name: n.H for n in nonin_mt.mt.ete_tree.traverse() if hasattr(n, 'H')}
-        #    self.ctx.history[(i, j)]['trackers'] = track_dict
-
-        with open(self.ctx.history_file, 'w') as f:
-            json.dump({str(k): v for k, v in self.ctx.history.items()}, f, indent=4)
+        return passed_events
 
     # --- Handlers for the Full mode ---
 
@@ -221,7 +907,7 @@ class FlowManager:
         self.logger.report_step(step, "Success")
         return suffix_name_map # suffix -> set of original names (for syncing GTs)
 
-    def _relabel_gene_trees(self, res: TaskResult, best_mt_idx: int, suffix_name_map: Dict[str, Set[str]]) -> Dict[int, SmrtTree]:
+    def _relabel_gene_trees(self, res: TaskResult, best_mt_idx: int, suffix_name_map: Dict[str, Set[str]], copy_gts: bool) -> Dict[int, SmrtTree]:
         """
         Renames Gene Trees to match the Species Tree renaming logic.
         Uses the mapping generated by _rename_best_mt.
@@ -230,7 +916,9 @@ class FlowManager:
         step = "Relabeling gene trees"
         self.logger.report_step(step, "In progress...")
 
-        gts = res.gene_trees
+        if copy_gts: gts = {k: v.copy() for k, v in res.gene_trees.items()}
+        else: gts = res.gene_trees
+
         min_maps = res.kept_mul_maps[best_mt_idx]
         
         debug_sample = self.sample(list(min_maps.keys()))
@@ -349,11 +1037,12 @@ class FlowManager:
         return smallest_event_root.name == node.name
 
     def relabel_problem(
-            self, i: int, res: TaskResult,
+            self, i: int, res: TaskResult, event: Any,
             iter_out: Path,
             iter_logger: GranLogger,
             j: int = 0,
-            targets: Optional[List[str]] = None
+            targets: Optional[List[str]] = None,
+            copy_gts: bool = False
         ) -> Tuple[Optional[MulTree], Optional[Dict[int, SmrtTree]], Dict[str, Set[str]]]:
         """
         Handles the end of a 'Full' mode iteration using tip renaming for both the best MT and GTs.
@@ -361,16 +1050,12 @@ class FlowManager:
         """
         self.logger = iter_logger
 
-        # Update history & check if passed cutoff
-        # Rename best non-input MT in-place while evaluating the event
-        passed, nonin_idx, next_mt, suffix_name_map = self.judge_event(i, j, res, transform=self._relabel_species_tree)
+        mt_idx, select_mt, _, _, _ = event
 
-        if not passed:
-            # Returns the input tree, i.e. index 0 in the mt dict.
-            return res.mul_trees[0], None, None
+        suffix_name_map = self._relabel_species_tree(select_mt, i, j)
 
         # Rename Trees for Next Iteration
-        next_gts = self._relabel_gene_trees(res, nonin_idx, suffix_name_map)
+        next_gts = self._relabel_gene_trees(res, mt_idx, suffix_name_map, copy_gts)
 
         if self.ctx.nesting in {"rectify", "strict_rectify"}:
             step = "Checking for nested events"
@@ -378,7 +1063,7 @@ class FlowManager:
             if j == 0:
                 # Check for Nested Hybridization
                 # This encapsulates the while-loop for recursive sub-fixes
-                targets = self.find_missing_targets(next_mt)
+                targets = self.find_missing_targets(select_mt)
                 # Sort targets to ensure deterministic order (important for testing/debugging)
                 # We could sort by clade size to avoid needing to update future targets as we rename,
                 # But this is less intuitive and not always correct.
@@ -413,7 +1098,7 @@ class FlowManager:
         self.logger.report_step(step, "In progress...")
 
         # Write handoff files for resume support
-        CommonOps.export_tree_files(iter_out.parent, next_mt.mt.ete_tree, [gt.ete_tree for gt in next_gts.values()])
+        CommonOps.export_tree_files(iter_out.parent, select_mt.mt.ete_tree, [gt.ete_tree for gt in next_gts.values()])
 
         if self.ctx.nesting in {"rectify", "strict_rectify"} and targets:
             success_msg = f"ready for task {i}.{j+1}"
@@ -422,18 +1107,22 @@ class FlowManager:
 
         self.logger.report_step(step, f"Success: {success_msg}")
         
-        return next_mt, next_gts, targets
+        return select_mt, next_gts, targets
     
     # --- Handlers for the Split mode ---
     
-    def _partition_gene_trees(self, res: TaskResult, best_mt_idx: int) -> Tuple[Dict[int, SmrtTree], Dict[int, SmrtTree], Dict[int, List[int]]]:
+    def _partition_gene_trees(self,
+                              res: TaskResult, best_mt_idx: int,
+                              select_mt: MulTree, copy_gts: bool) -> Tuple[Dict[int, SmrtTree], Dict[int, SmrtTree], Dict[int, List[int]]]:
         """Splits GTs into backbone (Outer) and hybrid clades (Inner)."""
         step = "Partitioning gene trees"
         self.logger.report_step(step, "In progress...")
 
-        gts = res.gene_trees
+        if copy_gts: gts = {k: v.copy() for k, v in res.gene_trees.items()}
+        else: gts = res.gene_trees
+
         min_maps = res.kept_mul_maps[best_mt_idx]
-        h_copy_map = res.mul_trees[best_mt_idx].build_h_copy_map() # mt_node -> copy_idx (0 for H1, 1 for H2, etc.)
+        h_copy_map = select_mt.build_h_copy_map() # mt_node -> copy_idx (0 for H1, 1 for H2, etc.)
 
         outer_gts, inner_gts = {}, {}
         gt_split_dict = defaultdict(list)
@@ -524,13 +1213,13 @@ class FlowManager:
         self.logger.report_step(step, f"Success: got {len(outer_gts)} out. & {len(inner_gts)} in. gts")
         return inner_gts, outer_gts, gt_split_dict
 
-    def _partition_species_tree(self, best_mt: MulTree) -> Tuple[SmrtTree, Optional[SmrtTree]]:
+    def _partition_species_tree(self, select_mt: MulTree) -> Tuple[SmrtTree, Optional[SmrtTree]]:
         """Safely creates the Inner and Outer Species Trees."""
         step = "Partitioning species tree"
         self.logger.report_step(step, "In progress...")
             
-        names_to_trim = [best_mt.h1_node.name] + [n.name for n in best_mt.hx_nodes]
-        outer_wrapper, inner_wrapper, _ = best_mt.partition('h1')
+        names_to_trim = [select_mt.h1_node.name] + [n.name for n in select_mt.hx_nodes]
+        outer_wrapper, inner_wrapper, _ = select_mt.partition('h1')
 
         self._debug_tree("Inner Species Tree (Hybrid Clade):", inner_wrapper.ete_tree)
 
@@ -543,9 +1232,8 @@ class FlowManager:
         return inner_wrapper, outer_wrapper
 
     def extract_subproblems(
-            self, bin_id: Tuple[int, int], res: TaskResult,
-            iter_out: Path,
-            iter_logger: GranLogger
+            self, bin_id: Tuple[int, int], res: TaskResult, events: list,
+            iter_out: Path, iter_logger: GranLogger
         ) -> Optional[List[ConcurrTask]]:
         """
         Processes a split worker result using ETE3-safe surgery and O(N) GT extraction.
@@ -556,57 +1244,235 @@ class FlowManager:
         backup_logger = self.logger
         self.logger = iter_logger
 
-        # Determine Depth and Index from Binary ID
         depth, idx = bin_id
-
-        passed, nonin_idx, next_mt, _ = self.judge_event(depth, idx, res)
-
-        if not passed:
-            return None # Event not taken!
-
-        # --- Extract Subproblems ---
-
-        # Partition the Gene Trees into Inner and Outer sets
-        inner_gts, outer_gts, gt_split_dict = self._partition_gene_trees(res, nonin_idx)
-
-        # Perform topological surgery on the Species Tree
-        inner_wrapper, outer_wrapper = self._partition_species_tree(next_mt)
-
-        step = "Extracting inferred event subproblems"
-        self.logger.report_step(step, "In progress...")
-
-        # Queue Tasks with binary IDs: Outer first
         next_tasks = []
-        if outer_wrapper and len(outer_wrapper) >= self.ctx.min_st_lvs and len(outer_gts) > 0:
-            next_tasks.append((outer_wrapper, outer_gts, (depth + 1, idx * 2)))
-        if len(inner_wrapper) >= self.ctx.min_st_lvs and len(inner_gts) > 0:
-            next_tasks.append((inner_wrapper, inner_gts, (depth + 1, idx * 2 + 1)))
+        gt_split_dict_all = {}
+        last_mt_idx = events[-1][0]
 
-        self.logger.report_step(step, f"Success: extracted {len(next_tasks)} valid subproblems")
+        # Tracker for Execution Deduplication
+        task_signatures = {}
 
-        step = "Writing handoff files"
-        self.logger.report_step(step, "In progress...")
+        for mt_idx, branch_mt, new_state_id, _, _ in events:
 
-        # Write gt_split_dict to a file
-        gt_split_path = iter_out.parent / f"gt_splits.json"
-        with open(gt_split_path, 'w') as f:
-            json.dump(gt_split_dict, f, indent=4)
+            copy_gts = (mt_idx != last_mt_idx) # Only deepcopy if this is a new MT to avoid unnecessary copying
+
+            # Partition the Gene Trees into Inner and Outer sets
+            inner_gts, outer_gts, gt_split_dict_all[new_state_id] = self._partition_gene_trees(res, mt_idx, branch_mt, copy_gts)
+
+            # Perform topological surgery on the Species Tree
+            inner_wrapper, outer_wrapper = self._partition_species_tree(branch_mt)
+
+            step_extract = f"Extracting inferred event subproblems ({new_state_id})"
+            self.logger.report_step(step_extract, "In progress...")
+
+            # Define subproblems cleanly: (Label, Wrapper, GTs, Task_Offset)
+            subproblems = [
+                ("Outer", outer_wrapper, outer_gts, 0),
+                ("Inner", inner_wrapper, inner_gts, 1)
+            ]
+
+            # Process both Outer and Inner subproblems without redundant code
+            for label, wrapper, gts, offset in subproblems:
+                if wrapper and len(wrapper) >= self.ctx.min_st_lvs and len(gts) > 0:
+                    
+                    # Signature: Taxa content + Gene Tree count
+                    sig_str = '|'.join(sorted(wrapper.ete_tree.iter_leaf_names())) + '|' + str(len(gts))
+                    sig = hash(sig_str)
+                    self.logger.log(f"{sig}: {sig_str}", 'd') # Log the signature for debugging
+
+                    task_id = (depth + 1, idx * 2 + offset)
+                    
+                    if sig in task_signatures:
+                        source_state_id = task_signatures[sig]
+                        
+                        # Create the Virtual Clone in History
+                        self.ctx.history[task_id][new_state_id] = {"__symlink__": source_state_id}
+                        self.logger.log(f"Optimization: {label} task for {new_state_id} symlinked to identical subproblem {source_state_id}", 'i')
+                    else:
+                        task_signatures[sig] = new_state_id
+                        next_tasks.append((wrapper, gts, task_id, new_state_id))
+
+            self.logger.report_step(step_extract, f"Success: extracted {len(next_tasks)} valid subproblems")
+
+        step_write = "Writing handoff files"
+        self.logger.report_step(step_write, "In progress...")
+
+        # Write combined splits
+        with open(iter_out.parent / f"gt_splits.json", 'w') as f:
+            json.dump(gt_split_dict_all, f, indent=4)
 
         # Write handoff files for resume support
         task_strs = []
-        for task_st, task_gts, task_id in next_tasks:
+        # Unpack the 4-tuple, ensuring we write to the isolated new_state_id
+        for task_st, task_gts, task_id, new_state_id in next_tasks:
             task_str = f"{task_id[0]}.{task_id[1]}"
-            task_strs.append(task_str)
-            task_out = iter_out.parent / task_str
+            task_str_ = f"{new_state_id}->{task_str}"
+            task_strs.append(task_str_)
+            
+            # Isolated directory pathing
+            task_out = iter_out.parent / task_str / new_state_id
             task_out.mkdir(parents=True, exist_ok=True)
             CommonOps.export_tree_files(task_out, task_st.ete_tree, [gt.ete_tree for gt in task_gts.values()])
 
         if task_strs:
-            self.logger.report_step(step, f"Success: ready for tasks {', '.join(task_strs)}")
+            self.logger.report_step(step_write, f"Success: ready for {len(task_strs)} tasks")
+            self.logger.log(f"INFO: Tasks generated: {', '.join(task_strs)}", 'i')
         else:
-            self.logger.report_step(step, "Success")
+            self.logger.report_step(step_write, "Success")
+            self.logger.log("INFO: No tasks generated.", 'i')
+            
         self.logger = backup_logger
         return next_tasks
+
+    def process_depth_batch(self, batch_results: list, depth: int, max_select: int) -> List[ConcurrTask]:
+        """
+        Assimilates a complete batch of worker results, extracts subproblems, 
+        and applies Lookahead and Breadth filters highly efficiently.
+        """
+        next_tasks = []
+
+        def sort_key(item):
+            task_id, _, _, _, search_state_id = item
+            # Primary Sort (External): Parse "S42" to 42 so S2 sorts before S10
+            s_num = int(search_state_id.replace('S', ''))
+            # Secondary Sort (Internal): task_id tuple (which naturally sorts the 'j' index)
+            return (s_num, task_id)
+            
+        batch_results.sort(key=sort_key)
+        all_results = []
+        current_active_states = []
+        
+        # Save Events
+        for task_id, res, _, log_inheritance, state_id in batch_results:
+            if not res: continue
+            
+            min_mt_repr = res.repr_min_mt
+
+            iter_out = self.ctx.get_task_dir(task_id, state_id, is_beam= max_select != 1)
+            
+            passed_events = self.save_events(task_id[0], task_id[1], res, state_id)
+            
+            if passed_events:
+                for ev in passed_events:
+                    current_active_states.append(ev[2]) # new_state_id
+            
+            all_results.append((task_id, res, iter_out, log_inheritance, passed_events, min_mt_repr))
+
+        # Global Filtration (Lookahead & Breadth)
+        self.apply_universe_filters(depth, current_active_states)
+
+        # Log Assimilation and Preparation of Next Tasks
+        tracker_nodes = self.tracker.state['nodes']
+        for task_id, res, iter_out, log_inheritance, passed_events, min_mt_repr in all_results:
+
+            # Assimilate the worker's log into the main logger
+            self.logger.assimilate(log_inheritance.log_file, warnings=log_inheritance.warnings)
+            iter_logger = GranLogger(None, self.ctx.verbosity, self.ctx.debug, parent_logger=self.logger, inheritance=log_inheritance)
+
+            if passed_events:
+                unblocked_events = [ev for ev in passed_events if not tracker_nodes[ev[2]].get('blocked', False)]
+                if unblocked_events:
+                    extracts = self.extract_subproblems(task_id, res, unblocked_events, iter_out, iter_logger)
+                    if extracts:
+                        next_tasks.extend(extracts)
+
+            iter_logger.end_report(*min_mt_repr)
+
+        return next_tasks
+
+    def apply_universe_filters(self, depth: int, current_active_states: List[str]) -> None:
+
+        if not current_active_states: return
+
+        l_val = self.ctx.lookahead
+        b_val = self.ctx.breadth_max
+
+        if l_val <= 0 and b_val <= 0: return
+
+        # Optimization: only query the global universes once to execute both filters
+        graph_mutated = False
+        all_universes = []
+        blocked_str = lambda lst: f"branches {', '.join(lst)}" if len(lst) <= 5 else f"branch {len(lst)} states"
+
+        # Lookahead Filtration
+        if l_val > 0 and depth >= l_val:
+            all_universes, _ = self.navigator.compute_all_universes(start_node="S0")
+            valid_universes = [u for u in all_universes if u[0] != float('inf')]
+            
+            # If no valid universes, quit this filter
+            target_prune_depth = depth - l_val if valid_universes else 0
+            
+            if target_prune_depth > 0:
+                nodes = self.tracker.state['nodes']
+                prune_candidates = defaultdict(list)
+                blocked = []
+                
+                # Group nodes at target prune depth by their parent
+                for nid, ndata in nodes.items():
+                    task = self.navigator._parse_task(ndata['task'])
+                    if task[0] == target_prune_depth:
+                        p_id = ndata['parent']
+                        if p_id: prune_candidates[p_id].append(nid)
+
+                # Pre-compute the best score for every node in O(Universes) time
+                node_best_scores = defaultdict(lambda: float('inf'))
+                for score, nodes_set, _ in valid_universes:
+                    for node in nodes_set:
+                        if score < node_best_scores[node]:
+                            node_best_scores[node] = score
+                            
+                for p_id, children in prune_candidates.items():
+                    if len(children) <= 1: continue # No sibling choices to prune
+
+                    # O(Children) lookup instead of O(Children * Universes)
+                    best_child = min(children, key=lambda c: node_best_scores[c])
+                    
+                    if node_best_scores[best_child] != float('inf'):
+                        for child_id in children:
+                            if child_id != best_child:
+                                bad_descendants = self.tracker.block_branch(child_id)
+                                blocked.append(child_id)
+
+                if blocked:
+                    graph_mutated = True
+                    self.logger.log(f"Lookahead ({l_val}): Blocked sub-optimal {blocked_str(blocked)} originating from depth {target_prune_depth}", 'i')
+
+        # Max Breadth Filtration
+        if b_val > 0:
+            if graph_mutated or not all_universes:
+                all_universes, _ = self.navigator.compute_all_universes(start_node="S0")
+                
+            valid_universes = [u for u in all_universes if u[0] != float('inf')]
+            
+            if len(valid_universes) > b_val:
+                top_universes = valid_universes[:b_val]
+                allowed_active_nodes = set()
+                for score, nodes_set, _ in top_universes:
+                    allowed_active_nodes.update(nodes_set)
+                blocked = []
+
+                for state_id in current_active_states:
+                    if state_id not in allowed_active_nodes:
+                        bad_descendants = self.tracker.block_branch(state_id)
+                        blocked.append(state_id)
+                        
+                if blocked:
+                    graph_mutated = True
+                    self.logger.log(f"Breadth ({b_val}): Blocked {blocked_str(blocked)} from depth {depth+1} (capping at {b_val} top branches)", 'i')
+
+    # -- Recombination Logic for the Split mode ---
+
+    def get_bulk_state_caches(self, root_task_id: Tuple[int, int], unique_states: Set[str]) -> Dict[str, SmrtTree]:
+        """Silently glues state caches in bulk using pre-computed math."""
+        histories = self.navigator.get_bulk_histories(unique_states)
+        trees = {}
+        
+        # Suspend logger output for the entire batch to keep the console clean
+        with self.logger.silenced(True):
+            for s_id, (univ_hist, desc) in histories.items():
+                trees[s_id] = self._iterative_glue(root_task_id, univ_hist)
+                
+        return trees
 
     def glue_split_results(self, root_id: Tuple[int, int] = (0, 0), is_silent: bool = False) -> SmrtTree:
         """
@@ -616,12 +1482,14 @@ class FlowManager:
             self.logger.title_banner("Recombining Split Results")
             self.logger.log("Merging subproblem trees...", 'i')
 
+            self.best_history, _ = self.navigator.get_multiverse_history()
+
             ft_wrapper = self._iterative_glue(root_id)
             
             self.logger.log("Success: All subproblems merged successfully.", 's')
             return ft_wrapper
 
-    def _iterative_glue(self, root_task_id: Tuple[int, int]) -> SmrtTree:
+    def _iterative_glue(self, root_task_id: Tuple[int, int], history: Dict = None) -> SmrtTree:
         """
         Recombines split results using history 'trackers' to identify graft targets.
         Returns:
@@ -632,17 +1500,19 @@ class FlowManager:
         stack = [(root_task_id, False)]
         results = {}
 
+        history = self.best_history if history is None else history
+
         while stack:
             task_id, visited = stack.pop()
             
             # Base Case: If this task was never run or didn't pass, 
             # we return None or the input tree.
-            if task_id not in self.ctx.history:
+            if task_id not in history:
                 self.logger.log(f"Glue {task_id}: Task {task_id} not found in history.", 'd')
                 results[task_id] = None
                 continue
 
-            event = self.ctx.history[task_id]
+            event = history[task_id]
 
             # Check Pass/Fail
             if not event['passed']:
@@ -734,7 +1604,7 @@ class FlowManager:
             # Fallback to original ST
             self.logger.log("No valid recombination found. Returning the original ST.", 'i')
             # Not finding root in history SHOULD raise an error!
-            return SmrtTree(tree_obj=Tree(self.ctx.history[root_task_id]['best_mt'], format=1))
+            return SmrtTree(tree_obj=Tree(history[root_task_id]['in_tree'], format=1))
         return results[root_task_id]
 
     def _prepare_graft_records(self, task_id: Tuple[int, int], outer_wrapper: SmrtTree, records: List[GraftRecord], first_uid_of_depth: int) -> List[GraftRecord]:
@@ -844,6 +1714,8 @@ class FlowManager:
 
         return records
 
+    # --- Fast-forwarding logic for Split mode ---
+
     def fast_forward_split(self, current_tasks: List[ConcurrTask]) -> List[ConcurrTask]:
         """
         Reconstructs the task queue from disk state based on history.
@@ -907,7 +1779,39 @@ class FlowManager:
 
         return real_tasks
     
+    def fast_forward_split_ng(self, current_tasks: List[ConcurrTask]) -> List[ConcurrTask]:
+        nid, depth, idx = None, None, None
+        while 1:
+        # ... [keep top part] ...
+            # Check if this task is already solved in history
+            if nid in self.ctx.history:
+                passed = False
+                for state_id, events in self.ctx.history[nid].items():
+                    for child_id, event_data in events.items():
+                        if child_id != "In" and event_data.get('passed', False):
+                            passed = True
+                            break
+                    if passed: break
+                    
+                if passed:
+                    # Task done. Check for its children directories on disk
+                    c1 = (depth + 1, idx * 2)
+                    c2 = (depth + 1, idx * 2 + 1)
+        # ... [keep the rest] ...
+
     # --- Output methods ---
+
+    def _infer_switch(self):
+        mixed_switch = self.ctx.mixed_switch
+        if mixed_switch == 0:
+            if self.mode == 'split':
+                mixed_switch = 0
+            # Other iterative modes shouldn't have mixed_switch == 0
+            elif self.mode == 'full':
+                mixed_switch = float('inf')
+            elif self.mode == 'mixed':
+                self.logger.log(f'Unexpected mixed_switch value of 0 for mode {self.mode}.', 'e')
+        return mixed_switch
 
     def create_problem_tree_ascii(self) -> str:
         """
@@ -916,27 +1820,23 @@ class FlowManager:
         """
         if not self.ctx.history:
             return "No tasks recorded."
+        
+        if self.best_history is None:
+            self.best_history, _ = self.navigator.get_multiverse_history()
 
         # Create a virtual super-root to hold the (0,0) start
         super_root = TreeNode(name="<RUN_START>")
         nodes = {}
         last_task_at_depth = {}
 
-        mixed_switch = self.ctx.mixed_switch
-        if mixed_switch == 0:
-            if self.mode == 'split':
-                mixed_switch = 0
-            elif self.mode == 'full':
-                mixed_switch = float('inf')
-            # Any other iterative mode shouldn't have mixed_switch == 0
-            else:
-                self.logger.log(f'Unexpected mixed_switch value of 0 for mode {self.mode}.', 'e')
+        mixed_switch = self._infer_switch()
 
-        sorted_tasks = sorted(self.ctx.history.keys(), key=lambda x: (x[0], x[1]))
+        sorted_tasks = sorted(self.best_history.keys(), key=lambda x: (x[0], x[1]))
 
         for task_id in sorted_tasks:
             depth, idx = task_id
-            passed = self.ctx.history[task_id].get('passed', False)
+
+            passed = self.best_history[task_id].get('passed', False)
             status = "PASS" if passed else "FAIL"
             
             node = TreeNode(name=f"({depth},{idx})[{status}]")
@@ -986,7 +1886,7 @@ class FlowManager:
         # Return string without the first '\n' padding character
         return super_root.get_ascii(show_internal=True)[1:]
 
-    def plot(self):
+    def plot_metrics(self):
         import matplotlib.pyplot as plt
         from matplotlib.ticker import MaxNLocator, FixedLocator
         from matplotlib.lines import Line2D
@@ -1004,19 +1904,23 @@ class FlowManager:
         # Split Mode: i=depth, j=index
         # Full Mode: i=iteration, j=nested_id
         grouped_history = defaultdict(list)
+
+        if not self.best_history:
+            self.best_history, _ = self.navigator.get_multiverse_history()
         
-        for key, val in self.ctx.history.items():
+        for key, val in self.best_history.items():
             i, j = key
             
             # --- Metrics Calculation ---
-            out_score = val['nonin_score']
-            if out_score == 'N/A':
-                continue # Skip if no non-input tree existed
-            out_taxa = get_taxa_count(val['nonin_mt'])
-            h_lvs = len(val.get('h_leaves', []))
-            h_copies = len(val.get('h_locs', []))
+            out_score = val['score']
+            if out_score == 'N/A': continue # Skip if no non-input tree existed
+            in_score = val['in_score']
+
+            h_lvs = len(val['h_leaves'])
+            h_copies = len(val['h_locs'])
+            out_taxa = get_taxa_count(val['mt_tree'])
             in_taxa = max(0, out_taxa - h_lvs*(h_copies-1 if h_copies > 0 else 0)) # Adjust for hybrid leaves that don't add taxa
-            in_score = val['input_score']
+            assert in_taxa == get_taxa_count(val['in_tree']), f"Taxa count mismatch for input tree at {key}"
             
             out_norm = out_score / out_taxa if out_taxa > 0 else 0
             in_norm = in_score / in_taxa if in_taxa > 0 else 0

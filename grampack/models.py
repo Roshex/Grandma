@@ -1,5 +1,7 @@
 import math
+import json
 import array
+from hashlib import blake2b
 from pathlib import Path
 from functools import partial
 from ete3 import Tree, TreeNode
@@ -12,6 +14,20 @@ from Reticulate_Tree.reticulate_tree import ReticulateTree
 # Grampa does:                  raw.rsplit("_", 1)[-1]  // split by last underscore
 # Grandma will eventually do:   raw.split("_", 1)[-1]   // split by first underscore, to preserve species names with underscores
 splitSpec = lambda raw: raw.rsplit("_", 1)[-1] if "_" in raw else raw
+
+def decode_optim(optim: int) -> Tuple[bool, bool, bool]:
+    """
+    Decode --optim into independent switches.
+      bit 0 (1,3,5,7) -> dedup_gts : one representative per class of gene trees that are
+                                     isomorphic as species-labelled trees.
+      bit 1 (2,3,6,7) -> use_gray  : Gray-code enumeration of the ambiguous groups.
+      bit 2 (4,5,6,7) -> use_sweep : score single-target candidates with the target
+                                     sweep instead of building and reconciling each MT.
+    Kept here so ops (grouping), reconcile (scoring) and main (wiring) cannot drift.
+    """
+    if not isinstance(optim, int) or not (0 <= optim <= 7):
+        raise ValueError(f"Invalid optimization level: {optim}. Must be 0-7.")
+    return bool(optim & 1), bool(optim & 2), bool(optim & 4)
 
 class NameRegistry:
     """
@@ -80,11 +96,21 @@ class FlatTree:
     name_id_to_node_id: Dict[int, int] = field(default_factory=dict)
     node_id_to_name_id: Dict[int, int] = field(default_factory=dict)
     rmq_table: List[array.array] = field(default_factory=list) # Sparse table for RMQ
+    _sig: Optional[bytes] = None                 # AHU signature, filled by canonical()
+    _canon_order: Optional[array.array] = None   # canonical leaf order, as FULL-name IDs
 
     def get_lca(self, u: int, v: int) -> int:
-        """O(1) LCA query using Sparse Table RMQ."""
+        """O(1) LCA query using Sparse Table RMQ.
+        This version is guarded against missing a RMQ table, so when speed is critical,
+        use an inlined version that assumes the table is present (e.g., in the reconciliation engine) - without if checks.
+        """
         if u == v: return u
-        
+
+        if not self.rmq_table:
+            raise RuntimeError(
+                "get_lca() on a FlatTree without LCA arrays. Call TreeLinearizer.build_lca() "
+                "(or SmrtTree.make_lca()) first; gene-tree flats deliberately skip them.")
+       
         # Find range in Euler tour
         first = self.first_visit[u]
         last = self.first_visit[v]
@@ -105,11 +131,89 @@ class FlatTree:
         else:
             return self.euler_tour[idx2]
 
+    def canonical(self) -> Tuple[bytes, array.array]:
+        """
+        AHU canonical form (Aho, Hopcroft & Ullman 1974, §3.2), computed once and cached.
+
+        Returns (signature, canonical leaf order):
+          * signature - a 128-bit digest over (topology, leaf SPECIES id). Two trees share
+            it iff they are isomorphic as species-labelled trees. Child order is
+            irrelevant and internal names are ignored, both by design.
+          * canonical leaf order - the leaves' FULL-name IDs in the order induced by
+            sorting every node's children by their code. Two trees with the same
+            signature have leaves that correspond one-to-one at equal positions, which
+            is what lets a GroupData computed on one be replayed on the other.
+
+        O(n): the per-node "sort" is a single comparison for a bifurcating node. Polytomies
+        ARE supported (the general branch sorts all child codes, at O(k log k) for that
+        node), even though every tree reaching this point is expected to be bifurcating.
+
+        The signature is over registry IDs, so it is comparable within a run and across
+        the workers of that run (they share the pickled registry), but NOT across runs -
+        exactly like the IDs stored in the group pickles, which _check_registry_safety
+        already governs.
+        """
+        if self._sig is not None and self._canon_order is not None:
+            return self._sig, self._canon_order
+
+        cs, cf, post, names = (self.children_start, self.children_flat,
+                               self.postorder, self.node_to_name_id)
+        code: List[bytes] = [b''] * self.num_nodes
+        swap = bytearray(self.num_nodes)          # bifurcating: remember if children flip
+        poly_order: Dict[int, List[int]] = {}     # non-bifurcating: explicit order
+
+        for u in post:
+            s, e = cs[u], cs[u + 1]
+            if s == e:
+                code[u] = blake2b(b'L%d' % names[u], digest_size=16).digest()
+            elif e - s == 2:
+                a, b = code[cf[s]], code[cf[s + 1]]
+                if a > b:
+                    a, b = b, a
+                    swap[u] = 1
+                code[u] = blake2b(b'N' + a + b, digest_size=16).digest()
+            else:
+                kids = sorted(cf[s:e], key=code.__getitem__)
+                poly_order[u] = kids
+                code[u] = blake2b(b'N' + b''.join(code[c] for c in kids),
+                                  digest_size=16).digest()
+
+        order = array.array('i')
+        stack = [self.root_id]
+        id_to_name = self.node_id_to_name_id
+        while stack:
+            u = stack.pop()
+            s, e = cs[u], cs[u + 1]
+            if s == e:
+                order.append(id_to_name[u])
+            elif e - s == 2:
+                c1, c2 = (cf[s + 1], cf[s]) if swap[u] else (cf[s], cf[s + 1])
+                stack.append(c2)
+                stack.append(c1)
+            else:
+                stack.extend(reversed(poly_order[u]))
+
+        self._sig, self._canon_order = code[self.root_id], order
+        return self._sig, self._canon_order
+
+    @property
+    def signature(self) -> bytes:
+        return self.canonical()[0]
+
+    @property
+    def canon_order(self) -> array.array:
+        return self.canonical()[1]
+
 class TreeLinearizer:
     """Helper to convert ETE3/SmrtTree objects to FlatTree."""
     
     @staticmethod
-    def linearize(smrt_tree: 'SmrtTree', registry: NameRegistry) -> FlatTree:
+    def linearize(smrt_tree: 'SmrtTree', registry: NameRegistry, with_lca: bool = True) -> FlatTree:
+        """
+        Build the topology + name arrays. Does NOT build the Euler tour / sparse table;
+        call TreeLinearizer.build_lca() for that. Gene trees never need them - every LCA
+        query in the engine is on the species/MUL-tree side.
+        """
         ete_tree = smrt_tree.ete_tree
         
         # Capture nodes in list. Index is the ID.
@@ -180,96 +284,95 @@ class TreeLinearizer:
         # Map the objects to IDs directly
         postorder = array.array('i', [node_to_id[n] for n in ete_tree.traverse("postorder")])
 
-        # 3. Euler Tour & RMQ (Stack-Based DFS)
-        return TreeLinearizer._build_flat_tree(
-            num_nodes, node_to_id[ete_tree.get_tree_root()],
-            parents, children_start, children_flat, postorder,
-            node_to_name_id, name_id_to_node_id, node_id_to_name_id
+        # node_depths without the Euler walk: node IDs are preorder, so a parent always
+        # has a smaller ID than its child.
+        node_depths = array.array('i', [0] * num_nodes)
+        for v in range(1, num_nodes):
+            p = parents[v]
+            if p >= 0:
+                node_depths[v] = node_depths[p] + 1
+
+        empty = array.array('i')
+        return FlatTree(
+            num_nodes=num_nodes,
+            root_id=node_to_id[ete_tree.get_tree_root()],
+            parents=parents,
+            children_start=children_start,
+            children_flat=children_flat,
+            postorder=postorder,
+            node_to_name_id=node_to_name_id,
+            euler_tour=empty,
+            depths=empty,
+            first_visit=array.array('i', [-1] * num_nodes),
+            node_depths=node_depths,
+            name_id_to_node_id=name_id_to_node_id,
+            node_id_to_name_id=node_id_to_name_id,
+            rmq_table=[],
         )
 
     @staticmethod
-    def _build_flat_tree(num_nodes, root_id, parents, children_start, children_flat, postorder,
-                         node_to_name_id, name_id_to_node_id, node_id_to_name_id):
+    def build_lca(flat: FlatTree) -> FlatTree:
         """
-        Pure integer array processing. Separated from ETE3 logic.
+        Fill the Euler tour, depths, first_visit and the RMQ sparse table in place (Stack-Based DFS).
+        Idempotent, and works on integer arrays only (no ETE3 objects), so it can be
+        deferred to whoever actually needs O(1) LCA queries.
+        Theta(n) tour + Theta(n log n) table, exactly as before the split.
         """
+        if flat.rmq_table:
+            return flat
+
+        num_nodes = flat.num_nodes
+        children_start, children_flat = flat.children_start, flat.children_flat
         euler_nodes = array.array('i')
         euler_depths = array.array('i')
         first_visit = array.array('i', [-1] * num_nodes)
         node_depths = array.array('i', [0] * num_nodes)
-        
-        # Optimized Stack: (node_id, depth, child_ptr_start, child_ptr_end)
-        # Storing 'end' in the stack avoids array lookups inside the loop
-        stack = [[root_id, 0, children_start[root_id], children_start[root_id+1]]]
-        
-        # Pre-visit root
+
+        root_id = flat.root_id
+        stack = [[root_id, 0, children_start[root_id], children_start[root_id + 1]]]
         first_visit[root_id] = 0
         euler_nodes.append(root_id)
         euler_depths.append(0)
-        
+
         while stack:
-            # Peek at top (don't unpack yet to keep reference mutable if needed, though lists are ref)
             frame = stack[-1]
-            u, d, ptr, end = frame
-            
+            _u, d, ptr, end = frame
             if ptr < end:
-                # Visit next child
                 v = children_flat[ptr]
-                frame[2] += 1 # Advance pointer in current frame
-                
-                # Push child
-                stack.append([v, d + 1, children_start[v], children_start[v+1]])
-                
-                # Pre-visit child
+                frame[2] += 1
+                stack.append([v, d + 1, children_start[v], children_start[v + 1]])
                 first_visit[v] = len(euler_nodes)
                 euler_nodes.append(v)
                 euler_depths.append(d + 1)
                 node_depths[v] = d + 1
             else:
-                # Backtrack
                 stack.pop()
                 if stack:
                     parent = stack[-1]
                     euler_nodes.append(parent[0])
                     euler_depths.append(parent[1])
 
-        # Sparse Table Logic
         L = len(euler_nodes)
         rmq = []
         if L > 0:
             k_max = int(math.log2(L)) + 1
             rmq = [array.array('i', [0] * L) for _ in range(k_max)]
-            
-            for i in range(L): rmq[0][i] = i
-            
+            for i in range(L):
+                rmq[0][i] = i
             for j in range(1, k_max):
-                half = 1 << (j-1)
+                half = 1 << (j - 1)
                 for i in range(L - (1 << j) + 1):
-                    idx1 = rmq[j-1][i]
-                    idx2 = rmq[j-1][i + half]
-                    if euler_depths[idx1] < euler_depths[idx2]:
-                        rmq[j][i] = idx1
-                    else:
-                        rmq[j][i] = idx2
+                    idx1 = rmq[j - 1][i]
+                    idx2 = rmq[j - 1][i + half]
+                    rmq[j][i] = idx1 if euler_depths[idx1] < euler_depths[idx2] else idx2
 
-        return FlatTree(
-            num_nodes=num_nodes,
-            root_id=root_id,
-            parents=parents,
-            children_start=children_start,
-            children_flat=children_flat,
-            postorder=postorder,
-            node_to_name_id=node_to_name_id,
-            euler_tour=euler_nodes,
-            depths=euler_depths,
-            first_visit=first_visit,
-            node_depths=node_depths,
-            # Defaults last
-            name_id_to_node_id=name_id_to_node_id,
-            node_id_to_name_id=node_id_to_name_id,
-            rmq_table=rmq
-        )
-
+        flat.euler_tour = euler_nodes
+        flat.depths = euler_depths
+        flat.first_visit = first_visit
+        flat.node_depths = node_depths          # identical to the preorder version
+        flat.rmq_table = rmq
+        return flat
+    
 @dataclass(slots=True)
 class GraftRecord:
     """Encapsulates the location and metadata for a single H lineage graft."""
@@ -298,7 +401,7 @@ class GroupData:
 class SmrtTree:
     """Wrapper around ETE3 Tree to provide GRAMPA-specific functionality."""
 
-    __slots__ = ['ete_tree', 'node_map', 'match_map', 'flat_tree', 'Q']
+    __slots__ = ['ete_tree', 'node_map', 'match_map', 'flat_tree', 'Q', '_canon']
 
     def __init__(self, tree_obj: Tree = None, newick: str = None, frmt: int = 0, kw_root_attrs: dict = {}):
         if tree_obj:
@@ -312,7 +415,7 @@ class SmrtTree:
         self.match_map: Dict[str, List[TreeNode]] = {}
         self.flat_tree: Optional[FlatTree] = None
         self.Q: float = 1.0
-        
+        self._canon: Optional[Tuple[bytes, array.array, int]] = None
         self._index_nodes()
 
     def _index_nodes(self):
@@ -366,15 +469,289 @@ class SmrtTree:
                 self.match_map.setdefault(node.pure, []).append(node)
         return list(self.match_map[name])
 
-    def make_flat(self, registry: NameRegistry):
-        """Generates the FlatTree bundle for optimized processing."""
-        self.flat_tree = TreeLinearizer.linearize(self, registry)
+    def make_flat(self, registry: NameRegistry, with_lca: bool = True, force: bool = False):
+        """
+        Build the FlatTree, or reuse a valid one.
+
+        with_lca=False skips the Euler tour and the O(n log n) sparse table. GENE trees
+        never need them - every LCA query in the engine is on the species/MUL-tree side
+        (`st`/`mul_flat`), while the gene tree is only traversed. Skipping it removes the
+        largest array in a FlatTree, which is also the one shipped to every worker.
+        """
+        ft = self.flat_tree
+        if (not force and ft is not None and ft.num_nodes == self._cache_token
+                and (ft.rmq_table or not with_lca)):
+            return                                        # still valid, and rich enough
+        self.flat_tree = TreeLinearizer.linearize(self, registry, with_lca=with_lca)
+        self.flat_tree._sig = self.canon_sig               # one computation serves both stages
+
+    def __getstate__(self):
+        return (self.ete_tree, self._canon, self.Q)
+    
+    def __setstate__(self, state):
+        self.ete_tree, canon, q = state
+        self.refresh()
+        self._canon, self.Q = canon, q               # refresh() clears both; restore
+
+    # --------------------------------------------------------------------------
+    # Caches
+    # --------------------------------------------------------------------------
+
+    @property
+    def _cache_token(self) -> int:
+        """O(1) structural fingerprint. node_map is rebuilt by _index_nodes and kept in
+        step by rename_node/_clear_dead, so its size moves whenever the topology does."""
+        return len(self.node_map)
+
+    def _invalidate_struct_caches(self) -> None:
+        """
+        Drop every derived cache. flat_tree depends on (topology, ALL names); _canon
+        depends on (topology, leaf species) - a strict subset - so whatever invalidates
+        one invalidates the other. Call this from EVERY mutation site; never assign
+        self.flat_tree = None by hand again.
+        """
+        self.flat_tree = None
+        self._canon = None
+        self.Q = 1.0
 
     def refresh(self):
         self._index_nodes()
         self.match_map = {}
-        self.flat_tree = None # Invalidate flat tree on structural change
-        self.Q = 1.0 # Reset Q on structural change
+        self._invalidate_struct_caches()
+
+    def _clear_dead(self, affected_nodes: Dict[str, Set[str]]) -> None:
+        """
+        Removes affected nodes from caches after structural modifications.
+        affected_nodes: Dict[pure_name, Set[node_names]]
+        """
+        self._invalidate_struct_caches()
+        for pure, names in affected_nodes.items():
+            for k in names:
+                self.node_map.pop(k, None)
+            if pure in self.match_map:
+                self.match_map[pure] = [n for n in self.match_map[pure] if n.name not in names]
+                if not self.match_map[pure]:
+                    del self.match_map[pure]
+
+    # --------------------------------------------------------------------------
+    # Utilities and Pickling
+    # --------------------------------------------------------------------------
+
+    def copy(self) -> 'SmrtTree':
+        # The faster newick-extended method should work too as it preserves attributes added as features (e.g. pure),
+        # and it is faster, but I trust the cPickle method more (and it's already faster than deepcopy), so I'll keep it for now.
+        return SmrtTree(tree_obj=self.ete_tree.copy(method="cpickle"))
+
+    def destroy(self) -> None:
+
+        # Drop the root pointer
+        tree = self.ete_tree
+        self.ete_tree = None
+
+        # Sever circular references (primary GC bottleneck)
+        if tree is not None:
+            for node in tree.traverse("postorder"):
+                node.up = None
+                node.children = []
+            del tree
+
+        # Clear caches
+        self.node_map.clear()
+        self.match_map.clear()
+        self._invalidate_struct_caches()
+
+    def __getstate__(self):
+        # flat_tree is deliberately not shipped (rebuilt where needed); _canon and Q are,
+        # because refresh() clears both and workers cannot recompute _canon without a flat.
+        return (self.ete_tree, self._canon, self.Q)
+
+    def __setstate__(self, state):
+        self.ete_tree, canon, q = state
+        self.refresh()
+        if canon is not None and canon[2] == self._cache_token:
+            self._canon = canon          # token-checked: a stale cache cannot survive
+        self.Q = q
+
+    # --------------------------------------------------------------------------
+    # Flattening, LCA, and Canonical Form 
+    # --------------------------------------------------------------------------
+
+    def make_flat(self, registry: NameRegistry, force: bool = False) -> FlatTree:
+        """Build (or reuse) the topology+names FlatTree. No LCA arrays - see make_lca()."""
+        ft = self.flat_tree
+        if force or ft is None or ft.num_nodes != self._cache_token:
+            self.flat_tree = TreeLinearizer.linearize(self, registry)
+        return self.flat_tree
+
+    def make_lca(self, registry: NameRegistry) -> FlatTree:
+        """Ensure the FlatTree exists AND carries the Euler tour + sparse table.
+        Only trees used as the reconciliation TARGET (species / MUL-trees) need this."""
+        return TreeLinearizer.build_lca(self.make_flat(registry))
+
+    @property
+    def canon(self) -> Tuple[bytes, array.array]:
+        """
+        (AHU signature, canonical leaf order as full-name IDs), cached and token-checked.
+
+        Computed from the FlatTree, so make_flat() must have run in THIS process first.
+        It is cached on the SmrtTree rather than only on the FlatTree because
+        __getstate__ does not ship flat trees: priming it in the parent is what lets the
+        collapse workers use it without rebuilding anything.
+        """
+        token = self._cache_token
+        if self._canon is None or self._canon[2] != token:
+            if self.flat_tree is None:
+                raise RuntimeError(
+                    "SmrtTree.canon requires make_flat(registry) in this process first "
+                    "(prime it in the parent before dispatching to workers).")
+            sig, order = self.flat_tree.canonical()
+            self._canon = (sig, order, token)
+        return self._canon[0], self._canon[1]
+
+    @property
+    def canon_sig(self) -> bytes:
+        return self.canon[0]
+
+    @property
+    def canon_order(self) -> array.array:
+        return self.canon[1]
+
+    # --------------------------------------------------------------------------
+    # GROUP COLLAPSING LOGIC (Object-based, run once per iter)
+    # --------------------------------------------------------------------------
+
+    def compute_groups(self, mul_data: 'MulTree', registry: NameRegistry, 
+                       h1_sisters: Set[str] = None, hx_sisters_list: List[Set[str]] = None) -> GroupData:
+        """
+        Registry-Optimized O(N) implementation.
+        Uses integer IDs for Set operations (Union/IsSubset) to achieve significant speedup.
+        """
+        h1_target_ids = {registry.get_id(name) for name in mul_data.h_clade}
+        # Cache: node -> (species_id_set, leaf_names_list, active_roots)
+        # species_id_set: Set[int] - much faster than Set[str]
+        groups, singles, node_info = {}, {}, {}
+
+        # Raw ete3 traversal - Maximum speed!
+        for node in self.ete_tree.traverse("postorder"):
+            if node.is_leaf():
+                # Extract name and convert to ID
+                sp_name = splitSpec(node.name)
+                sp_id = registry.get_id(sp_name)
+                is_h1 = sp_id in h1_target_ids
+                
+                s_set, l_list = {sp_id}, [node.name]
+                if is_h1:
+                    singles[node.name] = [] 
+                    a_roots = [node.name]
+                else:
+                    a_roots = []
+                node_info[node] = (s_set, l_list, a_roots)
+                
+            else:
+                u_s_set, u_l_list, u_a_roots = set(), [], []
+                all_h1_descendants, total_species_count = True, 0
+                
+                for child in node.children:
+                    c_s_set, c_l_list, c_a_roots = node_info[child]
+                    u_s_set.update(c_s_set)
+                    u_l_list.extend(c_l_list)
+                    u_a_roots.extend(c_a_roots)
+                    total_species_count += len(c_s_set)
+                    
+                    # Integer set subset check is highly optimized
+                    if not c_s_set.issubset(h1_target_ids):
+                        all_h1_descendants = False
+                
+                if all_h1_descendants and (len(u_s_set) == total_species_count) and len(node.children) > 1:
+                    # Valid Group
+                    for r in u_a_roots:
+                        groups.pop(r, None)
+                        singles.pop(r, None)
+                    groups[node.name] = [u_l_list, []]
+                    u_a_roots = [node.name]
+                
+                node_info[node] = (u_s_set, u_l_list, u_a_roots)
+
+        # --- Post-Processing ---
+        
+        def fill_anc_leaves(n_name, target_dict):
+            n_obj = self.get_node(n_name)
+            if not n_obj or not n_obj.up: return
+            p_obj = n_obj.up
+            if p_obj in node_info and n_obj in node_info:
+                p_leaves = node_info[p_obj][1]
+                n_leaves_set = set(node_info[n_obj][1])
+                anc_list = [l for l in p_leaves if l not in n_leaves_set]
+                if target_dict is groups:
+                    target_dict[n_name][1] = anc_list
+                else: # is singles
+                    target_dict[n_name] = anc_list
+
+        for g_name in groups: fill_anc_leaves(g_name, groups)
+        for s_name in singles: fill_anc_leaves(s_name, singles)
+
+        # --- Fixes Logic ---
+
+        # List of List[int], List of (List[int], int)
+        final_ambiguous, final_fixed = [], [] 
+
+        # Sister checking
+        if mul_data.h1_node and (h1_sisters is None):
+            h1_sisters, hx_sisters_list = mul_data.get_sister_clades()
+
+        def check_fix(unit_nodes, anc_leaves):
+            # Convert to Set for fast subset math
+            group_sis_specs = {splitSpec(n) for n in anc_leaves}
+            if group_sis_specs:
+                if h1_sisters and group_sis_specs.issubset(h1_sisters):
+                    # Index 0 corresponds to the Base/H1 target
+                    final_fixed.append((registry.get_ids(unit_nodes), 0))
+                    return
+                for idx, hx_sisters in enumerate(hx_sisters_list):
+                    if hx_sisters and group_sis_specs.issubset(hx_sisters):
+                        # Index idx + 1 corresponds to H2 (1), H3 (2), etc.
+                        final_fixed.append((registry.get_ids(unit_nodes), idx + 1))
+                        return
+            final_ambiguous.append(registry.get_ids(unit_nodes))
+
+        for g_leaves, anc_leaves in groups.values(): check_fix(g_leaves, anc_leaves)
+        for s_name, anc_leaves in singles.items(): check_fix([s_name], anc_leaves)
+
+        return GroupData(final_ambiguous, final_fixed)
+
+    # Transport of a GroupData between isomorphic gene trees
+    def groups_to_positions(self, gd: 'GroupData'):
+        """Express a GroupData in canonical LEAF POSITIONS, i.e. independently of this
+        tree's gene-copy names, so it can be replayed on any isomorph. No registry
+        needed: the canonical order is already in name-ID space."""
+        pos = {nid: i for i, nid in enumerate(self.canon[1])}
+        return ([[pos[n] for n in unit] for unit in gd.ambiguous_groups],
+                [([pos[n] for n in unit], t) for unit, t in gd.fixed_groups])
+
+    def groups_from_positions(self, positions) -> 'GroupData':
+        order = self.canon[1]
+        amb_pos, fix_pos = positions
+        return GroupData([[order[p] for p in unit] for unit in amb_pos],
+                         [([order[p] for p in unit], t) for unit, t in fix_pos])
+
+    # --------------------------------------------------------------------------
+    # Quality Metrics and Identity
+    # --------------------------------------------------------------------------
+
+    @property
+    def assert_len(self):
+        assert len(self) == len(self.ete_tree), f"Length mismatch: {len(self)} by names vs {len(self.ete_tree)} by tree leaves"
+
+    @property
+    def assert_topology(self):
+        """Checks bifurcation and root legality"""
+        assert self.ete_tree.is_root(), "Tree is not rooted to None"
+        assert not any(len(n.children) not in (0, 2) for n in self.ete_tree.traverse()), "Tree has non-bifurcating nodes"
+
+    def __len__(self):
+        # Returns the number of leaves
+        # Assume bifurcating tree with unique names, so num_nodes = 2 * num_leaves - 1
+        return (len(self.node_map) + 1) // 2
 
     def calculate_Q(self, total_species: int) -> Tuple[float, float, float, bool]:
         """Calculates harmonic mean Q of topology occupancy (O) and resolved support (R)."""
@@ -458,19 +835,9 @@ class SmrtTree:
         
         return rf == 0
 
-    def _clear_dead(self, affected_nodes: Dict[str, Set[str]]) -> None:
-        """
-        Removes affected nodes from caches after structural modifications.
-        affected_nodes: Dict[pure_name, Set[node_names]]
-        """
-        self.flat_tree = None
-        for pure, names in affected_nodes.items():
-            for k in names:
-                self.node_map.pop(k, None)
-            if pure in self.match_map:
-                self.match_map[pure] = [n for n in self.match_map[pure] if n.name not in names]
-                if not self.match_map[pure]:
-                    del self.match_map[pure]
+    # --------------------------------------------------------------------------
+    # Node Naming and Bookkeeping
+    # --------------------------------------------------------------------------
 
     def rename_leaves_from_mapping(self, recon_map: 'Map', suffix_name_map: Dict[str, Set[str]]) -> None:
         
@@ -501,7 +868,7 @@ class SmrtTree:
         del self.node_map[old_name]
         self.node_map[new_name] = node
         self.match_map = {}
-        self.flat_tree = None
+        self._invalidate_struct_caches()
 
     @staticmethod
     def add_pure(node: TreeNode):
@@ -523,6 +890,10 @@ class SmrtTree:
             base += '>'
         return base
     
+    # --------------------------------------------------------------------------
+    # Tree Structure Queries
+    # --------------------------------------------------------------------------
+
     @staticmethod
     def get_sis(node: Optional[Tree]) -> Optional[Tree]:
         """Returns the sister node of the given node, or None if root."""
@@ -923,157 +1294,6 @@ class SmrtTree:
             n.name = n.pure
         return ReticulateTree(tree_copy)
 
-    # --------------------------------------------------------------------------
-    # GROUP COLLAPSING LOGIC (Object-based, run once per iter)
-    # --------------------------------------------------------------------------
-
-    def compute_groups(self, mul_data: 'MulTree', registry: NameRegistry, 
-                       h1_sisters: Set[str] = None, hx_sisters_list: List[Set[str]] = None) -> GroupData:
-        """
-        Registry-Optimized O(N) implementation.
-        Uses integer IDs for Set operations (Union/IsSubset) to achieve significant speedup.
-        """
-        h1_target_ids = {registry.get_id(name) for name in mul_data.h_clade}
-        # Cache: node -> (species_id_set, leaf_names_list, active_roots)
-        # species_id_set: Set[int] - much faster than Set[str]
-        groups, singles, node_info = {}, {}, {}
-
-        # Raw ete3 traversal - Maximum speed!
-        for node in self.ete_tree.traverse("postorder"):
-            if node.is_leaf():
-                # Extract name and convert to ID
-                sp_name = splitSpec(node.name)
-                sp_id = registry.get_id(sp_name)
-                is_h1 = sp_id in h1_target_ids
-                
-                s_set, l_list = {sp_id}, [node.name]
-                if is_h1:
-                    singles[node.name] = [] 
-                    a_roots = [node.name]
-                else:
-                    a_roots = []
-                node_info[node] = (s_set, l_list, a_roots)
-                
-            else:
-                u_s_set, u_l_list, u_a_roots = set(), [], []
-                all_h1_descendants, total_species_count = True, 0
-                
-                for child in node.children:
-                    c_s_set, c_l_list, c_a_roots = node_info[child]
-                    u_s_set.update(c_s_set)
-                    u_l_list.extend(c_l_list)
-                    u_a_roots.extend(c_a_roots)
-                    total_species_count += len(c_s_set)
-                    
-                    # Integer set subset check is highly optimized
-                    if not c_s_set.issubset(h1_target_ids):
-                        all_h1_descendants = False
-                
-                if all_h1_descendants and (len(u_s_set) == total_species_count) and len(node.children) > 1:
-                    # Valid Group
-                    for r in u_a_roots:
-                        groups.pop(r, None)
-                        singles.pop(r, None)
-                    groups[node.name] = [u_l_list, []]
-                    u_a_roots = [node.name]
-                
-                node_info[node] = (u_s_set, u_l_list, u_a_roots)
-
-        # --- Post-Processing ---
-        
-        def fill_anc_leaves(n_name, target_dict):
-            n_obj = self.get_node(n_name)
-            if not n_obj or not n_obj.up: return
-            p_obj = n_obj.up
-            if p_obj in node_info and n_obj in node_info:
-                p_leaves = node_info[p_obj][1]
-                n_leaves_set = set(node_info[n_obj][1])
-                anc_list = [l for l in p_leaves if l not in n_leaves_set]
-                if target_dict is groups:
-                    target_dict[n_name][1] = anc_list
-                else: # is singles
-                    target_dict[n_name] = anc_list
-
-        for g_name in groups: fill_anc_leaves(g_name, groups)
-        for s_name in singles: fill_anc_leaves(s_name, singles)
-
-        # --- Fixes Logic ---
-
-        # List of List[int], List of (List[int], int)
-        final_ambiguous, final_fixed = [], [] 
-
-        # Sister checking
-        if mul_data.h1_node and (h1_sisters is None):
-            h1_sisters, hx_sisters_list = mul_data.get_sister_clades()
-
-        def check_fix(unit_nodes, anc_leaves):
-            # Convert to Set for fast subset math
-            group_sis_specs = {splitSpec(n) for n in anc_leaves}
-            if group_sis_specs:
-                if h1_sisters and group_sis_specs.issubset(h1_sisters):
-                    # Index 0 corresponds to the Base/H1 target
-                    final_fixed.append((registry.get_ids(unit_nodes), 0))
-                    return
-                for idx, hx_sisters in enumerate(hx_sisters_list):
-                    if hx_sisters and group_sis_specs.issubset(hx_sisters):
-                        # Index idx + 1 corresponds to H2 (1), H3 (2), etc.
-                        final_fixed.append((registry.get_ids(unit_nodes), idx + 1))
-                        return
-            final_ambiguous.append(registry.get_ids(unit_nodes))
-
-        for g_leaves, anc_leaves in groups.values(): check_fix(g_leaves, anc_leaves)
-        for s_name, anc_leaves in singles.items(): check_fix([s_name], anc_leaves)
-
-        return GroupData(final_ambiguous, final_fixed)
-
-    # --------------------------------------------------------------------------
-    # Utilities and Pickling
-    # --------------------------------------------------------------------------
-
-    def copy(self) -> 'SmrtTree':
-        # The faster newick-extended method should work too as it preserves attributes added as features (e.g. pure),
-        # and it is faster, but I trust the cPickle method more (and it's already faster than deepcopy), so I'll keep it for now.
-        return SmrtTree(tree_obj=self.ete_tree.copy(method="cpickle"))
-
-    def destroy(self) -> None:
-
-        # Drop the root pointer
-        tree = self.ete_tree
-        self.ete_tree = None
-
-        # Sever circular references (primary GC bottleneck)
-        if tree is not None:
-            for node in tree.traverse("postorder"):
-                node.up = None
-                node.children = []
-            del tree
-
-        # Clear caches
-        self.node_map.clear()
-        self.match_map.clear()
-        self.flat_tree = None
-
-    @property
-    def assert_len(self):
-        assert len(self) == len(self.ete_tree), f"Length mismatch: {len(self)} by names vs {len(self.ete_tree)} by tree leaves"
-
-    @property
-    def assert_topology(self):
-        """Checks bifurcation and root legality"""
-        assert self.ete_tree.is_root(), "Tree is not rooted to None"
-        assert not any(len(n.children) not in (0, 2) for n in self.ete_tree.traverse()), "Tree has non-bifurcating nodes"
-
-    def __len__(self):
-        # Returns the number of leaves
-        # Assume bifurcating tree with unique names, so num_nodes = 2 * num_leaves - 1
-        return (len(self.node_map) + 1) // 2
-
-    def __getstate__(self):
-        return self.ete_tree
-    
-    def __setstate__(self, state):
-        self.ete_tree = state
-        self.refresh()
 
 @dataclass(slots=True)
 class TreeCache:
@@ -1198,7 +1418,7 @@ class MulTree:
     # A routine to init from a history event
     @classmethod
     def from_history_event(cls, event: Dict[str, Any]) -> 'MulTree':
-        tree = Tree(event['best_mt'], format=1)
+        tree = Tree(event['mt_tree'], format=1)
         tree_wrapper = SmrtTree(tree_obj=tree)
         h_name = event['h_name']
         return cls(
@@ -1467,6 +1687,12 @@ class TaskResult:
     # All gene trees used in this step
     gene_trees: Dict[int, SmrtTree]
 
+    # Valleys (first, left-of-input, right-of-input) in the score distribution, used for dynamic thresholding
+    #valleys: Tuple[float, float, float]
+
+    # Map: MulTreeID -> Passed Status (True/False)
+    passed_events: Dict[int, bool]
+
     # Internal cache for self_score lookup (Rank of Species Tree ID 0)
     _input_rank: int = field(init=False, default=-1)
 
@@ -1503,9 +1729,104 @@ class TaskResult:
         min_idx = self.mt_idx()
         min_mult = self.mul_trees[min_idx]
         return min_score, min_idx, min_mult
+    
+    @property
+    def repr_min_mt(self) -> Tuple[Union[int, float], int, MulTree]:
+        """Returns a tuple of (score, mt_id, mt_string) for easy unpacking of the best performing mt (incl. input)."""
+        min_score = self.mt_score()
+        min_idx = self.mt_idx()
+        min_mult = self.mul_trees[min_idx]
+        return min_score, min_idx, min_mult.to_marked_str()
 
 # --- Type aliases ---
 
-HistoryType = Dict[Tuple[int, int], Dict[str, Any]]
-ConcurrTask = Tuple[SmrtTree, Dict[int, SmrtTree], Tuple[int, Optional[int]]]
+#HistoryType = Dict[Tuple[int, int], Dict[str, Any]]
+#ConcurrTask = Tuple[SmrtTree, Dict[int, SmrtTree], Tuple[int, Optional[int]]]
+
+class ProtectedDict(dict):
+    """
+    A recursive, auto-vivifying dictionary that explicitly prevents key reassignment.
+    If a key already exists, it raises an error instead of silently overwriting.
+    """
+    def __init__(self, initial_data=None):
+        super().__init__()
+        if initial_data:
+            for k, v in initial_data.items():
+                self[k] = v
+
+    def __missing__(self, key):
+        # Always spawn a ProtectedDict (avoids init signature crashes with HistoryType)
+        value = self[key] = ProtectedDict()
+        return value
+
+    def __setitem__(self, key, value):
+        # Auto-convert standard dict assignments into ProtectedDicts
+        if isinstance(value, dict) and not isinstance(value, ProtectedDict):
+            value = ProtectedDict(value)
+            
+        if key in self and self[key] is not value:
+            raise KeyError(
+                f"CRITICAL: ProtectedDict prevented a silent overwrite of key '{key}'. "
+                f"Previous value: {type(self[key])}. New value: {type(value)}."
+            )
+        super().__setitem__(key, value)
+
+    def update(self, *args, **kwargs):
+        for k, v in dict(*args, **kwargs).items():
+            self[k] = v
+
+# --- IN: Type aliases (Bottom of file) ---
+#HistoryType = ProtectedDict[Tuple[int, int], Dict[str, Any]] # <--- UPDATED: Relaxed to allow nested dictionary branching
+#ConcurrTask = Tuple[SmrtTree, Dict[int, SmrtTree], Tuple[int, Optional[int]], str] # <--- UPDATED: Added `str` for search_state_id
+ConcurrTask = Tuple[SmrtTree, Dict[int, SmrtTree], Tuple[int, Optional[int]], str, Optional[float]]
+                    
+class HistoryType(ProtectedDict):
+    """Manages the history of evaluated states, strictly enforcing (depth, idx) tuple keys in memory."""
+    def __init__(self, filepath: Path, initial_data: dict = None):
+        super().__init__()
+        self.filepath = filepath
+        if initial_data:
+            for k, v in initial_data.items():
+                self[k] = v # Routes through ProtectedDict.__setitem__ for auto-conversion
+
+    def _normalize_key(self, key) -> Tuple[int, int]:
+        """
+        Ensures all keys are stored as (iteration, task) tuples, accepting flexible input formats.
+        Acceptable formats:
+        - (2, 1) -> (2, 1)
+        - "2.1" -> (2, 1)
+        - "2,1" -> (2, 1)
+        - "2" -> (2, 0) [Assumes missing idx is 0]
+        """
+        if isinstance(key, tuple): return key
+        if isinstance(key, str):
+            clean = key.replace('(', '').replace(')', '').replace(' ', '')
+            if '.' in clean: return tuple(map(int, clean.split('.')))
+            if ',' in clean: return tuple(map(int, clean.split(',')))
+            return (int(clean), 0)
+        return key
+
+    def __getitem__(self, key): return super().__getitem__(self._normalize_key(key))
+    def __setitem__(self, key, value): super().__setitem__(self._normalize_key(key), value)
+    def __contains__(self, key): return super().__contains__(self._normalize_key(key))
+    def get(self, key, default=None): return super().get(self._normalize_key(key), default)
+    def setdefault(self, key, default=None): return super().setdefault(self._normalize_key(key), default)
+    
+    def save(self):
+        #sis_nodes = self._get_sis_nodes(nonin_mt.h1_node, nonin_mt.h2_node)
+
+        # Embed an attr H in each sis_node
+        #for n in sis_nodes:
+        #    if n is None: continue
+        #    if not hasattr(n, 'H'):
+        #        n.add_feature('H', [])
+        #    n.H.append(str((i, j))) # Track which events this node was involved in for nested detection / gluing logic
+
+        #if self.logger.debug:
+        #    # No longer needed to parse iterations, but is very useful for debugging
+        #    track_dict = {n.name: n.H for n in nonin_mt.mt.ete_tree.traverse() if hasattr(n, 'H')}
+        #    self.ctx.history[(i, j)]['trackers'] = track_dict
+
+        with open(self.filepath, 'w') as f:
+            json.dump({str(k): v for k, v in self.items()}, f, indent=4)
 

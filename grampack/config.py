@@ -15,7 +15,7 @@ from typing import Optional, Tuple, Dict, Any, Union, List
 from dataclasses import dataclass, field, replace, fields
 
 from .logger import GranLogger
-from .models import SmrtTree, HistoryType, TreeCache
+from .models import SmrtTree, HistoryType, TreeCache, ProtectedDict
 
 import datetime
 
@@ -32,7 +32,7 @@ class GranMetadata:
     github: str = "https://github.com/Roshex/Grandma"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "3.0.9"
+    version: str = "2.3.0"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -52,7 +52,7 @@ class GlobalContext:
     # System Resources
     num_processes: int = 1
     seed: int = 42
-    optim: bool = False
+    optim: int = 0
     
     # Output & Logging Controls
     verbosity: int = 3
@@ -67,11 +67,12 @@ class GlobalContext:
 
     # Global Flow/Algorithm Options
     orth_opt: bool = False
+    lookahead: int = 0
+    breadth_max: int = 0
     max_iter: Union[int, float] = 0
     start_pt: int = 0
     mixed_switch: int = 0
     root_spec: Optional[str] = None
-    cutoff: Tuple[str, Optional[Union[int, float]]] = ("auto", None)
     # For full mode
     # replaces ignore_nesting: bool = False -> ignore (False), rectify (True), strict_rectify (New), model (New)
     nesting: str = "model"
@@ -87,12 +88,17 @@ class GlobalContext:
     log_file: Optional[Path] = None
     
     # History Tracking (Global State)
-    history: HistoryType = field(default_factory=dict)
+    history: HistoryType = field(default_factory=lambda: HistoryType(Path(get_default_outdir()) / "history.json"))
 
     @property
     def history_file(self) -> Path:
         """Dynamic property derived from the root output dir."""
         return self.root_dir / 'history.json'
+    
+    @property
+    def beam_file(self) -> Path:
+        """Dynamic property for the beam search file path."""
+        return self.root_dir / 'beam_tracker.json'
     
     def update(self, **changes) -> 'GlobalContext':
         """
@@ -101,8 +107,8 @@ class GlobalContext:
         """
         # Certain fields should not be allowed to be changed
         forbidden_keys = {"seed", "pickles", "maps", "plot", "norun", "nolog", "bench", "sample",
-        "orth_opt", "max_iter", "start_pt", "mixed_switch", "nesting", "min_gt_lvs", "min_st_lvs",
-        "root_spec", "strict_max", "allow_redun", "root_dir", "log_file", "history"}
+        "orth_opt", "lookahead", "breadth_max", "max_iter", "start_pt", "mixed_switch", "nesting",
+        "min_gt_lvs", "min_st_lvs", "root_spec", "strict_max", "allow_redun", "root_dir", "log_file", "history"}
         # Safety check to ensure we aren't inventing new fields
         valid_fields = {f.name for f in fields(self)}
         for key in changes:
@@ -112,6 +118,20 @@ class GlobalContext:
                 raise ValueError(f"GlobalContext field '{key}' is not allowed to be changed")
 
         return replace(self, **changes)
+    
+    def get_task_dir(self, task_id: Optional[Tuple[int, int]] = None, state_id: str = "S0", is_beam: bool = False) -> Path:
+        """Centralized path management for consistent task output directory resolution."""
+        if task_id is None:
+            return self.root_dir / "output"
+        
+        depth, idx = task_id
+        task_str = f"{depth}.{idx}" if idx is not None else f"{depth}"
+        
+        # Branch into isolated state folders only if beam search is actively splitting paths
+        if is_beam and state_id != "S0":
+            return self.root_dir / task_str / state_id / "output"
+        
+        return self.root_dir / task_str / "output"
 
 
 # --- Unit of Reconciliation (Dynamic) ---
@@ -136,10 +156,11 @@ class TaskConfig:
     h1_nodes: Optional[Union[str, List[str]]] = None
     h2_nodes: Optional[Union[str, List[str]]] = None
     ploidies: Optional[Union[Path, str, Dict[str, int]]] = None
-    group_cap: int = 8
+    group_cap: int = 15
     quota_gts: str = "equal"
     weights: Tuple[int, int] = (1, 1) # (w_dup, w_loss)
-    max_select: int = 1 # max mts to select for processing per Run (non-overlapping H clades & scoring above ST)
+    n_best: int = 1 # max mts to select for processing per Run (non-overlapping H clades & scoring above ST)
+    cutoff: Tuple[str, str, Union[float, int]] = ('input', 'abs', 0) # (Reference, DiffFunc, Offset)
 
     # Legacy Flags
     is_mul_input: bool = False
@@ -149,6 +170,9 @@ class TaskConfig:
     global_tree_cache: Optional[TreeCache] = None
     # For MulTree inputs with pre-defined reconciliations
     predefined_rets: Dict[int, List[Tuple[str, str]]] = field(default_factory=dict)
+    # For tracking multiple MT selection searches (i.e., not a simple greedy selection)
+    search_state_id: str = "S0"
+    prev_score: Optional[float] = None
 
     @property
     def pickle_dir(self) -> Path:
@@ -166,7 +190,7 @@ class TaskConfig:
         Validates that keys exist to prevent silent errors.
         """
         # Certain fields should not be allowed to be changed
-        forbidden_keys = {'group_cap', "quota_gts", 'weights', 'max_select', 'run_prefix'}
+        forbidden_keys = {'group_cap', "quota_gts", 'weights', 'max_select', 'run_prefix', 'search_state_id'}
         # Safety check to ensure we aren't inventing new fields
         valid_fields = {f.name for f in fields(self)}
         for key in changes:
@@ -179,7 +203,7 @@ class TaskConfig:
 
 # --- Utility Functions ---
 
-def load_history(history_file: Path) -> Dict[Tuple[Any, int], Any]:
+def load_history_ng(history_file: Path) -> Dict[Tuple[Any, int], Any]:
     """Loads and deserializes the iteration history."""
     with open(history_file, 'r') as f:
         # Convert string keys back to tuples. 
@@ -187,12 +211,32 @@ def load_history(history_file: Path) -> Dict[Tuple[Any, int], Any]:
         # but ast.literal_eval handles "(0, 0)" safely.
         return {ast.literal_eval(k): v for k, v in json.load(f).items()}
 
+def load_history(history_file: Path) -> ProtectedDict:
+    """Loads and deserializes the iteration history into a ProtectedDict."""
+    with open(history_file, 'r') as f:
+        raw_history = json.load(f)
+        
+    def _recursive_protect(d):
+        if isinstance(d, dict):
+            pt = ProtectedDict()
+            for k, v in d.items():
+                pt[k] = _recursive_protect(v)
+            return pt
+        return d
+        
+    protected_hist = ProtectedDict()
+    for k, v in raw_history.items():
+        # ast.literal_eval handles the tuple keys like "(0, 0)"
+        protected_hist[ast.literal_eval(k)] = _recursive_protect(v)
+        
+    return protected_hist
+
 def start_up_prep_2(start_point: Union[str, int], base_output_dir: Path, logger: GranLogger, mode: str = "full") -> Tuple[int, Dict, Path]:
     """
     Handles folder cleanup and history loading.
     Supports both integer-based iteration folders (Full) and Depth.Index folders (Split).
     """
-    history = {}
+    history = ProtectedDict()
     history_file = base_output_dir / 'history.json'
     
     # Check for resume
@@ -214,7 +258,7 @@ def start_up_prep_2(start_point: Union[str, int], base_output_dir: Path, logger:
         if isinstance(start_point, int) and start_point == 0:
              logger.log("Split mode: --start 0 implies fresh run. Wiping history.", 'i')
              is_resume = False
-             history = {}
+             history = ProtectedDict()
              # shutil.rmtree(base_output_dir) # Dangerous? Better to just clear history and let overwrite handle it.
              # Actually, we should clear folders to avoid confusion.
              if base_output_dir.exists():
@@ -287,7 +331,7 @@ def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: G
     Robustly handles both Integer folders (Full mode) and Dot-Notation folders (Split mode).
     """
     i = 0
-    history = {}
+    history = ProtectedDict()
     history_file = base_output_dir / 'history.json'
 
     # 1. Load History if exists
@@ -298,7 +342,7 @@ def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: G
                 logger.log(f"Loaded existing history ({len(history)} entries).", 'i')
             except Exception as e:
                 logger.log(f"Failed to load history file ({e}). Starting fresh.", 'w')
-                history = {}
+                history = ProtectedDict()
         else:
             pass
             #logger.log(f"No history file found at {history_file}. Starting from scratch.", 'i')
@@ -311,7 +355,7 @@ def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: G
         # We generally DO NOT delete folders in split mode unless forced, to preserve the recursion tree.
         if start_point == 0: # Explicit restart request
              logger.log("Split Mode: Explicit start at 0. Clearing previous history.", 'i')
-             history = {}
+             history = ProtectedDict()
              # We let existing folders be overwritten by the run logic
         return 0, history, history_file
 
@@ -383,7 +427,7 @@ def start_up_prep(start_point: Union[str, int], base_output_dir: Path, logger: G
 
     return i, history, history_file
 
-def check_loop_length(n: int, i: int, st_file: Path, history: Dict, logger: GranLogger) -> Union[int, float]:
+def check_loop_length_greedy(n: int, i: int, st_file: Path, history: Dict, logger: GranLogger) -> Union[int, float]:
     """Determines the true loop length based on input and history."""
     # If n is non-positive, run while True, otherwise run n times
     if n <= 0:
@@ -403,6 +447,27 @@ def check_loop_length(n: int, i: int, st_file: Path, history: Dict, logger: Gran
             n = -1
     '''
 
+    return n
+
+def check_loop_length(n: int, i: int, st_file: Path, history: Dict, logger: GranLogger) -> Union[int, float]:
+    """Determines the true loop length based on input and history."""
+    if n <= 0:
+        n = float('inf')
+    if i > 0:
+        last_task = (i-1, 0)
+        if last_task in history:
+            passed_any = False
+            # Iterate through the new nested state structure
+            for state_id, events in history[last_task].items():
+                for child_id, event_data in events.items():
+                    if child_id != "In" and event_data.get('passed', False):
+                        passed_any = True
+                        break
+                if passed_any: break
+            
+            if not passed_any and st_file.exists():
+                logger.log(f'Previous run was completed. No further iterations needed.', 'i')
+                n = -1
     return n
 
 def assess_restart_compatibility(logger, ctx, tcf) -> bool:
@@ -488,34 +553,19 @@ class InitParser:
         g_algo.add_argument("-x", "--ploidy", type=str, default=None,
             help="Ploidy file or string formatted as a line-separated counter of diploid subgenomes (e.g., 'A 1' = "
                  "A is at most diploid). If provided, H1 and H2 nodes will be enforced by ploidy levels. Default: None.")
-        g_algo.add_argument("-c", "--cap", type=int, default=8,
+        g_algo.add_argument("-c", "--cap", type=int, default=15,
             help="The maximum number of groups with polyploid species a gene tree is allowed to have given a MUL-tree. "
-                 "A GT with more than --cap groups for at least one MT, will be skipped entirely. Default = 8 [15 on release].")
-        g_algo.add_argument("-w", "--weights", type=int, nargs=2, default=[1, 1],
-            help="Space-separated integer weights for the parsimony score calculation: 'w_dup w_loss'. Default = '1 1'.")
-        g_algo.add_argument("-n", "--max_select", type=int, default=1,
-            help="Maximum MUL-trees to select per run for postprocessing and detailed outputs. Default: 1, i.e., only the best "
-                 "scoring MT is considered per iteration (Default: 1, All_until_input_st_inclusive: 0, ALL: any negative int).")
-
-        # new to be implemented later:
-
-        # -- lookahead --
-        # greedy search when selecting n MTs - each selected MT is a branch in the search,
-        # lookahead determines how many depths forward to evaluate the search-branches...
-        g_algo.add_argument("-l", "--lookahead", type=int, default=0,
-            help="Number of iterations to look ahead when selecting MTs for postprocessing. Only relevant for iterative modes "
-            "where more than one tree is selected. Default: 0 (no lookahead), Unbounded: any negative int.")
-        
-        # -- gt balanching --
-        # How to balance the influance of the gts during reconciliation
-        # Options: no balancing (default), balance by harmonic mean of gt toplogy and support values (new), apply supports while reconciling (new)
+                 "A GT with more than --cap groups for at least one MT, will be skipped entirely. Default = 15.")
         g_algo.add_argument("-q", "--quota_gts", type=str, choices=['equal', 'e', 'harmonic', 'h', 'per-clade', 'p'], default='equal',
             help="Method for balancing the influence of gene trees during reconciliation. "
                  "(e)qual: No balancing; all GTs contribute equally to the parsimony score [default]. "
                  "(h)armonic: Balance by the harmonic mean Q of topology and support. GTs with Q will have less influence. "
-                 "(p)er-clade: Balance directly during reconciliation. Clades with low support will have less influence.")
-
-
+                 "(p)er-clade: Balance directly during reconciliation. Clades with low support will have less influence [Not implemented].")
+        g_algo.add_argument("-w", "--weights", type=int, nargs=2, default=[1, 1],
+            help="Space-separated integer weights for the parsimony score calculation: 'w_dup w_loss'. Default = '1 1'.")
+        g_algo.add_argument("-n", "--n_best", type=int, default=1,
+            help="Maximum top-ranked MUL-trees to select per run for postprocessing and detailed outputs. Default: 1, i.e., only the best "
+                 "scoring MT is considered per iteration (Default: 1, All_until_input_st_inclusive: 0, ALL: any negative int).")
         g_algo.add_argument("--min_st_lvs", type=int, default=1,
             help="Minimum species tree leaves for a species tree to be considered valid. Specifically relevant for the "
                  "split mode. Default: 1.")
@@ -537,10 +587,8 @@ class InitParser:
                  "reproduction of legacy-GRAMPA output, but is not recommended for general use due to increased runtime and algorithmic " 
                  "incompatibility with full/mixed modes.")
         
-        g_algo.add_argument('--optim', dest='optim', action='store_true',
-            help="If set, will run alternative algorithms for [1.] MT construction and [2.] reconciliation: " 
-                "these are unrelated and can be mixed if merged into default. However, testing them I observe no significant speedup. "
-                "[1.] may be worth to keep due to safety (?) but [2.] is over-engineered and seems to not be worth it at all.")
+        g_algo.add_argument('--optim', dest='optim', type=int, default=0,
+            help="Developer option for optimization level. 0 = default, 1 = deduplication only, 2 = backbone only, 3 = combined optimizations.")
 
         # --- Flow Control Options ---
         g_flow = self.parser.add_argument_group("Flow Control Options")
@@ -557,14 +605,38 @@ class InitParser:
                  "check-nums: Count groups only. "
                  "no-st: Skip reconciliation to input. "
                  "st-only: Reconciliation to input only.")
+        g_flow.add_argument("-l", "--lookahead", type=int, default=0,
+            help="Controls the 'delay' in path selection: a lookahead of `l` at depth `d` evaluates paths which originated at depth `d-l`. "
+                 "Keeps only the paths which originated from the origin that produced the best path (at depth `d`), capping the maximum "
+                 "active paths back to n^l. Only relevant for iterative modes with n>1. Default: 0 (disabled), Unbounded (=disabled): any "
+                 "non-positive int.")
+        g_flow.add_argument("-b", "--breadth-max", type=int, default=0,
+            help="Controls the maximum number of active paths allowed to proceed at any given depth, keeping only the top `b` paths. "
+                 "Only relevant for iterative modes with n>1. Default: 0 (disabled), Unbounded (=disabled): any non-positive int.")
         g_flow.add_argument('-i', '--iter', type=int, default=0,
             help="Maximun number of iterations or (~depth) event num for iterative modes; <int>, non-positive to be unlimited. Default = 0.")
         g_flow.add_argument('--start', type=str, default='auto',
             help="Start point when resuming a previous execution; positive <int>, or 'auto' [default] for auto-detection.")
-        g_flow.add_argument('--cutoff', type=str, default='auto',
-            help="Stopping condition when comparing MP scores. For Split mode or the first iter of Full, score is compared to the input ST "
-                 "score. For subsequent iters of Full, score is compared to the previous iter's best score. Can be 'abs:<int>' for absolute "
-                 "difference, 'rel:<float>' for relative difference, or 'auto' as a shorthand for 'abs:0' [default].")
+        
+        # Cutoff Mode (-c, --cutoff-mode)
+        """
+        Controls how the top non-input Multi-Trees are filtered during reconciliation.
+        Options:
+        'input' (0)     : (Default) Filters based on the absolute/relative difference from the input score (using the existing threshold logic).
+        'fvall' (-1)    : Creates a score distribution histogram of the current reconciliation. Finds the first local minimum (valley) in frequency and uses its score as the cutoff threshold.
+        'lvall' (-2)     : Creates a score distribution histogram of the current reconciliation. Finds the first local minimum (valley) in frequency and uses its score as the cutoff threshold.
+        'rvall' (-3)    : Creates a score distribution histogram of the current reconciliation. Finds the first local minimum (valley) in frequency and uses its score as the cutoff threshold.
+        'none' (<=-4)     : No cutoff. All top `n_best` MTs will be accepted.
+        """
+
+        g_flow.add_argument('--cutoff', type=str, nargs='+', default=['auto'],
+            help="Strategy to pass or filter the top non-input MT(s) during reconciliation. Recieves up to 3 space-separated arguments: "
+                 "- Reference: 'input' [default] for input tree's score, 'fvall' for first valley in score distribution, 'lvall' for valley "
+                 "             left of the input score, 'rvall' for valley right of the input score, or 'none' for no cutoff. "
+                 "- Difference function (if Ref is not 'none'): 'abs' for absolute difference [default], or 'rel' for relative difference. "
+                 "- Offset (if Ref is not 'none'): <int> for absolute, or <float> for relative. Default = 0 (i.e., no difference from Ref). "
+                 "These are optional and may be given in any order. 'auto' [default] is a shorthand for 'input abs 0'. ")
+        
         g_flow.add_argument("--root", type=str, default=None,
             help="Root the species tree on the specified node/leaf string or comma-separated clade.")
         g_flow.add_argument("--orthologies", action="store_true",
@@ -619,21 +691,44 @@ class InitParser:
             help="If set, only the standard reconciliation (reconciling to the singly-labeled species tree) "
                  "will be performed. Equivalent to -m st-only.")
 
-    def parse_cutoff(self, val: str) -> Tuple[str, Optional[Union[float, int]]]:
-        """Parses stopping condition strings into a typed tuple."""
-        if val == 'auto': 
-            return ('abs', 0)
-        if val.startswith('rel:'):
-            try: 
-                return ('rel', float(val.split(':')[1]))
-            except (ValueError, IndexError): 
-                self.logger.log(f'Invalid relative cutoff: {val}', 'e')
-        if val.startswith('abs:'):
-            try: 
-                return ('abs', int(val.split(':')[1]))
-            except (ValueError, IndexError): 
-                self.logger.log(f'Invalid absolute cutoff: {val}', 'e')
-        self.logger.log(f'Invalid cutoff format: "{val}". Use "auto", "rel:<float>", or "abs:<int>".', 'e')
+    def parse_cutoff(self, vals: List[str]) -> Tuple[str, str, Union[float, int]]:
+        """Parses stopping condition list into a typed tuple (Reference, DiffFunc, Offset)."""
+        # Failsafe if argparse hasn't converted it to a list yet
+        if isinstance(vals, str):
+            vals = [vals]
+        if len(vals) > 3:
+            self.logger.log(f'Cutoff argument received too many values: {vals}', 'e')
+        vals = [v.strip().lower() for v in vals]
+
+        # Shorthand overrides
+        if 'auto' in vals:
+            if len(vals) > 1:
+                self.logger.log(f'"auto" cutoff overrides other cutoff arguments. Ignoring: {[v for v in vals if v != "auto"]}', 'w')
+            return ('input', 'abs', 0)
+        if 'none' in vals:
+            if len(vals) > 1:
+                self.logger.log(f'"none" cutoff overrides other cutoff arguments. Ignoring: {[v for v in vals if v != "none"]}', 'w')
+            return ('none', 'abs', 0)
+
+        # Defaults
+        ref, func, offset = 'input', 'abs', 0
+
+        # Order-independent parsing
+        for val in vals:
+            if val in ('input', 'fvall', 'lvall', 'rvall'):
+                ref = val
+            elif val in ('abs', 'rel'):
+                func = val
+            else:
+                try:
+                    if '.' in val:
+                        offset = float(val)
+                    else:
+                        offset = int(val)
+                except ValueError:
+                    self.logger.log(f'Ignored invalid cutoff argument: "{val}"', 'w')
+                    
+        return (ref, func, offset)
 
     def resolve_mode_logic(self, mode: str, lgflags: Dict[str, bool]) -> Tuple[str, int]:
         """
@@ -1131,11 +1226,12 @@ class InitParser:
             sample        = args.sample,
             optim         = args.optim,
             orth_opt      = args.orthologies,
+            lookahead     = args.lookahead,
+            breadth_max   = args.breadth_max,
             max_iter      = check_loop_length(args.iter, i, None, history, self.logger),
             start_pt      = i,
             mixed_switch  = mixed_switch,
             root_spec     = args.root,
-            cutoff        = self.parse_cutoff(args.cutoff),
             nesting       = nesting,
             min_gt_lvs    = args.min_gt_lvs,
             min_st_lvs    = args.min_st_lvs,
@@ -1143,7 +1239,7 @@ class InitParser:
             allow_redun   = args.allow_redundant_mts,
             root_dir      = out_dir,
             log_file      = log_file,
-            history       = history
+            history       = HistoryType(out_dir / "history.json", initial_data=history)
         )
 
         # --- Prepare Step Config ---
@@ -1161,7 +1257,8 @@ class InitParser:
             group_cap     = args.cap,
             quota_gts     = quota_gts,
             weights       = tuple(args.weights),
-            max_select    = args.max_select,
+            n_best        = args.n_best,
+            cutoff        = self.parse_cutoff(args.cutoff),
             is_mul_input  = args.is_mul_input,
         )
 

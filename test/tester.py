@@ -33,13 +33,13 @@ if __name__ == "__main__":
 #            ("w_sn_H", "genetrees.txt", "spectree.tre"),
         ],
         'generator': [
-             ("ex", "to_generate.json", "spectree.tre"),
+###             ("ex", "to_generate.json", "spectree.tre"),
         ],
 
         'empirical': [
-#        ("ex_k_back", "backbone.txt", "astral.tre"),
-#        ("ex_bend", "grampa_trees.tre", "species.tre"),
-#        ("ex_diaz", "grampa_trees.tre", "species.tre"),
+        ("ex_k_back", "backbone.txt", "astral.tre"),
+        ("ex_diaz", "grampa_trees.tre", "species.tre"),
+        ("ex_bend", "grampa_trees.tre", "species.tre"),
 #        ("ex_kall", "kall.nw", "kall.treefile"),
 
 #        ("ding2023", "grampa_trees.tre", "grampa_species_tree.tre"),
@@ -69,20 +69,22 @@ if __name__ == "__main__":
             o_old = path_manual / 'o_old'
             o_new = path_manual / 'o_new'
 
-            run_str_new = f"python {new_tool} -g {g} -s {s} --debug --plot -v 3 -p 10 -q h -x E:\\Repos\\Grandma\\test\\test_data\\generator\\ex\\o_new2\\Zhao\\ploidies.txt -o"# --root u --strict_constraint
-            run_str_old = f"python {old_tool} -g {g} -s {s} --overwrite -o"
+            #run_str_new = f"python {new_tool} -g {g} -s {s} --debug --plot -v 3 -p 10 -q h -x E:\\Repos\\Grandma\\test\\test_data\\generator\\ex\\o_new2\\Wise\\ploidies.txt --strict_constraint --sample 0 -o"# -l 1 -n 2 --root u
 
-            #time_tool(f"{run_str_new} {o_new}/", "new") # --debug --plot -w 1 50
+            run_str_new = f"python {new_tool} -g {g} -s {s} --debug --bench --plot -v 3 -p 10 -m single -c 8 --allow_redunant_mts --sample 0 -o"
+            run_str_old = f"python {old_tool} -g {g} -s {s} --overwrite -p 10 -o"
+
+            time_tool(f"{run_str_new} {o_new}_ar/ --optim 1", "new") # --debug --plot -w 1 50
             #time_tool(f"{run_str_new} {o_new}_nm/ --nestedness model", "new") # --debug --plot
-            #time_tool(f"{run_str_new} {o_new}_op/ --optim", "new")
+            time_tool(f"{run_str_new} {o_new}_op_ar/ --optim 3", "new")
             #time_tool(f"{run_str_new} {o_new}_np/ --optim --nestedness model", "new") # --debug --plot
             #time_tool(f"{run_str_new} {o_new}_spltnew/ -m split --start auto -x {x} --maps 6 --min_gt_lvs 1", "new") #--plot --start 1 -i 2 --repair
             
-            time_tool(f"{run_str_new} {o_new}2/ --generate {g} --bench", "new")
+            #time_tool(f"{run_str_new} {o_new}2/ --generate {g} --bench", "new")
             
             #time_tool(f"{run_str_old} {o_old}_v0 --maps -v 0", "old")
             #time_tool(f"{run_str_old} {o_old}_v1 --maps -v 1", "old")
-            #time_tool(f"{run_str_old} {o_old}_v2 --maps -v 2", "old")
+            #time_tool(f"{run_str_old} {o_old}_ --maps -v 2", "old")
             #time_tool(f"{run_str_old} {o_old}_iter/ -v 3 -p 10 -i 0", "old") #_v3
 
             #time_tool(f"python {curr_path / 'exe_compare.py'} -log {path_manual / 'compare_log.txt'} -old {o_old} -new {o_new}", "compare") #_splt\\0\\output

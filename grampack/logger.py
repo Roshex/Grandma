@@ -481,14 +481,19 @@ class GranLogger:
 
         # --- Execution Settings ---
 
+        unlimited_lambda = lambda x: "Unlimited" if x == float('inf') or x < 0 else str(x) # inf for max_iter, negative for lookahead
+
         log_("-" * 125)
         log_("EXECUTION SETTINGS:")
         m_switch = ctx.mixed_switch
         mixed_switch_str = "" if mode != "mixed" and not m_switch else f" [switch at {str(m_switch)}]"
         log_(space("------ MODE ------:", pad) + f"{str(mode).upper()}{mixed_switch_str}")
         if is_top_level:
-            iter_text = "Unlimited" if ctx.max_iter == float('inf') else str(ctx.max_iter)
-            log_(space("Max iterations:", pad) + iter_text)
+            # NEW :
+            if ctx.lookahead and (tcf.n_best > 1 or tcf.n_best == 0):
+                log_(space("Max number of MTs to select:", pad) + str(tcf.n_best) if tcf.n_best > 0 else "Up to input ST")
+                log_(space("Early branch termination lookahead:", pad) + unlimited_lambda(ctx.lookahead))
+            log_(space("Max iterations:", pad) + unlimited_lambda(ctx.max_iter))
             log_(space("Start iteration:", pad) + str(ctx.start_pt))
         if not is_task or ctx.debug:
             log_(space("Automatic tree repair:", pad) + str("Off" if tcf.repair == 'none' else tcf.repair.capitalize()))
@@ -527,11 +532,12 @@ class GranLogger:
                     log_(space("Optimized reconciliation:", pad) + str("On" if ctx.optim else "Off"))
                     log_(space("Gene tree quotas:", pad) + tcf.quota_gts.capitalize())
                     log_(space("Parsimony penalty weights:", pad) + f"Dup: {tcf.weights[0]}, Loss: {tcf.weights[1]}")
-                    max_select_str = str(tcf.max_select) if tcf.max_select > 0 else ("Up to input ST (inclusive)" if not tcf.max_select else "All")
+                    max_select_str = str(tcf.n_best) if tcf.n_best > 0 else ("Up to input ST (inclusive)" if not tcf.n_best else "All") #Bug !!!!
                     if mode != "st-only":
                         log_(space("Max number of MTs to select:", pad) + max_select_str)
                     if mode in ("split", "full", "mixed"):
-                        log_(space("Parsimony score cutoff:", pad) + f"Type: {ctx.cutoff[0]}, Value: {ctx.cutoff[1]}")
+                        cutoff_str = f"Ref: {tcf.cutoff[0]}, Offset: {tcf.cutoff[2]}, Diff: {tcf.cutoff[1]}" if tcf.cutoff[0] != "none" else "None"
+                        log_(space("Parsimony score cutoff:", pad) + cutoff_str)
                         if mode in ("full", "mixed"):
                             log_(space("Nestedness behavior:", pad) + str(ctx.nesting).capitalize())
                         if mode in ("split", "mixed"):
