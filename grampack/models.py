@@ -15,7 +15,7 @@ from Reticulate_Tree.reticulate_tree import ReticulateTree
 # Grandma will eventually do:   raw.split("_", 1)[-1]   // split by first underscore, to preserve species names with underscores
 splitSpec = lambda raw: raw.rsplit("_", 1)[-1] if "_" in raw else raw
 
-def decode_optim(optim: int) -> Tuple[bool, bool, bool]:
+'''def decode_optim(optim: int) -> Tuple[bool, bool, bool]:
     """
     Decode --optim into independent switches.
       bit 0 (1,3,5,7) -> dedup_gts : one representative per class of gene trees that are
@@ -27,7 +27,19 @@ def decode_optim(optim: int) -> Tuple[bool, bool, bool]:
     """
     if not isinstance(optim, int) or not (0 <= optim <= 7):
         raise ValueError(f"Invalid optimization level: {optim}. Must be 0-7.")
-    return bool(optim & 1), bool(optim & 2), bool(optim & 4)
+    return bool(optim & 1), bool(optim & 2), bool(optim & 4)'''
+
+def decode_optim(optim: int) -> Tuple[bool, bool, bool, bool]:
+    """
+      bit 0 (+1)  dedup_gts    one representative per class of isomorphic gene trees
+      bit 1 (+2)  use_gray     Gray-code enumeration
+      bit 2 (+4)  use_sweep    target sweep for single-target candidates
+      bit 3 (+8)  exact_groups exact unit states (see grouping.unit_states); without it
+                               both engines reproduce GRAMPA's collapsing exactly.
+    """
+    if not isinstance(optim, int) or not (0 <= optim <= 15):
+        raise ValueError(f"Invalid optimization level: {optim}. Must be 0-15.")
+    return bool(optim & 1), bool(optim & 2), bool(optim & 4), bool(optim & 8)
 
 class NameRegistry:
     """
@@ -39,6 +51,7 @@ class NameRegistry:
         self._int_to_str: List[str] = []
     
     def get_id(self, name: str) -> int:
+        """Get the integer ID for a species name, registering it if not already present."""
         try:
             return self._str_to_int[name]
         except KeyError:
@@ -46,9 +59,13 @@ class NameRegistry:
             self._str_to_int[name] = idx
             self._int_to_str.append(name)
             return idx
-    
+
     def get_ids(self, names: List[str]) -> List[int]:
         return [self.get_id(name) for name in names]
+    
+    def find_id(self, name: str) -> Optional[int]:
+        """Non-mutating lookup: None when the name was never registered."""
+        return self._str_to_int.get(name)
     
     def get_name(self, idx: int) -> str:
         return self._int_to_str[idx]
@@ -620,104 +637,6 @@ class SmrtTree:
     # GROUP COLLAPSING LOGIC (Object-based, run once per iter)
     # --------------------------------------------------------------------------
 
-    def compute_groups(self, mul_data: 'MulTree', registry: NameRegistry, 
-                       h1_sisters: Set[str] = None, hx_sisters_list: List[Set[str]] = None) -> GroupData:
-        """
-        Registry-Optimized O(N) implementation.
-        Uses integer IDs for Set operations (Union/IsSubset) to achieve significant speedup.
-        """
-        h1_target_ids = {registry.get_id(name) for name in mul_data.h_clade}
-        # Cache: node -> (species_id_set, leaf_names_list, active_roots)
-        # species_id_set: Set[int] - much faster than Set[str]
-        groups, singles, node_info = {}, {}, {}
-
-        # Raw ete3 traversal - Maximum speed!
-        for node in self.ete_tree.traverse("postorder"):
-            if node.is_leaf():
-                # Extract name and convert to ID
-                sp_name = splitSpec(node.name)
-                sp_id = registry.get_id(sp_name)
-                is_h1 = sp_id in h1_target_ids
-                
-                s_set, l_list = {sp_id}, [node.name]
-                if is_h1:
-                    singles[node.name] = [] 
-                    a_roots = [node.name]
-                else:
-                    a_roots = []
-                node_info[node] = (s_set, l_list, a_roots)
-                
-            else:
-                u_s_set, u_l_list, u_a_roots = set(), [], []
-                all_h1_descendants, total_species_count = True, 0
-                
-                for child in node.children:
-                    c_s_set, c_l_list, c_a_roots = node_info[child]
-                    u_s_set.update(c_s_set)
-                    u_l_list.extend(c_l_list)
-                    u_a_roots.extend(c_a_roots)
-                    total_species_count += len(c_s_set)
-                    
-                    # Integer set subset check is highly optimized
-                    if not c_s_set.issubset(h1_target_ids):
-                        all_h1_descendants = False
-                
-                if all_h1_descendants and (len(u_s_set) == total_species_count) and len(node.children) > 1:
-                    # Valid Group
-                    for r in u_a_roots:
-                        groups.pop(r, None)
-                        singles.pop(r, None)
-                    groups[node.name] = [u_l_list, []]
-                    u_a_roots = [node.name]
-                
-                node_info[node] = (u_s_set, u_l_list, u_a_roots)
-
-        # --- Post-Processing ---
-        
-        def fill_anc_leaves(n_name, target_dict):
-            n_obj = self.get_node(n_name)
-            if not n_obj or not n_obj.up: return
-            p_obj = n_obj.up
-            if p_obj in node_info and n_obj in node_info:
-                p_leaves = node_info[p_obj][1]
-                n_leaves_set = set(node_info[n_obj][1])
-                anc_list = [l for l in p_leaves if l not in n_leaves_set]
-                if target_dict is groups:
-                    target_dict[n_name][1] = anc_list
-                else: # is singles
-                    target_dict[n_name] = anc_list
-
-        for g_name in groups: fill_anc_leaves(g_name, groups)
-        for s_name in singles: fill_anc_leaves(s_name, singles)
-
-        # --- Fixes Logic ---
-
-        # List of List[int], List of (List[int], int)
-        final_ambiguous, final_fixed = [], [] 
-
-        # Sister checking
-        if mul_data.h1_node and (h1_sisters is None):
-            h1_sisters, hx_sisters_list = mul_data.get_sister_clades()
-
-        def check_fix(unit_nodes, anc_leaves):
-            # Convert to Set for fast subset math
-            group_sis_specs = {splitSpec(n) for n in anc_leaves}
-            if group_sis_specs:
-                if h1_sisters and group_sis_specs.issubset(h1_sisters):
-                    # Index 0 corresponds to the Base/H1 target
-                    final_fixed.append((registry.get_ids(unit_nodes), 0))
-                    return
-                for idx, hx_sisters in enumerate(hx_sisters_list):
-                    if hx_sisters and group_sis_specs.issubset(hx_sisters):
-                        # Index idx + 1 corresponds to H2 (1), H3 (2), etc.
-                        final_fixed.append((registry.get_ids(unit_nodes), idx + 1))
-                        return
-            final_ambiguous.append(registry.get_ids(unit_nodes))
-
-        for g_leaves, anc_leaves in groups.values(): check_fix(g_leaves, anc_leaves)
-        for s_name, anc_leaves in singles.items(): check_fix([s_name], anc_leaves)
-
-        return GroupData(final_ambiguous, final_fixed)
 
     # Transport of a GroupData between isomorphic gene trees
     def groups_to_positions(self, gd: 'GroupData'):

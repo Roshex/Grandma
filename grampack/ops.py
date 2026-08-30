@@ -10,11 +10,12 @@ from collections import defaultdict
 from shutil import rmtree, make_archive, unpack_archive
 from itertools import chain, combinations
 from functools import partial
-from typing import Tuple, List, Optional, Dict, Union, Set
+from typing import Tuple, List, Optional, Dict, Union, Set, Collection
 
 from .config import TaskConfig
 from .logger import GranLogger
-from .models import Tree, SmrtTree, TreeCache, MulTree, GroupData, NameRegistry, splitSpec, decode_optim
+from .models import Tree, SmrtTree, TreeCache, MulTree, NameRegistry, FlatTree, splitSpec, decode_optim
+from .algo import compute_groups, compute_units, TargetSweep
 
 class CommonOps:
     @staticmethod
@@ -104,6 +105,42 @@ class CommonOps:
             logger.log(f"{desc.capitalize()} file '{input}' not found.", key)
         else:
             logger.log(f"Invalid input type for {desc}.", key)
+
+    @staticmethod
+    def plan_dedup(gene_trees, threshold, enabled=True, latched_off=False,
+               logger=None, label=""):
+        """
+        Returns (rep_of, latch_off_downstream).
+
+        Once the signature pass has run its cost is sunk, so the map is USED in the task
+        that computed it whatever the duplicate fraction. `threshold` decides only whether
+        the fraction is high enough to be worth re-paying in the tasks that inherit from
+        this one: below it, descendants of a SERIAL task latch de-duplication off (their
+        duplicate fraction cannot recover - relabelling only refines the leaf labelling).
+        Split regimes always re-assess, because partitioning creates many duplicates.
+
+        Hard off: clear bit 0 of --optim (enabled=False), or set the threshold to >= 1.0,
+        which skips even the signature pass.
+        """
+        if not enabled or latched_off or not gene_trees or threshold >= 1.0:
+            return {}, True
+
+        first, rep_of = {}, {}
+        for idx, gt in gene_trees.items():
+            rep = first.setdefault(gt.canon_sig, idx)
+            if rep != idx:
+                rep_of[idx] = rep
+
+        frac = len(rep_of) / len(gene_trees)
+        latch = frac < threshold
+        if logger is not None:
+            tag = f"{label} " if label else ""
+            kept = len(gene_trees) - len(rep_of)
+            tail = (f" < {100*threshold:.1f}% threshold - used here, disabled "
+                    f"for subsequent iterations." if latch else ".")
+            logger.log(f"{tag}Gene-tree de-duplication: {len(gene_trees)} trees -> {kept} "
+                    f"distinct labelled topologies ({100*frac:.1f}%){tail}", 'i')
+        return rep_of, latch
                 
 class TreeLoader:
     """
@@ -407,7 +444,7 @@ class TreeLoader:
         we must temporarily binarize any remaining polytomies (e.g., ancestors when resolving bottom-up)
         so the scoring engine doesn't silently ignore 3rd+ children and drop lineages.
         """
-        from .reconcile import Reconciler  # Dynamic import avoids circular dependency
+        from .algo import PairwiseRecon
         from .models import SmrtTree
         
         # Flatten the species tree once if it hasn't been already
@@ -425,7 +462,7 @@ class TreeLoader:
         temp_wrapper = SmrtTree(tree_obj=temp_gt)
         temp_wrapper.make_flat(registry)
         
-        return Reconciler.reconcile_sl(temp_wrapper.flat_tree, st_wrapper.flat_tree, dup_cost, loss_cost, registry=registry)
+        return PairwiseRecon(dup_cost, loss_cost, True).reconcile_sl(temp_wrapper.flat_tree, st_wrapper.flat_tree, registry=registry)[0]
 
     @staticmethod
     def root_by_recon(gt: Tree, st_wrapper: SmrtTree, weights: Tuple[int, int], registry: NameRegistry) -> None:
@@ -495,8 +532,10 @@ class TreeLoader:
 
         def resolve_large_polytomy(poly_node: Tree) -> None:
             """Species-Tree-Guided bottom-up heuristic for large polytomies."""
-            from .reconcile import Reconciler
+            from .algo import PairwiseRecon
             st_bins = defaultdict(list)
+
+            pr = PairwiseRecon(dup_cost, loss_cost, True)
             
             # 1. Map each child to its ST LCA using exact Reconciliation (Flawless MUL-tree handling)
             for c in list(poly_node.children):
@@ -512,22 +551,13 @@ class TreeLoader:
                 c_wrapper.make_flat(registry)
                 
                 st_lca = None
-                try:
-                    # Run the DP LCA algorithm to find the mathematically optimal mapping!
-                    res = Reconciler.reconcile_sl(
-                        c_wrapper.flat_tree, 
-                        st_wrapper.flat_tree, 
-                        dup_cost, 
-                        loss_cost, 
-                        registry=registry, 
-                        retmap=True
-                    )
-                    if res and res.maps:
-                        mapped_st_name = res.maps[0].cor[temp_name][0]
-                        st_lca = st_wrapper.get_node(mapped_st_name)
-                except Exception as e:
-                    raise
-                    #pass # Safety catch, st_lca remains None
+
+                _score, maps = pr.reconcile_sl(
+                    c_wrapper.flat_tree, st_wrapper.flat_tree,
+                    registry=registry, retmap=True)
+                if maps:
+                    mapped_st_name = maps[0].cor[temp_name][0]
+                    st_lca = st_wrapper.get_node(mapped_st_name)
                 
                 # Restore original name
                 if not original_name:
@@ -1278,7 +1308,7 @@ class MulTreeManager:
             
         return valid_match_groups
 
-    def build(self,
+    def index(self,
               nesting: str='model',
               strict_constraint: bool=False,
               allow_redundant_mts: bool=False,
@@ -1361,52 +1391,39 @@ class MulTreeManager:
         # Pre-calculate valid pairings and use this for both counting and building steps
         # This ensures consistency and avoids redundant calculations
         
-        step = "Counting MUL-trees" if self.tcf.mode == "count-mts" else "Counting MUL-trees to generate"
+        step = "Counting MUL-trees" if self.tcf.mode == "count-mts" or sweep_mode else "Counting MUL-trees to generate"
         self.logger.report_step(step, "In progress...")
-        
-        num_mul_trees = 0
-        valid_pairings: Dict[str, List[List[Tree]]] = {}
+
+        multi: List[int] = []
+        single: List[int] = []
+        mt_meta: Dict[int, Tuple[str, List]] = {}
+        idx = 1 # idx 0 reserved for species tree!
+
         for h1 in h1_resolved:
             h1_st_node = self.st.get_node(h1)
             n1_pure_descendants = pure_desc_cache.get(h1_st_node, set())
             
             # Get the definitive list of valid target groupings
-            match_groups = self._compile_h2_targets(h1_st_node, h2_resolved, nesting, n1_pure_descendants, h1_allowances[h1], allow_redundant_mts)
-            valid_pairings[h1] = match_groups
-            num_mul_trees += len(match_groups)
+            # _compile returns valid_pairings, a list of matches, for the given H1
+            for matches in self._compile_h2_targets(h1_st_node, h2_resolved, nesting, n1_pure_descendants, h1_allowances[h1], allow_redundant_mts):
+                mt_meta[idx] = (h1, matches)
+                (single if len(matches) == 1 else multi).append(idx)
+                idx += 1
+
+        num_mul_trees = len(mt_meta) # already excludes the species tree (index 0)
             
         self.logger.report_step(step, f"Success: {num_mul_trees} total MUL-trees")
-                        
+
         if self.tcf.mode == "count-mts":
             self.report_mt_count(self.st.ete_tree, h1_resolved_original, h2_resolved, num_mul_trees, nesting, bool(self.ploidies), allow_redundant_mts)
             return {}, [], [], {} # Returns empty dict to signal main.py to exit
 
         if sweep_mode:
             self.logger.log("Sweep mode enabled: skipping MUL-tree building step.", 'i')
-            return valid_pairings, h1_resolved, [], self.ploidies
- 
-        # --- BUILDING STEP ---
-        step = "Building MUL-trees"
-        self.logger.report_step(step, "In progress...")
-        
-        mul_num = 1
-        for h1 in h1_resolved:
-            h1_st_node = self.st.get_node(h1)
-            h_clade = h1_st_node.get_leaf_names()
-            
-            # We just iterate over the pre-calculated, validated groups!
-            for matches in valid_pairings[h1]:
-                all_targets = sorted([n.name for n in matches])
-                
-                # to_multi_mul_tree handles BOTH Simple and Model modes seamlessly!
-                # (If simple, all_targets just has 1 item)
-                mt_wrapper, h1_obj, hx_objs = self.st.to_multi_mul_tree(h1, all_targets)
+            return (mt_meta, single, multi), h1_resolved, h2_resolved, self.ploidies
 
-                if mt_wrapper:
-                    mul_trees[mul_num] = MulTree(mt_wrapper, h_clade, h1_obj, hx_nodes=hx_objs)
-                    mul_num += 1
-        
-        self.logger.report_step(step, f"Success: {mul_num-1} MUL-trees built")
+        # --- BUILDING STEP ---
+        self.build(mt_meta, mul_trees)
 
         if self.tcf.mode == "build-mts":
             self.report_mt_build(mul_trees, nesting)
@@ -1418,6 +1435,44 @@ class MulTreeManager:
             self.logger.log("Too few MUL-trees built. Check your H1/H2 and ploidy constraints.", 'w')
             
         return mul_trees, h1_resolved, h2_resolved, self.ploidies
+
+    def build(self,
+              mt_meta: Dict[int, Tuple[str, List]],
+              mul_trees: Optional[Dict[int, MulTree]] = None,
+              keep: Optional[Collection[int]] = None,
+              label: str = ''
+              ) -> Dict[int, MulTree]:
+        """
+        Builds MUL-trees from the provided index metadata.
+        Metadata indexes must not be already present in mul_trees to avoid overwriting!
+        If mul_trees is provided, it will be updated in-place; otherwise, a new dictionary will be created.
+
+        keep=None: build all
+        keep=collection[int]: build only the specified indices
+        keep=empty_collection: build none (used for counting only)
+        """
+        step = f"Building {label}MUL-trees"
+        self.logger.report_step(step, "In progress...")
+
+        counter = 0
+        if mul_trees is None: mul_trees = {}
+        for idx, (h1, matches) in mt_meta.items():
+            if keep is None or idx in keep:
+
+                assert idx not in mul_trees, f"Index {idx} already exists in mul_trees. This should not happen."
+
+                h1_st_node = self.st.get_node(h1)
+                h_clade = h1_st_node.get_leaf_names()
+                # to_multi_mul_tree handles BOTH Simple and Model modes seamlessly!
+                # (If simple, matches just has 1 item)
+                mt_wrapper, h1_obj, hx_objs = self.st.to_multi_mul_tree(h1, sorted([n.name for n in matches]))
+
+                if mt_wrapper:
+                    mul_trees[idx] = MulTree(mt_wrapper, h_clade, h1_obj, hx_nodes=hx_objs)
+                    counter += 1
+        
+        self.logger.report_step(step, f"Success: {counter} {label}MUL-trees built")
+        return mul_trees
 
     def report_mt_count(self, st_ete: Tree, h1_resolved: List[str], h2_resolved: List[str], num_mul_trees: int,
                         nesting: str, has_ploidies: bool, allow_redundant_mts: bool) -> None:
@@ -1468,17 +1523,18 @@ _worker_gene_trees: Dict[int, SmrtTree] = {}
 _worker_registry: Optional[NameRegistry] = None
 _worker_group_cap: int = 8
 _worker_want_counts: bool = False
-_worker_dedup: bool = False
+#_worker_dedup: bool = False
+_worker_rep_of: Dict[int, int] = {}
 
 def _init_collapse_worker(data_path: Optional[Union[Path, str]] = None,
                           group_cap: int = 8, want_counts: bool = False,
-                          dedup: bool = False) -> None:
+                          rep_of: Dict[int, int] = None) -> None:
     """Universal initializer: loads the gene trees + registry from the temp dump and
     installs the per-run switches."""
     global _worker_gene_trees, _worker_registry
-    global _worker_group_cap, _worker_want_counts, _worker_dedup
+    global _worker_group_cap, _worker_want_counts, _worker_rep_of
 
-    _worker_group_cap, _worker_want_counts, _worker_dedup = group_cap, want_counts, dedup
+    _worker_group_cap, _worker_want_counts, _worker_rep_of = group_cap, want_counts, rep_of
 
     if data_path:
         try:
@@ -1510,31 +1566,48 @@ def _collapse_worker(payload: Tuple[int, MulTree]):
     """
     m_idx, m_data = payload
     h1_sis, hx_sis_list = m_data.get_sister_clades()
-    cap, want_counts, dedup = _worker_group_cap, _worker_want_counts, _worker_dedup
+    gene_trees, registry = _worker_gene_trees, _worker_registry
+    cap, want_counts, rep_of = _worker_group_cap, _worker_want_counts, _worker_rep_of
 
-    groups_out: Dict[int, GroupData] = {}
-    fails: List[int] = []
-    counts: Optional[Dict[int, Tuple[int, int]]] = {} if want_counts else None
-    by_sig: Dict[bytes, tuple] = {} if dedup else None
+    # Only representatives that actually HAVE members are worth converting: the
+    # position transport costs about as much as compute_groups, so paying it for a
+    # singleton class is pure loss. This is what made de-duplication a net cost at a
+    # low duplicate fraction.
+    has_members = set(rep_of.values())
 
-    for g_idx, gt_obj in _worker_gene_trees.items():
-        if dedup:
-            sig = gt_obj.canon_sig
-            cached = by_sig.get(sig)
-            if cached is None:
-                group_data = gt_obj.compute_groups(m_data, _worker_registry, h1_sis, hx_sis_list)
-                by_sig[sig] = gt_obj.groups_to_positions(group_data)
-            else:
-                group_data = gt_obj.groups_from_positions(cached)
+    groups_out, fails, positions = {}, [], {}
+    counts = {} if want_counts else None
+    for g_idx, gt_obj in gene_trees.items():
+        rep = rep_of.get(g_idx)
+        if rep is None:
+            gd = compute_groups(gt_obj, m_data, registry, h1_sis, hx_sis_list)
+            if g_idx in has_members:
+                positions[g_idx] = gt_obj.groups_to_positions(gd)
         else:
-            group_data = gt_obj.compute_groups(m_data, _worker_registry, h1_sis, hx_sis_list)
+            # Assumes reps were built and are in positions!
+            assert rep in positions, f"Representation for gene tree {g_idx} is not in positions"
+            gd = gt_obj.groups_from_positions(positions[rep])
 
-        groups_out[g_idx] = group_data
-        n_amb = len(group_data.ambiguous_groups)
+        groups_out[g_idx] = gd
+        n_amb = len(gd.ambiguous_groups)
         if n_amb > cap:
             fails.append(g_idx)
+
+        # c_max computed once per MUL-tree (max multiplicity of a pure species name in m_data.mt),
+        # and use_exact added to the worker state alongside group_cap.
+        """
+        if use_exact:
+            # a unit of size 1 keeps c states; a larger one gains "mixed" (<= 2c-1).
+            # GRAMPA's cap is log2(#combinations), so measure it in the same units.
+            n_multi = sum(1 for u in gd.ambiguous_groups if len(u) > 1)
+            eff = n_amb * log2(c_max) + n_multi * (log2(2 * c_max - 1) - log2(c_max))
+        else:
+            eff = n_amb
+        if eff > cap:
+            fails.append(g_idx)"""
+
         if want_counts:
-            counts[g_idx] = (n_amb, len(group_data.fixed_groups))
+            counts[g_idx] = (n_amb, len(gd.fixed_groups))
 
     return m_idx, groups_out, fails, counts
 
@@ -1603,7 +1676,11 @@ class GeneTreeManager:
         self.n_procs = num_processes
         self.pickle_action = pickle_action
         # bit 0 of --optim: reuse groups across isomorphic gene trees (1 and 3)
-        self.dedup_gts, _, _ = decode_optim(optim)
+        self.dedup_gts, _, _, _ = decode_optim(optim)
+
+        self.dedup_threshold = getattr(config, 'disable_dedup_below', 0.05)
+        self.rep_of: Dict[int, int] = {}        # the decision, read back by main
+        self.dedup_latch_next = True            # ditto, drives the serial latch
 
     def cull(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry) -> bool:
 
@@ -1674,13 +1751,13 @@ class GeneTreeManager:
         else:
             self.logger.log(f"Unknown pickle handling action: '{action}'", 'w')
 
-    def unpack_archive(self, pickle_dir: Path) -> None:
+    def unpack_archive_(self, pickle_dir: Path) -> None:
         archive_path = Path(str(pickle_dir) + '.tar.gz')
         if not pickle_dir.exists() and archive_path.exists() and not self.tcf.overwrite:
             step_unpack = "Unpacking pickle archive"
             self.logger.report_step(step_unpack, "In progress...")
             try:
-                unpack_archive(archive_path, extract_dir=pickle_dir.parent)
+                unpack_archive(archive_path, extract_dir=pickle_dir)
                 self.logger.report_step(step_unpack, "Success")
             except Exception as e:
                 self.logger.log(f"Failed to unpack archive: {e}", 'w')
@@ -1691,17 +1768,17 @@ class GeneTreeManager:
         check-nums mode consumes."""
         return self.tcf.mode == "check-nums" or getattr(self.tcf, 'write_checknums', False)
 
-    def collapse_groups(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry):
+    def collapse_groups(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], registry: NameRegistry, label: str = ''):
         """
         Computes groups for all MUL-trees and dumps them to pickle immediately.
         Returns (fails_by_mt, counts_by_mt, reused_mt_ids); the counts feed
         filter_and_check directly so it never has to read the pickles back.
         """
         pickle_dir = self.tcf.pickle_dir
-        self.unpack_archive(pickle_dir)
+        self.unpack_archive_(pickle_dir)
         pickle_dir.mkdir(parents=True, exist_ok=True)
 
-        step = "Collapsing gene tree groupings"
+        step = f"Collapsing {label}gene tree groupings"
         self.logger.report_step(step, "In progress...")
 
         # --- PRIME CACHES BEFORE FORKING ------------------------------------------
@@ -1711,11 +1788,16 @@ class GeneTreeManager:
         # are only ever traversed, never LCA-queried. Reconciliation reuses them as-is.
         for gt in gene_trees.values():
             gt.make_flat(registry)
-        if self.dedup_gts:
+        # ONE decision for the whole task; reconcile reuses it rather than re-deciding.
+        self.rep_of, self.dedup_latch_next = CommonOps.plan_dedup(
+            gene_trees, self.dedup_threshold, enabled=self.dedup_gts,
+            latched_off=getattr(self.tcf, 'dedup_latch', False),
+            logger=self.logger)
+        if self.rep_of:
             # canon is computed from the flat tree, which __getstate__ does not ship;
             # priming it here is what lets the workers use it without rebuilding.
             for gt in gene_trees.values():
-                gt.canon
+                gt.canon                        # prime for the workers (see __getstate__)
 
         registry_path = pickle_dir / f"{self.tcf.run_prefix}_registry.pickle"
         force_regenerate = self._check_registry_safety(registry_path, registry)
@@ -1761,7 +1843,7 @@ class GeneTreeManager:
                     pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
                 with mp.Pool(processes=self.n_procs, initializer=_init_collapse_worker,
-                             initargs=(temp_file_path, cap, want_counts, self.dedup_gts)) as pool:
+                             initargs=(temp_file_path, cap, want_counts, self.rep_of)) as pool:
                     for res in tqdm(pool.imap_unordered(_collapse_worker, tasks),
                                     total=len(tasks), desc="# Collapsing", unit="mt",
                                     disable=self.logger.disable_tqdm, ncols=177):
@@ -1778,7 +1860,7 @@ class GeneTreeManager:
             global _worker_gene_trees, _worker_registry
             _worker_gene_trees = gene_trees
             _worker_registry = registry
-            _init_collapse_worker(None, cap, want_counts, self.dedup_gts)
+            _init_collapse_worker(None, cap, want_counts, self.rep_of)
             try:
                 for item in tqdm(tasks, desc="# Collapsing", unit="mt",
                                  disable=self.logger.disable_tqdm, ncols=177):
@@ -1812,6 +1894,51 @@ class GeneTreeManager:
             if want_counts:
                 counts[g_idx] = (n_amb, len(gd.fixed_groups))
         return fails, counts
+
+    # ops.GeneTreeManager
+    def filter_by_sweep_cap(self, gene_trees: Dict[int, SmrtTree], st_flat: FlatTree,
+                            sw: TargetSweep, clade_ids: Dict[str, Set[int]], h_id: Dict[str, int],
+                            valid_t: Dict[str, Set[int]], registry: NameRegistry) -> Dict[int, int]:
+        """
+        The sweep's equivalent of filter_and_check: the standard path caps on units
+        remaining AFTER sister-pinning, which is target-dependent, and pin_states gives
+        that same count for every target - so this removes exactly the gene trees the
+        standard path removes, and writes the same filtered-trees output.
+        """
+        step = "Filtering gene trees over group cap"
+        self.logger.report_step(step, "In progress...")
+
+        original_count = max(gene_trees.keys()) + 1 if gene_trees else 0
+        for gt in gene_trees.values():
+            gt.make_flat(registry)          # Traversed only: no Euler tour / or RMQ
+
+        cap = self.tcf.group_cap
+        gt_failures: Dict[int, int] = {}
+        cache: Dict[Tuple[bytes, str], bool] = {}
+        for g_idx, gt in gene_trees.items():
+            sig = gt.canon_sig          # structural: identical trees give identical counts
+            for h1_name, sp_ids in clade_ids.items():
+                key = (sig, h1_name)
+                over = cache.get(key)
+                if over is None:
+                    units = compute_units(gt.flat_tree, sp_ids, rule=True)
+                    if not units:
+                        cache[key] = over = False
+                    else:
+                        _st, free = sw.pin_states(gt.flat_tree, h_id[h1_name], units,
+                                                  st_flat, valid_t[h1_name])
+                        cache[key] = over = any(free[t] > cap for t in valid_t[h1_name])
+                if over:
+                    gt_failures[g_idx] = gt_failures.get(g_idx, 0) + 1
+
+        for g_idx in sorted(gt_failures):
+            self.logger.log(f"Gene tree on line {g_idx+1} is over the group cap for "
+                            f"{gt_failures[g_idx]} donor clades and will be filtered.", 'w')
+            del gene_trees[g_idx]
+        self.write_filtered_trees(gene_trees, gt_failures, original_count)
+
+        self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap", full_update=True)
+        return gt_failures
 
     def filter_and_check(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree],
                          fails_by_mt=None, counts_by_mt=None, reused=()) -> Dict[int, int]:

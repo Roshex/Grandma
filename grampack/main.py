@@ -115,7 +115,7 @@ class Task:
     def reconciler_uses_sweep(self, tcf: TaskConfig) -> bool:
         """The sweep only models a single graft into a singly labelled species tree, so it
         is available at depth 0 only. Iterative modes fall back to the standard path."""
-        _, _, use_sweep = decode_optim(self.ctx.optim)
+        _, _, use_sweep, _ = decode_optim(self.ctx.optim)
         return use_sweep and tcf.mode not in ("st-only", "check-nums", "repair") \
             and not getattr(tcf, 'predefined_rets', None) \
             and getattr(tcf, 'depth', 0) == 0
@@ -142,7 +142,7 @@ class Task:
             return self.logger.end_report(), {}
 
         self.mul_trees: Dict[int, MulTree] = {}
-        valid_pairings = None
+        mt_space = None
 
         if tcf.mode != "repair":
             # Re-init component with current task
@@ -150,13 +150,13 @@ class Task:
 
             if self.reconciler_uses_sweep(tcf):
                 # Enumerate valid H1/H2 pairings; build nothing yet.
-                valid_pairings, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(
+                mt_space, h1_nodes, h2_nodes, ploidies = self.mul_mgr.index(
                     self.ctx.nesting, self.ctx.strict_max, self.ctx.allow_redun, sweep_mode=True)
-                if not valid_pairings:
+                if not mt_space:
                     return self.logger.end_report(), {}
             else:
                 # Build MUL-Trees
-                self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.build(
+                self.mul_trees, h1_nodes, h2_nodes, ploidies = self.mul_mgr.index(
                     self.ctx.nesting, self.ctx.strict_max, self.ctx.allow_redun)
                 # If build() returns an empty dict, a terminal mode (count-mts or build-mts) successfully finished or a warning was logged. Exit smoothly.
                 if not self.mul_trees:
@@ -174,12 +174,12 @@ class Task:
         self.gene_mgr = GeneTreeManager(
             tcf, self.logger, self.ctx.num_processes, self.ctx.pickles, self.ctx.optim)
 
-        if valid_pairings is not None:
+        if mt_space is not None:
             # Sweep pipeline owns culling: it filters by the group cap itself, then culls
             # only the MUL-trees it actually builds.
             step_result = self.reconciler.run_sweep(
-                valid_pairings, h1_nodes, self.spec_tree, self.gene_trees,
-                self.registry, self.gene_mgr)
+                mt_space, self.spec_tree, self.gene_trees,
+                self.registry, self.gene_mgr, self.mul_mgr)
             """if step_result is None:
                 return self.logger.end_report(), {}"""
         else:
@@ -190,6 +190,7 @@ class Task:
             if not self.gene_mgr.cull(self.mul_trees, self.gene_trees, self.registry):
                 # check-nums mode: cull returns False after logging the counts and handling pickles.
                 return self.logger.end_report(), {}
+            self.reconciler.rep_of = self.gene_mgr.rep_of        # decided once, reused
             # Reconciliation and MUL-tree Selection
             step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry)
             """if not step_result.sorted_scores:
@@ -222,7 +223,8 @@ class Task:
             'ploidies': ploidies,
             #'h1_nodes': h1_nodes, to be supported later
             #'h2_nodes': h2_nodes, to be supported later
-            'repair': 'none' # Disable repair for subsequent runs
+            'repair': 'none', # Disable repair for subsequent runs
+            'dedup_latch_next': self.gene_mgr.dedup_latch_next if self.gene_mgr else True,
         }
 
         return step_result, tcf_updates
@@ -446,8 +448,15 @@ class Engine:
                     parent_logger = self.flow_logger
                 )
 
-                # Update persistent config for next iteration
                 perm_tcf = perm_tcf.update(**updates)
+                # `dedup_latch_next` is a report from the task, not a config field.
+                latch = any(u.pop('dedup_latch_next', True)
+                            for u in (updates,) if u) if updates else True
+                if latch:
+                    # Relabelling only REFINES the leaf labelling, so the duplicate
+                    # fraction cannot recover along a serial chain: latch once, and skip
+                    # even the signature pass from here on.
+                    perm_tcf = perm_tcf.update(dedup_latch=True)
 
                 min_mt_repr = res.repr_min_mt
 
@@ -647,7 +656,8 @@ class Engine:
             # The next depth's workers will receive the PARSED dicts, not file paths.
             for _, _, updates, _, _ in batch_results:
                 if updates:
-                    perm_tcf = perm_tcf.update(**updates)
+                    updates.pop('dedup_latch_next', None)
+                    perm_tcf = perm_tcf.update(**updates, dedup_latch=False)
                     break # Only need to do once
 
             # --- Process Results, Apply Trimming & Generate Next Tasks ---

@@ -23,9 +23,9 @@ By utilizing flattened array-based tree structures and $O(1)$ Lowest Common Ance
 
 ## 📥 Installation
 
-### Option 1: Conda (Recommended)
+### Option 1: Conda (Recommended) [UNDER DEVELOPMENT]
 
-The easiest way to install GRANDMA and its dependencies is via the Bioconda channel:
+The easiest way to install GRANDMA and its dependencies will be via the Bioconda channel:
 
 ```bash
 conda install -c bioconda grandma
@@ -116,5 +116,5 @@ for task_id, event in history.items():
 
 If you use GRANDMA in your research, please cite:
 
-* *Shtein, R. (2026). GRANDMA [Software]*
+* *Shtein, R., Ulanovski, T., Huchon, D., Pupko, T., Mayrose, I. (202X). GRANDMA [Software]*
 * *Thomas, G.W.C., Ather, S.H., & Hahn, M.W. (2017). Gene-tree reconciliation with MUL-trees to resolve polyploid events. Systematic Biology 66(6): 1007-1018. https://doi.org/10.1093/sysbio/*

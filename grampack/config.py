@@ -32,7 +32,7 @@ class GranMetadata:
     github: str = "https://github.com/Roshex/Grandma"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "2.3.0"
+    version: str = "2.4.5"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -161,6 +161,10 @@ class TaskConfig:
     weights: Tuple[int, int] = (1, 1) # (w_dup, w_loss)
     n_best: int = 1 # max mts to select for processing per Run (non-overlapping H clades & scoring above ST)
     cutoff: Tuple[str, str, Union[float, int]] = ('input', 'abs', 0) # (Reference, DiffFunc, Offset)
+
+    disable_dedup_below: float = 0.05      # duplicate fraction under which dedup is skipped
+    dedup_latch: bool = False              # set on child tasks once the serial phase has
+                                           # decided against it (see plan_dedup)
 
     # Legacy Flags
     is_mul_input: bool = False
@@ -589,7 +593,14 @@ class InitParser:
         
         g_algo.add_argument('--optim', dest='optim', type=int, default=0,
             help="Developer option for optimization level. 0 = default, 1 = deduplication only, 2 = backbone only, 3 = combined optimizations.")
-
+        g_algo.add_argument('--disable-dedup-below', dest='disable_dedup_below',
+            type=float, default=0.05, metavar='FRAC',
+            help="Duplicate fraction below which gene-tree de-duplication is disabled for "
+                "SUBSEQUENT iterations of a serial chain. The map is always used in the task "
+                "that computed it (the signature pass is already paid). 1.0 disables it "
+                "entirely, including the signature pass; to switch it off completely, clear "
+                "bit 0 of --optim.")
+        
         # --- Flow Control Options ---
         g_flow = self.parser.add_argument_group("Flow Control Options")
         g_flow.add_argument("-m", "--mode", type=str, default="single",
@@ -1242,6 +1253,9 @@ class InitParser:
             history       = HistoryType(out_dir / "history.json", initial_data=history)
         )
 
+        if not 0.0 <= args.disable_dedup_below <= 1.0:
+            self.parser.error("--disable-dedup-below must be in [0, 1]")
+
         # --- Prepare Step Config ---
         tcf = TaskConfig(
             st            = args.spec_input,
@@ -1260,6 +1274,8 @@ class InitParser:
             n_best        = args.n_best,
             cutoff        = self.parse_cutoff(args.cutoff),
             is_mul_input  = args.is_mul_input,
+
+            disable_dedup_below = args.disable_dedup_below,
         )
 
         return ctx, tcf
