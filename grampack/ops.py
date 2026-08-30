@@ -17,6 +17,41 @@ from .logger import GranLogger
 from .models import Tree, SmrtTree, TreeCache, MulTree, NameRegistry, FlatTree, splitSpec, decode_optim
 from .core import compute_groups, compute_units, TargetSweep
 
+def plan_dedup(gene_trees: Dict[int, FlatTree], threshold: float, enabled: bool=True, latched_off: bool=False,
+               logger: Optional[GranLogger]=None, label: str=""):
+    """
+    Returns (rep_of, latch_off_downstream).
+
+    Once the signature pass has run its cost is sunk, so the map is USED in the task
+    that computed it whatever the duplicate fraction. `threshold` decides only whether
+    the fraction is high enough to be worth re-paying in the tasks that inherit from
+    this one: below it, descendants of a SERIAL task latch de-duplication off (their
+    duplicate fraction cannot recover - relabelling only refines the leaf labelling).
+    Split regimes always re-assess, because partitioning creates many duplicates.
+
+    Hard off: clear bit 0 of --optim (enabled=False), or set the threshold to >= 1.0,
+    which skips even the signature pass.
+    """
+    if not enabled or latched_off or not gene_trees or threshold >= 1.0:
+        return {}, True
+
+    first, rep_of = {}, {}
+    for idx, gt in gene_trees.items():
+        rep = first.setdefault(gt.canon_sig, idx)
+        if rep != idx:
+            rep_of[idx] = rep
+
+    frac = len(rep_of) / len(gene_trees)
+    latch = frac < threshold
+    if logger is not None:
+        tag = f"{label} " if label else ""
+        kept = len(gene_trees) - len(rep_of)
+        tail = (f" < {100*threshold:.1f}% threshold - used here, disabled "
+                f"for subsequent iterations." if latch else ".")
+        logger.log(f"{tag}Gene-tree de-duplication: {len(gene_trees)} trees -> {kept} "
+                f"distinct labelled topologies ({100*frac:.1f}%){tail}", 'i')
+    return rep_of, latch
+
 class CommonOps:
     @staticmethod
     def _fix_semicolon(tree_str: str) -> str:
@@ -106,42 +141,6 @@ class CommonOps:
         else:
             logger.log(f"Invalid input type for {desc}.", key)
 
-    @staticmethod
-    def plan_dedup(gene_trees, threshold, enabled=True, latched_off=False,
-               logger=None, label=""):
-        """
-        Returns (rep_of, latch_off_downstream).
-
-        Once the signature pass has run its cost is sunk, so the map is USED in the task
-        that computed it whatever the duplicate fraction. `threshold` decides only whether
-        the fraction is high enough to be worth re-paying in the tasks that inherit from
-        this one: below it, descendants of a SERIAL task latch de-duplication off (their
-        duplicate fraction cannot recover - relabelling only refines the leaf labelling).
-        Split regimes always re-assess, because partitioning creates many duplicates.
-
-        Hard off: clear bit 0 of --optim (enabled=False), or set the threshold to >= 1.0,
-        which skips even the signature pass.
-        """
-        if not enabled or latched_off or not gene_trees or threshold >= 1.0:
-            return {}, True
-
-        first, rep_of = {}, {}
-        for idx, gt in gene_trees.items():
-            rep = first.setdefault(gt.canon_sig, idx)
-            if rep != idx:
-                rep_of[idx] = rep
-
-        frac = len(rep_of) / len(gene_trees)
-        latch = frac < threshold
-        if logger is not None:
-            tag = f"{label} " if label else ""
-            kept = len(gene_trees) - len(rep_of)
-            tail = (f" < {100*threshold:.1f}% threshold - used here, disabled "
-                    f"for subsequent iterations." if latch else ".")
-            logger.log(f"{tag}Gene-tree de-duplication: {len(gene_trees)} trees -> {kept} "
-                    f"distinct labelled topologies ({100*frac:.1f}%){tail}", 'i')
-        return rep_of, latch
-                
 class TreeLoader:
     """
     Handles loading, verification, and optional repais of Species and Gene trees.
@@ -1789,7 +1788,7 @@ class GeneTreeManager:
         for gt in gene_trees.values():
             gt.make_flat(registry)
         # ONE decision for the whole task; reconcile reuses it rather than re-deciding.
-        self.rep_of, self.dedup_latch_next = CommonOps.plan_dedup(
+        self.rep_of, self.dedup_latch_next = plan_dedup(
             gene_trees, self.dedup_threshold, enabled=self.dedup_gts,
             latched_off=getattr(self.tcf, 'dedup_latch', False),
             logger=self.logger)
