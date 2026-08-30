@@ -113,13 +113,14 @@ states with the same Gray-code machinery the sweep uses).
 import array
 import itertools
 import numpy as np
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union, Iterable
+from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
+                    Sequence, Set, Tuple, Union)
 
 from .models import SmrtTree, MulTree, GroupData, Map, NameRegistry, FlatTree, splitSpec
 
 _INF = float('inf')
 
-def _prod(it):
+def _prod(it: Iterable[int]) -> int:
     r = 1
     for x in it:
         r *= x
@@ -165,9 +166,9 @@ def unit_clade(gt_flat: FlatTree, unit_leaves: Sequence[int]) -> Tuple[int, List
         stack.extend((c, False) for c in cf[cs[v]:cs[v + 1]])
     return root, order
 
-def unit_states(gt_flat, unit_leaves: Sequence[int],
+def unit_states(gt_flat: FlatTree, unit_leaves: Sequence[int],
                 leaf_targets: Dict[int, Sequence[int]],
-                mul_flat, dup_cost: int, loss_cost: int,
+                mul_flat: FlatTree, dup_cost: int, loss_cost: int,
                 exact: bool = True) -> List[Tuple[int, ...]]:
     """
     The assignment patterns a unit may take, aligned with `unit_leaves`.
@@ -460,7 +461,7 @@ def compute_groups(gt: SmrtTree, mul_data: MulTree, registry: NameRegistry,
 # Common utilities for sweep and pairwise reconciliation
 # --------------------------------------------------------------------------
 
-def _mixed_radix_gray(radices: Sequence[int]):
+def _mixed_radix_gray(radices: Sequence[int]) -> Iterator[Tuple[int, int]]:
     """
     Reflected mixed-radix Gray code. Yields (position, new_digit) for every step
     after the initial all-zero tuple, visiting each tuple exactly once and changing
@@ -530,7 +531,7 @@ class SpeciesIndex:
                  'tin', 'tout', 'root', 'sp_of_leaf', 'node_of_species',
                  'tin_np', 'tout_np', 'depth_np')
 
-    def __init__(self, st_flat):
+    def __init__(self, st_flat: FlatTree) -> None:
         n = self.n = st_flat.num_nodes
         cs, cf = st_flat.children_start, st_flat.children_flat
         self.parent = list(st_flat.parents)
@@ -616,16 +617,22 @@ class SpeciesIndex:
 class TargetSweep:
     """Scores one gene tree against every placement of one donor clade."""
 
-    def __init__(self, sidx: SpeciesIndex, dup_cost: int = 1, loss_cost: int = 1):
+    def __init__(self, sidx: SpeciesIndex, dup_cost: int = 1, loss_cost: int = 1) -> None:
         self.S = sidx
         self.dup_cost = dup_cost
         self.loss_cost = loss_cost
+        # Built ONCE: the closure depends only on the species tree, and the hot paths
+        # (_cost_vector, _init_state, _flip, _mixed_correction) would otherwise allocate
+        # a function object plus four cell bindings on every call.
+        self._lca: Callable[[int, int], int] = self._lca_factory()
+        self._scalar_cache: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
     # ----------------------------------------------------------------------
     # PINNING REGIONS
     # ----------------------------------------------------------------------
 
-    def _unit_sisters(self, gt_flat: FlatTree, units: List[List[int]]):
+    def _unit_sisters(self, gt_flat: FlatTree,
+                      units: Sequence[Sequence[int]]) -> List[Set[int]]:
         """
         For every unit, the species of its SISTER clade in the gene tree - exactly the
         `anc_leaves` that compute_groups/check_fix look at (the leaves of the unit root's
@@ -676,7 +683,9 @@ class TargetSweep:
             out.append(set(below[sib]))
         return out
 
-    def pin_states(self, gt_flat: FlatTree, h, units, st_flat: FlatTree, valid_targets=None):
+    def pin_states(self, gt_flat: FlatTree, h: int, units: Sequence[Sequence[int]],
+                   st_flat: FlatTree, valid_targets: Optional[Sequence[int]] = None
+                   ) -> Tuple[Dict[int, Tuple[Optional[int], ...]], List[int]]:
         """
         The pinned copy of every unit, as a function of the target.
 
@@ -724,7 +733,7 @@ class TargetSweep:
                 z.append(-1)                    # a species outside S: never graft-pinned
                 continue
             cur = nodes[0]
-            lca = self._lca_factory()
+            lca = self._lca
             for v in nodes[1:]:
                 cur = lca(cur, v)
             z.append(cur)
@@ -753,7 +762,8 @@ class TargetSweep:
                           units: Optional[List[List[int]]] = None,
                           valid_targets: Optional[Sequence[int]] = None,
                           pin: bool = True, exact: bool = True, mixed_on_pinned: bool = True,
-                          rule: bool = True, gray: bool = True, batch: int = 64):
+                          rule: bool = True, gray: bool = True,
+                          batch: int = 64) -> np.ndarray:
         """
         costs[t] = MP(G, T(h, t)) for every node t of S, as a NumPy array; entries for
         illegal targets (strict descendants of h) are +inf.
@@ -903,7 +913,7 @@ class TargetSweep:
 
     # ----------------------------------------------------------------------
     def _cost_vector(self, gt_flat: FlatTree, h: int, b_of_leaf: Dict[int, int],
-                     to_graft: set, n_leaves: int):
+                     to_graft: Set[int], n_leaves: int) -> np.ndarray:
         """
         cost(sigma, t) for every t, as a numpy array indexed by species-tree node id.
 
@@ -938,7 +948,7 @@ class TargetSweep:
         sb_lo: List[int] = []; sb_hi: List[int] = []; sb_v: List[int] = []   # SUB regions
         pt_i: List[int] = []; pt_v: List[int] = []      # POINT regions
 
-        lca = self._lca_factory()
+        lca = self._lca
 
         for u in post:
             s, e = cs[u], cs[u + 1]
@@ -1054,11 +1064,9 @@ class TargetSweep:
     # inside subtree(h), so the only way a node equals a child is by S-identity (classes
     # 0/0 and 1/1) or by having a rho child.
 
-    def _target_scalars(self, h: int):
+    def _target_scalars(self, h: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(A, D, R) as vectors over targets; cached per donor clade."""
-        cache = getattr(self, '_scalar_cache', None)
-        if cache is None:
-            cache = self._scalar_cache = {}
+        cache = self._scalar_cache
         if h in cache:
             return cache[h]
         S = self.S
@@ -1075,7 +1083,9 @@ class TargetSweep:
         cache[h] = (A, D, R)
         return cache[h]
 
-    def _mixed_correction(self, gt_flat: FlatTree, h, unit, b_of_leaf, canonical_graft):
+    def _mixed_correction(self, gt_flat: FlatTree, h: int, unit: Sequence[int],
+                          b_of_leaf: Dict[int, int],
+                          canonical_graft: Set[int]) -> Optional[np.ndarray]:
         """
         corr[t] = local_min(mixed, t) - local(canonical split, t), as a vector.
 
@@ -1090,7 +1100,7 @@ class TargetSweep:
         A, D, R = self._target_scalars(h)
         base1 = D + (1.0 - dh)
         n = S.n
-        lca = self._lca_factory()
+        lca = self._lca
         dup_cost, loss_cost = self.dup_cost, self.loss_cost
 
         root, order = unit_clade(gt_flat, unit)
@@ -1100,12 +1110,14 @@ class TargetSweep:
             a, b = cs[v], cs[v + 1]
             x[v] = b_of_leaf[v] if a == b else lca(x[cf[a]], x[cf[a + 1]])
 
-        def dep(cls_, v):
-            if cls_ == 0:
-                return dS[x[v]] + A
-            if cls_ == 1:
-                return base1 + dS[x[v]]
-            return R
+        # Per-node image depths, computed ONCE per node as (backbone, graft, rho).
+        # The DP below reads them nine times per node, so recomputing dS[x[v]] + A
+        # inside the transition loop allocated six arrays per node for nothing.
+        # rho is target-dependent but node-independent, so every node shares R.
+        dep_of: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for v in order:
+            dxv = dS[x[v]]
+            dep_of[v] = (dxv + A, base1 + dxv, R)
 
         INF = np.full(n, np.inf)
         best = {}                                     # v -> [3 vectors]
@@ -1118,6 +1130,7 @@ class TargetSweep:
                 continue
             c1, c2 = cf[a], cf[a + 1]
             same = (x[v] == x[c1] or x[v] == x[c2])   # S-identity: target-independent
+            dv, d1v, d2v = dep_of[v], dep_of[c1], dep_of[c2]
             cur = [INF.copy(), INF.copy(), INF.copy()]
             for ka in range(3):
                 ba = best[c1][ka]
@@ -1129,10 +1142,10 @@ class TargetSweep:
                         continue
                     m = 0 if (ka == 0 and kb == 0) else (1 if (ka == 1 and kb == 1) else 2)
                     dup = (1 if same else 0) if m != 2 else (1 if (ka == 2 or kb == 2) else 0)
-                    dm = dep(m, v)
+                    dm = dv[m]
                     cost = (dup_cost * dup
-                            + loss_cost * ((dep(ka, c1) - dm - 1 + dup)
-                                           + (dep(kb, c2) - dm - 1 + dup)))
+                            + loss_cost * ((d1v[ka] - dm - 1 + dup)
+                                           + (d2v[kb] - dm - 1 + dup)))
                     cand = ba + bb + cost
                     cur[m] = np.minimum(cur[m], cand)
             best[v] = cur
@@ -1141,10 +1154,10 @@ class TargetSweep:
             kb, cb = fixed[c2]
             m = 0 if (ka == 0 and kb == 0) else (1 if (ka == 1 and kb == 1) else 2)
             dup = (1 if same else 0) if m != 2 else (1 if (ka == 2 or kb == 2) else 0)
-            dm = dep(m, v)
+            dm = dv[m]
             fixed[v] = (m, ca + cb + dup_cost * dup
-                        + loss_cost * ((dep(ka, c1) - dm - 1 + dup)
-                                       + (dep(kb, c2) - dm - 1 + dup)))
+                        + loss_cost * ((d1v[ka] - dm - 1 + dup)
+                                       + (d2v[kb] - dm - 1 + dup)))
 
         assert fixed[root][0] == 2, "the canonical split must leave the unit root mixed"
         return best[root][2] - fixed[root][1]
@@ -1162,7 +1175,9 @@ class TargetSweep:
     #     sigmas are stacked into one (B, N) matrix and the cumulative sums run along
     #     axis 1, so B resolves cost a handful of NumPy calls instead of 4B.
 
-    def _node_record(self, cls_u, img_u, c1, c2, cls_arr, img_arr, d, dh, tin, tout):
+    def _node_record(self, cls_u: int, img_u: int, c1: Optional[int], c2: Optional[int],
+                     cls_arr: List[int], img_arr: List[int], d: Sequence[int], dh: int,
+                     tin: Sequence[int], tout: Sequence[int]) -> Tuple:
         """The additive contribution of ONE gene-tree node, as an undoable record."""
         const = m = dpure = allc = 0
         om = []; xw = []; sb = []; pt = []
@@ -1194,7 +1209,7 @@ class TargetSweep:
                 pt.append((tin[idx], val))
         return (const, m, dpure, allc, om, xw, sb, pt)
 
-    def _apply(self, st, rec, sign):
+    def _apply(self, st: Dict[str, Any], rec: Tuple, sign: int) -> None:
         st['const'] += sign * rec[0]
         st['m'] += sign * rec[1]
         st['dpure'] += sign * rec[2]
@@ -1210,7 +1225,8 @@ class TargetSweep:
         for i, v in rec[7]:
             pt[i] += sign * v
 
-    def _init_state(self, gt_flat: FlatTree, h, b_of_leaf, to_graft):
+    def _init_state(self, gt_flat: FlatTree, h: int, b_of_leaf: Dict[int, int],
+                    to_graft: Set[int]) -> Dict[str, Any]:
         """Full classification pass; returns the mutable incremental state."""
         S = self.S
         cs, cf, post = gt_flat.children_start, gt_flat.children_flat, gt_flat.postorder
@@ -1223,7 +1239,7 @@ class TargetSweep:
               'dsub': np.zeros(n + 1), 'pt': np.zeros(n),
               'cls': [0] * nn, 'img': [0] * nn, 'rec': [None] * nn}
         cls_arr, img_arr = st['cls'], st['img']
-        lca = self._lca_factory()
+        lca = self._lca
 
         for u in post:
             a, b = cs[u], cs[u + 1]
@@ -1249,14 +1265,16 @@ class TargetSweep:
             self._apply(st, rec, +1)
         return st
 
-    def _flip(self, st, gt_flat: FlatTree, h, b_of_leaf, unit, anc, chain_start, graft_sub):
+    def _flip(self, st: Dict[str, Any], gt_flat: FlatTree, h: int,
+              b_of_leaf: Dict[int, int], unit: Sequence[int], anc: Sequence[int],
+              chain_start: int, graft_sub: Set[int]) -> None:
         """Re-assign one unit to an arbitrary subset `graft_sub` of its leaves,
         updating the accumulators in place."""
         S = self.S
         cs, cf = gt_flat.children_start, gt_flat.children_flat
         d, dh, tin, tout = S.depth, S.depth[h], S.tin, S.tout
         cls_arr, img_arr, recs = st['cls'], st['img'], st['rec']
-        lca = self._lca_factory()
+        lca = self._lca
 
         for leaf in unit:
             new_cls = C if leaf in graft_sub else B
@@ -1292,14 +1310,15 @@ class TargetSweep:
             if nk == old_k and ni == old_i and i >= chain_start:
                 break                     # nothing above this node can change
 
-    def _snapshot(self, st, n_leaves, corr=None):
+    def _snapshot(self, st: Dict[str, Any], n_leaves: int,
+                  corr: Optional[np.ndarray] = None) -> Tuple:
         n = self.S.n
         return (st['om'].copy(), st['xw'].copy(), st['dsub'][:n + 1].copy(),
                 st['pt'].copy(),
                 st['const'] - 2 * (n_leaves - 1), st['m'], st['dpure'] + st['allc'],
                 None if corr is None else corr.copy())
 
-    def _resolve_batch(self, rows):
+    def _resolve_batch(self, rows: Sequence[Tuple]) -> np.ndarray:
         """Resolve B stacked mark-sets at once; returns a (B, N) cost matrix."""
         S = self.S
         n = S.n
@@ -1335,8 +1354,11 @@ class TargetSweep:
             out = out + np.stack([r[7] for r in rows])     # mixed-state corrections
         return out
 
-    def _min_over_states(self, gt_flat: FlatTree, h, b_of_leaf, units, unit_states, n_leaves,
-                         anc_cache, gray: bool = True, batch: int = 64):
+    def _min_over_states(self, gt_flat: FlatTree, h: int, b_of_leaf: Dict[int, int],
+                         units: Sequence[Sequence[int]], unit_states: Sequence[Sequence[Tuple]],
+                         n_leaves: int,
+                         anc_cache: Sequence[Tuple[Sequence[int], int]],
+                         gray: bool = True, batch: int = 64) -> np.ndarray:
         """
         Elementwise minimum over every combination of per-unit STATES.
 
@@ -1390,8 +1412,10 @@ class TargetSweep:
         flush()
         return best
     
-    def _min_over_states_product(self, gt_flat: FlatTree, h, b_of_leaf, unit_states,
-                                 n_leaves: int, batch: int = 64):
+    def _min_over_states_product(self, gt_flat: FlatTree, h: int,
+                                 b_of_leaf: Dict[int, int],
+                                 unit_states: Sequence[Sequence[Tuple]],
+                                 n_leaves: int, batch: int = 64) -> np.ndarray:
         """Reference enumeration: rebuild the state from scratch for every combination.
         Same numbers as the incremental path; kept as an oracle and for --optim without
         the Gray-code bit."""
@@ -1421,7 +1445,9 @@ class TargetSweep:
         return best
 
     # ----------------------------------------------------------------------
-    def _mixed_dup_region(self, c1, c2, k1, k2, w, bimg):
+    def _mixed_dup_region(self, c1: int, c2: int, k1: int, k2: int, w: int,
+                          bimg: Union[Dict[int, int], List[int]]
+                          ) -> Tuple[int, Tuple, Tuple]:
         """
         The set of targets for which the MIXED node u is a duplication, as
         (all_count, [(node, delta_SUB)], [(node, delta_POINT)]).
@@ -1484,7 +1510,9 @@ class TargetSweep:
         return all_cnt, tuple(sb), tuple(pt)
 
     # ----------------------------------------------------------------------
-    def _lca_factory(self):
+    def _lca_factory(self) -> Callable[[int, int], int]:
+        """Build the LCA closure. Called once, from __init__; every consumer uses
+        self._lca so that no function object is allocated on the hot path."""
         S = self.S
         tin, tout, parent, depth = S.tin, S.tout, S.parent, S.depth
 
@@ -1522,7 +1550,8 @@ class TargetSweep:
 class PairwiseRecon:
     """A class for performing pairwise reconciliation between gene trees and species trees."""
 
-    def __init__(self, dup_cost: int = 1, loss_cost: int = 1, strict_targets: bool = True):
+    def __init__(self, dup_cost: int = 1, loss_cost: int = 1,
+                 strict_targets: bool = True) -> None:
         self.dup_cost = dup_cost
         self.loss_cost = loss_cost
         self.strict_targets = strict_targets
@@ -1799,7 +1828,7 @@ class PairwiseRecon:
         score = PairwiseRecon._scan(gt, st, self.dup_cost, self.loss_cost, gt.postorder, lca_maps)
 
         if retmap:
-            return score, [PairwiseRecon._build_map(gt, st, lca_maps, registry)]
+            return score, [self._build_map(gt, st, lca_maps, registry)]
         return score, None
 
     # --------------------------------------------------------------------------
@@ -1808,7 +1837,7 @@ class PairwiseRecon:
 
     def _prepare_groups(self, gt_flat: FlatTree, target_map: Dict[int, List[int]],
                         ambig_groups: List[List[int]], fixed_groups: List[Tuple[List[int], int]],
-                        lca_maps: array.array, mul_flat, use_exact
+                        lca_maps: array.array, mul_flat: FlatTree, use_exact: bool
                         ) -> Tuple[List[List[int]], List[List[Tuple[int, ...]]]]:
         """
         Resolve, for every ambiguous group, the tuple of MUL-tree nodes its leaves take
@@ -1989,7 +2018,6 @@ class PairwiseRecon:
         #    raise RuntimeError("reconcile_permutation produced no candidate mapping.")
 
         if retmap:
-            return best_score, [PairwiseRecon._build_map(gt_flat, mul_flat, snap, registry)
+            return best_score, [self._build_map(gt_flat, mul_flat, snap, registry)
                                 for snap in best_maps]
         return best_score, None
-

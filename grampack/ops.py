@@ -1908,6 +1908,9 @@ class GeneTreeManager:
         step = "Filtering gene trees over group cap"
         self.logger.report_step(step, "In progress...")
 
+        # TODO: If a gene tree was already dropped earlier in the run (e.g. by the loader), the two paths
+        # will report slightly different "original" counts in write_filtered_trees. Worth passing
+        # original_count in from run_sweep for consistency with cull.
         original_count = max(gene_trees.keys()) + 1 if gene_trees else 0
         for gt in gene_trees.values():
             gt.make_flat(registry)          # Traversed only: no Euler tour / or RMQ
