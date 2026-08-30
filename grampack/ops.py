@@ -15,7 +15,7 @@ from typing import Tuple, List, Optional, Dict, Union, Set, Collection
 from .config import TaskConfig
 from .logger import GranLogger
 from .models import Tree, SmrtTree, TreeCache, MulTree, NameRegistry, FlatTree, splitSpec, decode_optim
-from .algo import compute_groups, compute_units, TargetSweep
+from .core import compute_groups, compute_units, TargetSweep
 
 class CommonOps:
     @staticmethod
@@ -444,7 +444,7 @@ class TreeLoader:
         we must temporarily binarize any remaining polytomies (e.g., ancestors when resolving bottom-up)
         so the scoring engine doesn't silently ignore 3rd+ children and drop lineages.
         """
-        from .algo import PairwiseRecon
+        from .core import PairwiseRecon
         from .models import SmrtTree
         
         # Flatten the species tree once if it hasn't been already
@@ -532,7 +532,7 @@ class TreeLoader:
 
         def resolve_large_polytomy(poly_node: Tree) -> None:
             """Species-Tree-Guided bottom-up heuristic for large polytomies."""
-            from .algo import PairwiseRecon
+            from .core import PairwiseRecon
             st_bins = defaultdict(list)
 
             pr = PairwiseRecon(dup_cost, loss_cost, True)
@@ -1938,9 +1938,9 @@ class GeneTreeManager:
             self.logger.log(f"Gene tree on line {g_idx+1} is over the group cap for "
                             f"{gt_failures[g_idx]} donor clades and will be filtered.", 'w')
             del gene_trees[g_idx]
-        self.write_filtered_trees(gene_trees, gt_failures, original_count)
+        self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap")#, full_update=True)
 
-        self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap", full_update=True)
+        self.write_filtered_trees(gene_trees, gt_failures, original_count)
         return gt_failures
 
     def filter_and_check(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree],

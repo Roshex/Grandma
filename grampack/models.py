@@ -634,11 +634,9 @@ class SmrtTree:
         return self.canon[1]
 
     # --------------------------------------------------------------------------
-    # GROUP COLLAPSING LOGIC (Object-based, run once per iter)
+    # Transport of a GroupData between isomorphic gene trees
     # --------------------------------------------------------------------------
 
-
-    # Transport of a GroupData between isomorphic gene trees
     def groups_to_positions(self, gd: 'GroupData'):
         """Express a GroupData in canonical LEAF POSITIONS, i.e. independently of this
         tree's gene-copy names, so it can be replayed on any isomorph. No registry

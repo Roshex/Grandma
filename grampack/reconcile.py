@@ -41,7 +41,7 @@ def _sweep_engine(st_flat, dup_cost, loss_cost):
     eng = _SWEEP_ENGINE.get('eng')
     if (eng is None or _SWEEP_ENGINE['nodes'] != st_flat.num_nodes
             or eng.dup_cost != dup_cost or eng.loss_cost != loss_cost):
-        from .algo import SpeciesIndex, TargetSweep
+        from .core import SpeciesIndex, TargetSweep
         eng = TargetSweep(SpeciesIndex(st_flat), dup_cost, loss_cost)
         _SWEEP_ENGINE.update(eng=eng, nodes=st_flat.num_nodes)
     return eng
@@ -76,7 +76,7 @@ def _worker_sweep_single(
 
     return h1_name, vt, totals
 
-def _worker_pairwise_single(
+def _worker_recon_single(
     mul_item: Tuple[int, FlatTree],
     flat_gts: Dict[int, FlatTree],
     dup_cost: int,
@@ -90,7 +90,7 @@ def _worker_pairwise_single(
     rep_of: Optional[Dict[int, int]] = None,
     use_exact: bool = False
 ) -> Tuple[int, Union[int, float], Optional[Dict[int, ReconResult]]]:
-    from .algo import PairwiseRecon
+    from .core import PairwiseRecon
     pr = PairwiseRecon(dup_cost, loss_cost, STRICT_TARGETS)
     
     mul_idx, flat_mul = mul_item
@@ -168,6 +168,42 @@ class Reconciler:
         self.dedup_gts, self.use_gray, self.use_sweep, self.use_exact = decode_optim(optim)
         self.dedup_threshold = getattr(config, 'disable_dedup_below', 0.05)
         self.rep_of = rep_of                    # None -> decide here (sweep path, st-only)
+
+    # --------------------------------------------------------------------------
+    # Common
+    # --------------------------------------------------------------------------
+
+    def _dedup_views(self, gene_trees: Dict[int, SmrtTree], retmap: bool = False, label: str = "[recon]") -> Tuple[Dict[int, int], Dict[int, FlatTree], Dict[int, float]]:
+        """
+        (rep_of, unique_gts, weight_of_rep) - three views of ONE de-duplication decision.
+
+        rep_of        gene tree -> representative of its class (empty when not worth it)
+        unique_gts    representative -> flat tree; what the sweep actually scores
+        weight_of_rep representative -> summed weight of its whole class
+
+        The decision itself is taken once, in cull (self.rep_of), so the threshold and
+        the serial latch apply identically to the engine and to the sweep. Maps are
+        per gene tree and are never shared, hence retmap forces the identity partition.
+        """
+        gt_weights = {i: (gt.Q if self.tcf.quota_gts == 'harmonic' else 1.0)
+                      for i, gt in gene_trees.items()}
+        if retmap:
+            rep_of = {}
+        elif self.rep_of is not None:
+            rep_of = {g: r for g, r in self.rep_of.items() if g in gene_trees}
+        else:
+            rep_of, _ = CommonOps.plan_dedup(gene_trees, self.dedup_threshold,
+                                   enabled=self.dedup_gts,
+                                   latched_off=getattr(self.tcf, 'dedup_latch', False),
+                                   logger=self.logger, label=label)
+
+        unique_gts, weight_of_rep = {}, {}
+        for g_idx, gt in gene_trees.items():
+            rep = rep_of.get(g_idx, g_idx)
+            weight_of_rep[rep] = weight_of_rep.get(rep, 0.0) + gt_weights[g_idx]
+            if rep == g_idx:
+                unique_gts[g_idx] = gt.flat_tree
+        return rep_of, unique_gts, weight_of_rep
 
     # --------------------------------------------------------------------------
     # DRIVER
@@ -281,7 +317,7 @@ class Reconciler:
         rep_of, unique_gts, rep_weight = self._dedup_views(gene_trees, retmap)
 
         return partial(
-            _worker_pairwise_single, 
+            _worker_recon_single, 
             flat_gts=flat_gts,
             dup_cost=dup_cost,
             loss_cost=loss_cost,
@@ -507,7 +543,7 @@ class Reconciler:
 
         return n_best
 
-    def run(self, mul_trees: dict, gene_trees: dict, registry: NameRegistry) -> TaskResult:
+    def run_recon(self, mul_trees: dict, gene_trees: dict, registry: NameRegistry) -> TaskResult:
 
         if registry is None: registry = NameRegistry()
 
@@ -586,41 +622,9 @@ class Reconciler:
                 raise RuntimeError("sweep: multi-labelled species tree")
             seen.add(sp)
 
-    def _dedup_views(self, gene_trees: Dict[int, SmrtTree], retmap: bool = False, label: str = "[recon]") -> Tuple[Dict[int, int], Dict[int, FlatTree], Dict[int, float]]:
-        """
-        (rep_of, unique_gts, weight_of_rep) - three views of ONE de-duplication decision.
-
-        rep_of        gene tree -> representative of its class (empty when not worth it)
-        unique_gts    representative -> flat tree; what the sweep actually scores
-        weight_of_rep representative -> summed weight of its whole class
-
-        The decision itself is taken once, in cull (self.rep_of), so the threshold and
-        the serial latch apply identically to the engine and to the sweep. Maps are
-        per gene tree and are never shared, hence retmap forces the identity partition.
-        """
-        gt_weights = {i: (gt.Q if self.tcf.quota_gts == 'harmonic' else 1.0)
-                      for i, gt in gene_trees.items()}
-        if retmap:
-            rep_of = {}
-        elif self.rep_of is not None:
-            rep_of = {g: r for g, r in self.rep_of.items() if g in gene_trees}
-        else:
-            rep_of, _ = CommonOps.plan_dedup(gene_trees, self.dedup_threshold,
-                                   enabled=self.dedup_gts,
-                                   latched_off=getattr(self.tcf, 'dedup_latch', False),
-                                   logger=self.logger, label=label)
-
-        unique_gts, weight_of_rep = {}, {}
-        for g_idx, gt in gene_trees.items():
-            rep = rep_of.get(g_idx, g_idx)
-            weight_of_rep[rep] = weight_of_rep.get(rep, 0.0) + gt_weights[g_idx]
-            if rep == g_idx:
-                unique_gts[g_idx] = gt.flat_tree
-        return rep_of, unique_gts, weight_of_rep
-
     def _sweep_index(self, meta, single, st_flat, n2id, registry) -> Tuple[Dict[str, int], Dict[str, set], Dict[str, List[int]], Dict[int, int]]:
 
-        from .algo import TargetSweep
+        from .core import TargetSweep
         def st_id(name: str) -> Optional[int]:
             nid = registry.find_id(name)
             return None if nid is None else n2id.get(nid)
@@ -671,7 +675,7 @@ class Reconciler:
 
         MUL-trees are then materialised only for the selected candidates.
         """
-        from .algo import SpeciesIndex, TargetSweep
+        from .core import SpeciesIndex, TargetSweep
 
         if registry is None:
             registry = NameRegistry()
@@ -719,7 +723,7 @@ class Reconciler:
 
         # Score eager multi-MTs
         if len(mul_trees) == 1:
-            from .algo import PairwiseRecon
+            from .core import PairwiseRecon
             pr = PairwiseRecon(dup_cost, loss_cost, STRICT_TARGETS)
             # For now, only the input tree: score it directly, no pool, no pickles.
             st_score = 0.0

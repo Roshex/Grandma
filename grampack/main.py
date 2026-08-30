@@ -192,7 +192,7 @@ class Task:
                 return self.logger.end_report(), {}
             self.reconciler.rep_of = self.gene_mgr.rep_of        # decided once, reused
             # Reconciliation and MUL-tree Selection
-            step_result = self.reconciler.run(self.mul_trees, self.gene_trees, self.registry)
+            step_result = self.reconciler.run_recon(self.mul_trees, self.gene_trees, self.registry)
             """if not step_result.sorted_scores:
                 self.logger.write("No valid MUL-trees scored.", level=1)
                 return None"""

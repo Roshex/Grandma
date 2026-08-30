@@ -1,5 +1,5 @@
 """
-algo.py - the mathematics of GRANDMA: grouping, the target sweep, and pairwise
+core.py - the mathematics of GRANDMA: grouping, the target sweep, and pairwise
 duplication-loss reconciliation. Everything here is computation over FlatTrees;
 orchestration, I/O and multiprocessing live in ops.py / reconcile.py.
 
@@ -52,7 +52,7 @@ one copy, so a split loses on the internal depths, on the duplications inside th
 and at its parent.
 
 ======================================================================================
-2. THE TARGET SWEEP - every placement of a donor clade in one pass
+2. TARGET SWEEP - every placement of a donor clade in one pass
 ======================================================================================
 Each candidate is T(h, t) = S with a copy C of subtree(h) grafted above target t.
 Instead of building and reconciling each of the O(N) candidates, the cost is written as
@@ -97,7 +97,7 @@ keeps its class and image) and `batch` (assignments resolved per vectorised pass
 gray=False rebuilds per combination and is kept as the reference oracle.
 
 Complexity: O(P*(n_G+N)) for ALL N targets per gene tree, P = prod of per-unit state
-counts, against O(N*2^g*n_G) for building and reconciling each candidate. Exact grouping
+counts, against O(2^g*n_G*N) for building and reconciling each candidate. Exact grouping
 costs (3/2)^(#free multi-leaf units) - the same factor unit_states costs the engine.
 
 ======================================================================================
