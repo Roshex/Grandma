@@ -209,7 +209,7 @@ class GranLogger:
 
         # Screen Output & Buffering
         if to_screen and self.verbosity >= level:
-            if key == 'w' and self.step_active:
+            if self.step_active and key != 'e':
                 # Buffer warnings to prevent breaking "In progress..." lines
                 self.step_buffer.append(formatted_msg)
             else:
@@ -221,8 +221,7 @@ class GranLogger:
         # Kill program on error
         if key == 'e' and kill_on_error:
             # Flush buffered warnings if any before exiting
-            if self.step_buffer:
-                print("\n".join(self.step_buffer))
+            self.flush_step_buffer()
             #sys.exit(1)
             raise RuntimeError(msg)
 
@@ -246,6 +245,8 @@ class GranLogger:
 
             # Log the crash using your custom file-flushing 'e' state
             self.log(f"FATAL EXCEPTION:\n{tb_string}", 'e')
+
+        self.flush_step_buffer()  # Flush any buffered warnings before setting the hook
 
         # Bind the custom handler to Python's global hook
         sys.excepthook = handle_exception
@@ -375,14 +376,20 @@ class GranLogger:
                 
                 sys.stdout.flush()
 
-                # FLUSH WARNINGS after status line is printed
-                if self.step_buffer:
-                    print("\n".join(self.step_buffer))
-                    self.step_buffer = [] # Clear
+                # Flush buffer after status line is printed
+                self.flush_step_buffer()
             
             # Write full line to log
             self.log(file_line, 'i', to_screen=False)
             self.step_interrupt = True
+
+    def flush_step_buffer(self) -> None:
+        """Emit anything buffered during an active step. Called on the completion path
+        and on every abnormal exit, so a crash or Ctrl-C cannot swallow warnings."""
+        if self.step_buffer:
+            print("\n".join(self.step_buffer))
+            self.step_buffer = []
+        self.step_active = False
 
     def log_software_banner(self, meta: 'GranMetadata') -> None:
         """Prints the static software info (Authors, DOI, Version)."""

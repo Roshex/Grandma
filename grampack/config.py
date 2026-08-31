@@ -32,7 +32,7 @@ class GranMetadata:
     github: str = "https://github.com/Roshex/Grandma"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "2.4.7"
+    version: str = "2.5.0"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -56,7 +56,7 @@ class GlobalContext:
     
     # Output & Logging Controls
     verbosity: int = 3
-    pickles: str = "archive" # 'keep', 'clean', 'archive'
+    pickles: str = "archive" # 'keep', 'clean', 'store', 'archive'
     maps: bool = False
     plot: bool = False
     norun: bool = False
@@ -656,10 +656,11 @@ class InitParser:
 
         # --- Output Options ---
         g_output = self.parser.add_argument_group("Output Options")
-        g_output.add_argument("--pickles", type=str, choices=['keep', 'k', 'clean', 'c', 'archive', 'a'], default='archive',
+        g_output.add_argument("--pickles", type=str, choices=['keep', 'k', 'clean', 'c', 'archive', 'a', 'store', 's'], default='archive',
             help="Action to take on the pickle directory after an inference step: "
-                 "(k)eep: leave files untouched for fast resuming. "
+                 "(k)eep: leave files untouched for instant resuming. "
                  "(c)lean: delete the directory (Warning: prevents resuming). "
+                 "(s)tore: store the entire directly as a .tar uncompressed file. "
                  "(a)rchive: compresses the entire directory into a single .tar.gz file (Default; auto-resumed).")
         g_output.add_argument("--maps", action='store_true',
             help="If set, the detailed output file will contain node mappings for each gene tree to each of the lowest "

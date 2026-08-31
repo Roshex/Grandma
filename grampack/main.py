@@ -25,6 +25,7 @@ from .models import SmrtTree, MulTree, NameRegistry, TaskResult, HistoryType, Co
 from .ops import TreeLoader, GeneTreeManager, MulTreeManager
 from .orthology import OrthologyLabeler
 from .reconcile import Reconciler
+from .parallel import WorkPool
 
 import psutil
 HAS_PSUTIL = psutil is not None
@@ -168,35 +169,49 @@ class Task:
         if self.gene_trees is None:
             return self.logger.end_report(), {}
 
+        # One pool for the whole task, shared by collapse, reconcile and sweep. Under
+        # spawn it is created once and reused across every stage (interpreter start-up
+        # and the package re-import are paid once); under fork it is re-forked whenever
+        # the payload changes, which costs ~1 ms.
+        self.pool = WorkPool(self.ctx.num_processes, spill_dir=tcf.pickle_dir,
+                             logger=self.logger, name=tcf.run_prefix)
+ 
         # Re-init component with current task
         self.reconciler = Reconciler(
-            tcf, self.logger, self.ctx.num_processes, self.ctx.pickles, self.ctx.maps, self.ctx.optim)
+            tcf, self.logger, self.ctx.num_processes, self.ctx.pickles, self.ctx.maps, self.ctx.optim, pool=self.pool)
         self.gene_mgr = GeneTreeManager(
-            tcf, self.logger, self.ctx.num_processes, self.ctx.pickles, self.ctx.optim)
+            tcf, self.logger, self.ctx.num_processes, self.ctx.pickles, self.ctx.optim, pool=self.pool)
 
-        if mt_space is not None:
-            # Sweep pipeline owns culling: it filters by the group cap itself, then culls
-            # only the MUL-trees it actually builds.
-            step_result = self.reconciler.run_sweep(
-                mt_space, self.spec_tree, self.gene_trees,
-                self.registry, self.gene_mgr, self.mul_mgr)
-            """if step_result is None:
-                return self.logger.end_report(), {}"""
-        else:
-            # Collapse & Filter Groups
-            # Note: In iterative modes, we are filtering the *memory* gene trees, 
-            # which effectively filters them for subsequent iterations too.
-            # TBD ?
-            if not self.gene_mgr.cull(self.mul_trees, self.gene_trees, self.registry):
-                # check-nums mode: cull returns False after logging the counts and handling pickles.
-                return self.logger.end_report(), {}
-            self.reconciler.rep_of = self.gene_mgr.rep_of        # decided once, reused
-            # Reconciliation and MUL-tree Selection
-            step_result = self.reconciler.run_recon(self.mul_trees, self.gene_trees, self.registry)
-            """if not step_result.sorted_scores:
-                self.logger.write("No valid MUL-trees scored.", level=1)
-                return None"""
+        try:
+            if mt_space is not None:
+                # Sweep pipeline owns culling: it filters by the group cap itself, then culls
+                # only the MUL-trees it actually builds.
+                step_result = self.reconciler.run_sweep(
+                    mt_space, self.spec_tree, self.gene_trees,
+                    self.registry, self.gene_mgr, self.mul_mgr)
+                """if step_result is None:
+                    return self.logger.end_report(), {}"""
+            else:
+                # Collapse & Filter Groups
+                # Note: In iterative modes, we are filtering the *memory* gene trees, 
+                # which effectively filters them for subsequent iterations too.
+                # TBD ?
+                if not self.gene_mgr.cull(self.mul_trees, self.gene_trees, self.registry):
+                    # check-nums mode: cull returns False after logging the counts and handling pickles.
+                    return self.logger.end_report(), {}
+                self.reconciler.rep_of = self.gene_mgr.rep_of        # decided once, reused
+                # Reconciliation and MUL-tree Selection
+                step_result = self.reconciler.run_recon(self.mul_trees, self.gene_trees, self.registry)
+                """if not step_result.sorted_scores:
+                    self.logger.write("No valid MUL-trees scored.", level=1)
+                    return None"""
 
+        finally:
+            # Under spawn the pool is deliberately long-lived, so the process would exit
+            # with live children without this. cleanup() is idempotent and also removes
+            # the spill files.
+            self.pool.cleanup()
+        
         # Extract Best Result from StepResult properties: kept_mul_maps is Dict[mul_idx, Dict[g_idx, Maps]]
         min_idx = step_result.mt_idx()
         min_data = step_result.mul_trees[min_idx]

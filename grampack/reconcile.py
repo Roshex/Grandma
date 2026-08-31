@@ -1,14 +1,12 @@
 import pickle
-import multiprocessing as mp
-from tqdm import tqdm
 from pathlib import Path
-from functools import partial
-from typing import TYPE_CHECKING, List, Dict, Tuple, Union, Optional, Set, Sequence, Iterator
+from typing import TYPE_CHECKING, List, Dict, Tuple, Union, Optional, Set, Sequence, Iterator, Any, Callable
 
 from .config import TaskConfig
 from .logger import GranLogger
-from .models import SmrtTree, MulTree, FlatTree, ReconResult, TaskResult, NameRegistry, decode_optim
+from .models import SmrtTree, MulTree, FlatTree, NameRegistry, ReconResult, TaskResult, decode_optim
 from .ops import plan_dedup
+from .parallel import WorkPool
 
 if TYPE_CHECKING:            # annotations only - never imported at run time
     from .core import TargetSweep
@@ -68,20 +66,20 @@ def _sweep_engine(st_flat: FlatTree, dup_cost: int, loss_cost: int) -> 'TargetSw
         _SWEEP_ENGINE.update(eng=eng, nodes=st_flat.num_nodes)
     return eng
 
-def _worker_sweep_single(
-    h_item: Tuple[str, int],
-    st_flat: FlatTree,
-    flat_gts: Dict[int, FlatTree],
-    weights: Dict[int, float],
-    dup_cost: int,
-    loss_cost: int,
-    valid_t: Dict[str, List[int]],
-    use_exact: bool = False,
-    use_gray: bool = True,
-) -> Tuple[str, 'np.ndarray', 'np.ndarray']:
+def _worker_sweep_single(state: Dict[str, Any], h_item: Tuple[str, int]) -> Tuple[str, 'np.ndarray', 'np.ndarray']:
     """Score every target of ONE donor clade, summed over the (de-duplicated) gene trees.
     Returns only the valid-target entries, so the payload back is a few dozen floats."""
     import numpy as np
+
+    st_flat: FlatTree = state['st_flat']
+    flat_gts: Dict[int, FlatTree] = state['flat_gts']
+    weights: Dict[int, float] = state['weights']
+    valid_t: Dict[str, List[int]] = state['valid_t']
+    dup_cost: int = state['dup_cost']
+    loss_cost: int = state['loss_cost']
+    use_exact: bool = state['use_exact']
+    use_gray: bool = state['use_gray']
+
     h1_name, h = h_item
     sw = _sweep_engine(st_flat, dup_cost, loss_cost)
     targets = valid_t[h1_name]
@@ -98,19 +96,7 @@ def _worker_sweep_single(
 
     return h1_name, vt, totals
 
-def _worker_recon_single(
-    mul_item: Tuple[int, FlatTree],
-    flat_gts: Dict[int, FlatTree],
-    weights: Dict[int, float],
-    dup_cost: int,
-    loss_cost: int,
-    registry: NameRegistry, 
-    pickle_dir: str, 
-    run_prefix: str,
-    retmap: bool = False,
-    use_gray: bool = False,
-    use_exact: bool = False
-) -> Tuple[int, Union[int, float], Optional[Dict[int, ReconResult]]]:
+def _worker_recon_single(state: Dict[str, Any], mul_item: Tuple[int, FlatTree]) -> Tuple[int, Union[int, float], Optional[Dict[int, ReconResult]]]:
     """
     Score ONE MUL-tree against every gene tree it is given.
 
@@ -121,6 +107,18 @@ def _worker_recon_single(
     and this loop is unchanged.
     """
     from .core import PairwiseRecon
+
+    flat_gts: Dict[int, FlatTree] = state['flat_gts']
+    weights: Dict[int, float] = state['weights']
+    dup_cost: int = state['dup_cost']
+    loss_cost: int  = state['loss_cost']
+    registry: NameRegistry  = state['registry']
+    pickle_dir: str = state['pickle_dir']
+    run_prefix: str = state['run_prefix']
+    retmap: bool = state['retmap']
+    use_gray: bool = state['use_gray']
+    use_exact: bool = state['use_exact']
+
     pr = PairwiseRecon(dup_cost, loss_cost, STRICT_TARGETS)
     
     mul_idx, flat_mul = mul_item
@@ -175,7 +173,7 @@ def _worker_recon_single(
 class Reconciler:
     def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1,
                  pickle_action: str = 'archive', to_map: bool = False, optim: int = 0,
-                 rep_of: Optional[Dict[int, int]] = None):
+                 rep_of: Optional[Dict[int, int]] = None, pool: Optional[WorkPool] = None):
         self.tcf = config
         self.logger = logger
         self.n_procs = num_processes
@@ -184,6 +182,28 @@ class Reconciler:
         self.dedup_gts, self.use_gray, self.use_sweep, self.use_exact = decode_optim(optim)
         self.dedup_threshold = getattr(config, 'disable_dedup_below', 0.05)
         self.rep_of = rep_of                    # None -> decide here (sweep path, st-only)
+
+        # One pool for the whole run, ideally created by the Engine and shared with
+        # GeneTreeManager: under spawn a pool costs an interpreter start-up plus a
+        # package re-import per worker, so it must be stood up once, not per stage.
+        self._pool = pool
+        self._owns_pool = pool is None
+
+    @property
+    def pool(self) -> WorkPool:
+        """The shared worker pool. Created on demand when the caller did not supply one
+        (stand-alone use, crash recovery), in which case this object also owns it."""
+        if self._pool is None:
+            self._pool = WorkPool(self.n_procs, spill_dir=self.tcf.pickle_dir,
+                                  logger=self.logger, name=self.tcf.run_prefix)
+        return self._pool
+
+    def cleanup(self) -> None:
+        """Release the workers and any spilled state files. A no-op when the pool was
+        supplied by the caller, which then owns its lifetime."""
+        if self._owns_pool and self._pool is not None:
+            self._pool.cleanup()
+            self._pool = None
 
     # --------------------------------------------------------------------------
     # Common
@@ -283,23 +303,19 @@ class Reconciler:
             return 1
         return self.n_procs
 
-    def _imap(self, worker_func: callable, items: List, desc: str, unit: str) -> Iterator:
+    def _imap(self, func: Callable[[Any, Any], Any], items: List, state: Any,
+              desc: str, unit: str) -> Iterator:
         """
-        The single place this module talks to multiprocessing. Yields worker results in completion order.
-        Both pipelines go through here, so swapping in WorkPool means replacing this method and nothing else.
+        The single place this module dispatches work.
+
+        `func(state, item)`. WorkPool moves `state` once per worker and keeps the pool
+        alive across stages where that pays (spawn), so the per-task payload is just the
+        item. The serial fallback inside WorkPool runs the same function with the same
+        state, so the two paths cannot drift.
         """
-        procs = self._pool_procs(len(items))
-        bar = dict(total=len(items), desc=desc, unit=unit,
-                   disable=self.logger.disable_tqdm, ncols=177)
-        if procs > 1:
-            # TODO(WorkPool): functools.partial re-pickles its bound payload once per
-            # task - free under fork, dominant under spawn. WorkPool replaces that with
-            # a per-worker state transfer.
-            with mp.Pool(processes=procs) as pool:
-                yield from tqdm(pool.imap_unordered(worker_func, items), **bar)
-        else:
-            for item in tqdm(items, **bar):
-                yield worker_func(item)
+        yield from self.pool.map_unordered(
+            func, items, state=state, desc=desc, unit=unit,
+            disable=self.logger.disable_tqdm, min_parallel=max(2, self.n_procs // 2) + 1)
 
     @staticmethod
     def _distribute_scores(sorted_scores: List[Tuple[int, int]]) -> Tuple[List[int], int, Tuple[float, float, float], str]:
@@ -477,40 +493,32 @@ class Reconciler:
     # PAIRWISE RECONCILIATION PIPELINE
     # --------------------------------------------------------------------------
 
-    def _dispatch_recon(self, tasks: List[Tuple[int, MulTree]], worker_func: callable, retmap: bool, desc: str
+    def _dispatch_recon(self, tasks: List[Tuple[int, MulTree]], state: Dict[str, Any], retmap: bool, desc: str
                         ) -> Tuple[Dict[int, Union[int, float]], Optional[Dict[int, Dict[int, ReconResult]]]]:
         """Run _worker_recon_single over `tasks` - one per MUL-tree."""
         all_scores: Dict[int, Union[int, float]] = {}
         detailed_res: Optional[Dict[int, Dict[int, ReconResult]]] = {} if retmap else None
 
         items = [(k, mdata.mt.flat_tree) for k, mdata in tasks]
-        for idx, score, gt_res in self._imap(worker_func, items, desc, "st"):
+        for idx, score, gt_res in self._imap(_worker_recon_single, items, state, desc, "st"):
             all_scores[idx] = score
             if retmap:
                 detailed_res[idx] = gt_res
         return all_scores, detailed_res
 
-    def _get_recon_worker(self, gene_trees: Dict[int, SmrtTree], registry: NameRegistry, retmap: bool = False) -> callable:
-        """Bind everything invariant across MUL-trees. Mirrors the sweep's worker: it is
-        handed one entry per DISTINCT gene tree plus that class's summed weight, so the
-        de-duplication decision is applied ONCE here rather than re-derived per task."""
+    def _recon_state(self, gene_trees: Dict[int, SmrtTree], registry: NameRegistry,
+                     retmap: bool = False) -> Dict[str, Any]:
+        """Everything invariant across MUL-trees, as ONE payload that travels once per
+        worker. Mirrors the sweep's state: one entry per DISTINCT gene tree plus that
+        class's summed weight, so the de-duplication decision is applied here rather
+        than re-derived per task."""
         dup_cost, loss_cost = self.tcf.weights
         _rep_of, unique_gts, weight_of_rep = self._dedup_views(gene_trees, retmap)
-
-        return partial(
-            _worker_recon_single,
-            flat_gts=unique_gts,
-            weights=weight_of_rep,
-            dup_cost=dup_cost,
-            loss_cost=loss_cost,
-            registry=registry,
-            pickle_dir=str(self.tcf.pickle_dir),
-            run_prefix=self.tcf.run_prefix,
-            retmap=retmap,
-            use_gray=self.use_gray,
-            use_exact=self.use_exact,
-        )
-
+        return dict(flat_gts=unique_gts, weights=weight_of_rep,
+                    dup_cost=dup_cost, loss_cost=loss_cost, registry=registry,
+                    pickle_dir=str(self.tcf.pickle_dir), run_prefix=self.tcf.run_prefix,
+                    retmap=retmap, use_gray=self.use_gray, use_exact=self.use_exact)
+    
     def recon_all(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree],
                   registry: NameRegistry, retmap: bool = False) -> Tuple[List[Tuple[int, int]], Dict[int, Dict[int, ReconResult]]]:
         
@@ -532,8 +540,8 @@ class Reconciler:
                     "gene trees are already labelled per sub-genome.", 'w')
 
         tasks = list(mul_trees.items())
-        worker_func = self._get_recon_worker(gene_trees, registry, retmap)
-        all_scores, detailed_res = self._dispatch_recon(tasks, worker_func, retmap, "# Scoring   ")
+        state = self._recon_state(gene_trees, registry, retmap)
+        all_scores, detailed_res = self._dispatch_recon(tasks, state, retmap, "# Scoring   ")
         
         self.logger.report_step(step, "Success", full_update=True)
         return sorted(all_scores.items(), key=lambda kv: (kv[1], kv[0])), detailed_res # Tie-break on the index
@@ -560,8 +568,8 @@ class Reconciler:
 
         for gt in gene_trees.values(): gt.make_flat(registry)   # traversed only -> no Euler tour / RMQ
 
-        worker_func = self._get_recon_worker(gene_trees, registry, True)
-        _scores, detailed_res = self._dispatch_recon(targets, worker_func, True, "# Mapping   ")
+        state = self._recon_state(gene_trees, registry, True)
+        _scores, detailed_res = self._dispatch_recon(targets, state, True, "# Mapping   ")
 
         self.logger.report_step(step, f"Success: got {len(detailed_res)}/{len(mul_trees)} maps", full_update=True)
         return detailed_res
@@ -658,11 +666,11 @@ class Reconciler:
 
         return h_id, clade_ids, valid_t, t_id_of
 
-    def _dispatch_sweep(self, donors: List[Tuple[str, int]], worker_func: callable,
+    def _dispatch_sweep(self, donors: List[Tuple[str, int]], state: Dict[str, Any],
                         desc: str = "# Sweeping  ") -> Dict[str, Tuple]:
         """Run _worker_sweep_single over `donors` - one per donor clade."""
         out: Dict[str, Tuple] = {}
-        for h1_name, vt, totals in self._imap(worker_func, donors, desc, "h1"):
+        for h1_name, vt, totals in self._imap(_worker_sweep_single, donors, state, desc, "h1"):
             out[h1_name] = (vt, totals)
         return out
 
@@ -712,7 +720,13 @@ class Reconciler:
         n2id = st_flat.name_id_to_node_id           # keyed by FULL name id, not pure
         h_id, clade_ids, valid_t, t_id_of = self._sweep_index(meta, single, st_flat, n2id, registry)
 
-        self.logger.report_step(step, f"Success: {len(single)} single- & {len(multi)} multi-MTs")
+        by_h1: Dict[str, List[int]] = {}
+        for c_idx in single:
+            by_h1.setdefault(meta[c_idx][0], []).append(c_idx)
+
+        donors = [(name, h_id[name]) for name in by_h1 if name in h_id]
+
+        self.logger.report_step(step, f"Success: {len(donors)} donor clades")
 
         # ---------------- 2. gene trees, cap ---------------
         gene_mgr.filter_by_sweep_cap(gene_trees, st_flat, sw, clade_ids, h_id, valid_t, registry)
@@ -752,17 +766,10 @@ class Reconciler:
         step = "Sweeping candidate placements"
         self.logger.report_step(step, "In progress...")
 
-        by_h1: Dict[str, List[int]] = {}
-        for c_idx in single:
-            by_h1.setdefault(meta[c_idx][0], []).append(c_idx)
-
-        # TODO(WorkPool)
-        worker = partial(_worker_sweep_single,
-                        st_flat=st_flat, flat_gts=unique_gts, weights=weight_of_rep,
-                        dup_cost=dup_cost, loss_cost=loss_cost, valid_t=valid_t,
-                        use_exact=self.use_exact, use_gray=self.use_gray)
-        donors = [(name, h_id[name]) for name in by_h1 if name in h_id]
-        results = self._dispatch_sweep(donors, worker)
+        sweep_state = dict(st_flat=st_flat, flat_gts=unique_gts, weights=weight_of_rep,
+                           dup_cost=dup_cost, loss_cost=loss_cost, valid_t=valid_t,
+                           use_exact=self.use_exact, use_gray=self.use_gray)
+        results = self._dispatch_sweep(donors, sweep_state)
 
         for h1_name, c_idxs in by_h1.items():
             got = results.get(h1_name)
@@ -775,7 +782,7 @@ class Reconciler:
                 if t_id is not None and t_id in pos:
                     all_scores[c_idx] = round(float(totals[pos[t_id]]), 3)
 
-        self.logger.report_step(step, f"Success: scored {len(all_scores)-1} candidates")
+        self.logger.report_step(step, f"Success: scored {len(all_scores)-1} candidates", full_update=True)
 
         sorted_scores = sorted(all_scores.items(), key=lambda kv: (kv[1], kv[0]))
 
