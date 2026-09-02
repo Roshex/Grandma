@@ -434,6 +434,8 @@ class GranLogger:
         space = self.space
         mode = tcf.mode
 
+        unit_rule_dict = {0: "Strict duplicate-free", 1: "Default [sibling-disjoint]", 2: "Maximally-movable"}
+
         # Comdition aliases
         is_task = bool(self.label)
         is_iter = mode in ("split", "full", "mixed")
@@ -532,12 +534,17 @@ class GranLogger:
                         log_(space("Global tree cache:", pad) + str("On" if tcf.global_tree_cache is not None else "Off"))
                 log_(space("Redundant MT filter:", pad) + str("Off" if ctx.allow_redun else "On"))
                 if ctx.nesting == "model" and mode not in ("full", "mixed"):
-                    log_(space("Nestedness behavior:", pad) + str(ctx.nesting).capitalize())
+                    log_(space("Nestedness rule:", pad) + str(ctx.nesting).capitalize())
             if mode not in ("count-mts", "build-mts"):
+                log_(space("Unit rule:", pad) + unit_rule_dict[tcf.unit_rule])
+                log_(space("Exact grouping:", pad) + str("On" if tcf.use_exact else "Off"))
                 log_(space("GT polyploid group cap:", pad) + str(tcf.group_cap))
+                log_(space("Capping on working unit-rule:", pad) + str("On" if tcf.cap_by_work else "Off"))
                 if mode != "check-nums":
-                    log_(space("Optimized reconciliation:", pad) + str("On" if ctx.optim else "Off"))
                     log_(space("Gene tree quotas:", pad) + tcf.quota_gts.capitalize())
+                    log_(space("Gene tree deduplication:", pad) + str("On" if tcf.dedup_gts else "Off"))
+                    log_(space("Gray-code enumeration:", pad) + str("On" if tcf.use_gray else "Off"))
+                    log_(space("Reconciliation method:", pad) + str("Sweep" if tcf.use_sweep else "Standard"))
                     log_(space("Parsimony penalty weights:", pad) + f"Dup: {tcf.weights[0]}, Loss: {tcf.weights[1]}")
                     max_select_str = str(tcf.n_best) if tcf.n_best > 0 else ("Up to input ST (inclusive)" if not tcf.n_best else "All") #Bug !!!!
                     if mode != "st-only":
@@ -546,7 +553,7 @@ class GranLogger:
                         cutoff_str = f"Ref: {tcf.cutoff[0]}, Offset: {tcf.cutoff[2]}, Diff: {tcf.cutoff[1]}" if tcf.cutoff[0] != "none" else "None"
                         log_(space("Parsimony score cutoff:", pad) + cutoff_str)
                         if mode in ("full", "mixed"):
-                            log_(space("Nestedness behavior:", pad) + str(ctx.nesting).capitalize())
+                            log_(space("Nestedness rule:", pad) + str(ctx.nesting).capitalize())
                         if mode in ("split", "mixed"):
                             log_(space("Min extracted tree leaves:", pad) + f"Species: {ctx.min_st_lvs}, Genes: {ctx.min_gt_lvs}")
         

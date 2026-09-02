@@ -4,12 +4,11 @@ from typing import TYPE_CHECKING, List, Dict, Tuple, Union, Optional, Set, Seque
 
 from .config import TaskConfig
 from .logger import GranLogger
-from .models import SmrtTree, MulTree, FlatTree, NameRegistry, ReconResult, TaskResult, decode_optim
+from .models import SmrtTree, MulTree, FlatTree, NameRegistry, ReconResult, TaskResult
 from .ops import plan_dedup
 from .parallel import WorkPool
 
 if TYPE_CHECKING:            # annotations only - never imported at run time
-    from .core import TargetSweep
     from .ops import GeneTreeManager, MulTreeManager
 
 # NOTE ON IMPORTS: core / numpy / scipy / matplotlib are imported lazily inside the
@@ -52,24 +51,11 @@ FIRST_VALLEY_AFTER_PEAK = False
 
 _INF = float('inf')
 
-# One SpeciesIndex/TargetSweep per worker process: both are derived from st_flat alone,
-# so rebuilding them locally is cheaper than shipping them with every task (and keeps
-# TargetSweep's per-donor scalar cache process-local).
-_SWEEP_ENGINE = {}   # single-slot cache: one species tree per worker per run
-
-def _sweep_engine(st_flat: FlatTree, dup_cost: int, loss_cost: int) -> 'TargetSweep':
-    eng = _SWEEP_ENGINE.get('eng')
-    if (eng is None or _SWEEP_ENGINE['nodes'] != st_flat.num_nodes
-            or eng.dup_cost != dup_cost or eng.loss_cost != loss_cost):
-        from .core import SpeciesIndex, TargetSweep
-        eng = TargetSweep(SpeciesIndex(st_flat), dup_cost, loss_cost)
-        _SWEEP_ENGINE.update(eng=eng, nodes=st_flat.num_nodes)
-    return eng
-
 def _worker_sweep_single(state: Dict[str, Any], h_item: Tuple[str, int]) -> Tuple[str, 'np.ndarray', 'np.ndarray']:
     """Score every target of ONE donor clade, summed over the (de-duplicated) gene trees.
     Returns only the valid-target entries, so the payload back is a few dozen floats."""
     import numpy as np
+    from .core import sweep_engine
 
     st_flat: FlatTree = state['st_flat']
     flat_gts: Dict[int, FlatTree] = state['flat_gts']
@@ -77,18 +63,19 @@ def _worker_sweep_single(state: Dict[str, Any], h_item: Tuple[str, int]) -> Tupl
     valid_t: Dict[str, List[int]] = state['valid_t']
     dup_cost: int = state['dup_cost']
     loss_cost: int = state['loss_cost']
+    rule: int = state['rule']
     use_exact: bool = state['use_exact']
     use_gray: bool = state['use_gray']
 
     h1_name, h = h_item
-    sw = _sweep_engine(st_flat, dup_cost, loss_cost)
+    sw = sweep_engine(st_flat, dup_cost, loss_cost)
     targets = valid_t[h1_name]
     vt = np.asarray(targets, dtype=np.int64)
     totals = np.zeros(len(vt))
 
     for g_idx, gt_flat in flat_gts.items():
         vec = sw.score_all_targets(gt_flat, st_flat, h, valid_targets=targets,
-                                   exact=use_exact, rule=True, gray=use_gray)
+                                   rule=rule, exact=use_exact, gray=use_gray)
         sub = vec[vt]
         if not np.isfinite(sub).all():
             raise RuntimeError(f"sweep returned inf for a valid target of '{h1_name}'")
@@ -172,14 +159,13 @@ def _worker_recon_single(state: Dict[str, Any], mul_item: Tuple[int, FlatTree]) 
 
 class Reconciler:
     def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1,
-                 pickle_action: str = 'archive', to_map: bool = False, optim: int = 0,
+                 pickle_action: str = 'archive', to_map: bool = False,
                  rep_of: Optional[Dict[int, int]] = None, pool: Optional[WorkPool] = None):
         self.tcf = config
         self.logger = logger
         self.n_procs = num_processes
         self.pickle_action = pickle_action
         self.to_map = to_map
-        self.dedup_gts, self.use_gray, self.use_sweep, self.use_exact = decode_optim(optim)
         self.dedup_threshold = getattr(config, 'disable_dedup_below', 0.05)
         self.rep_of = rep_of                    # None -> decide here (sweep path, st-only)
 
@@ -228,9 +214,12 @@ class Reconciler:
         """One line stating which --optim switches are active, so a run's log identifies
         the pathway it took without cross-referencing the bit flags."""
         on = []
-        if self.use_gray:  on.append("Gray-code enumeration")
-        if self.use_exact: on.append("exact grouping (mixed unit states)")
-        if self.dedup_gts: on.append("GT de-duplication (subject to threshold)")
+        tcf = self.tcf
+        if tcf.use_gray:  on.append("Gray-code enumeration")
+        if tcf.dedup_gts: on.append("GT de-duplication (subject to threshold)")
+        if tcf.use_exact: on.append("exact grouping (mixed unit states)")
+        if tcf.unit_rule != 1: on.append(f"{'maximal' if tcf.unit_rule == 2 else 'strict'} grouping rule")
+        if tcf.cap_by_work: on.append("capping by work")
         if on:
             self.logger.log(f"Using, for the {stage} step: " + "; ".join(on) + ".", 'i')
 
@@ -260,7 +249,7 @@ class Reconciler:
                       if g in gene_trees and r in gene_trees}
         else:
             rep_of, _ = plan_dedup(gene_trees, self.dedup_threshold,
-                                  enabled=self.dedup_gts,
+                                  enabled=self.tcf.dedup_gts,
                                   latched_off=getattr(self.tcf, 'dedup_latch', False),
                                   logger=self.logger, label=label)
 
@@ -512,12 +501,13 @@ class Reconciler:
         worker. Mirrors the sweep's state: one entry per DISTINCT gene tree plus that
         class's summed weight, so the de-duplication decision is applied here rather
         than re-derived per task."""
-        dup_cost, loss_cost = self.tcf.weights
+        tcf = self.tcf
+        dup_cost, loss_cost = tcf.weights
         _rep_of, unique_gts, weight_of_rep = self._dedup_views(gene_trees, retmap)
         return dict(flat_gts=unique_gts, weights=weight_of_rep,
                     dup_cost=dup_cost, loss_cost=loss_cost, registry=registry,
-                    pickle_dir=str(self.tcf.pickle_dir), run_prefix=self.tcf.run_prefix,
-                    retmap=retmap, use_gray=self.use_gray, use_exact=self.use_exact)
+                    pickle_dir=str(tcf.pickle_dir), run_prefix=tcf.run_prefix,
+                    retmap=retmap, use_gray=tcf.use_gray, use_exact=tcf.use_exact)
     
     def recon_all(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree],
                   registry: NameRegistry, retmap: bool = False) -> Tuple[List[Tuple[int, int]], Dict[int, Dict[int, ReconResult]]]:
@@ -729,7 +719,7 @@ class Reconciler:
         self.logger.report_step(step, f"Success: {len(donors)} donor clades")
 
         # ---------------- 2. gene trees, cap ---------------
-        gene_mgr.filter_by_sweep_cap(gene_trees, st_flat, sw, clade_ids, h_id, valid_t, registry)
+        gene_mgr.filter_by_sweep_cap(gene_trees, st_flat, clade_ids, h_id, valid_t, registry)
         if not gene_trees:
             return None
 
@@ -768,7 +758,7 @@ class Reconciler:
 
         sweep_state = dict(st_flat=st_flat, flat_gts=unique_gts, weights=weight_of_rep,
                            dup_cost=dup_cost, loss_cost=loss_cost, valid_t=valid_t,
-                           use_exact=self.use_exact, use_gray=self.use_gray)
+                           use_exact=self.tcf.use_exact, rule=self.tcf.unit_rule, use_gray=self.tcf.use_gray)
         results = self._dispatch_sweep(donors, sweep_state)
 
         for h1_name, c_idxs in by_h1.items():

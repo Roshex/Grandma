@@ -1,17 +1,19 @@
+import os
 import re
 import pickle
 import gzip, tarfile
+from math import log2
 from pathlib import Path
 from collections import defaultdict
 from shutil import rmtree, unpack_archive
 from itertools import combinations
 from functools import partial
-from typing import Tuple, List, Optional, Dict, Union, Set, Collection, Any
+from typing import Any, Collection, Dict, List, Optional, Set, Tuple, Union
 
 from .config import TaskConfig
 from .logger import GranLogger
-from .models import Tree, SmrtTree, TreeCache, MulTree, NameRegistry, FlatTree, GroupData, splitSpec, decode_optim
-from .core import compute_groups, compute_units, TargetSweep
+from .models import Tree, SmrtTree, TreeCache, MulTree, NameRegistry, FlatTree, GroupData, splitSpec, ENGINE_RULE
+from .core import compute_groups, compute_units
 from .parallel import WorkPool
 
 
@@ -20,6 +22,7 @@ from .parallel import WorkPool
 #  nearly all the compression.
 ARCHIVE_COMPRESSLEVEL = 2
 
+MAX_LG_COMB = 24
 
 def plan_dedup(gene_trees: Dict[int, FlatTree], threshold: float, enabled: bool=True, latched_off: bool=False,
                logger: Optional[GranLogger]=None, label: str=""):
@@ -1537,14 +1540,42 @@ class MulTreeManager:
             hx_sisters = ",".join(n.name for n in mt_data.hx_sisters)
             self.logger.log(f"{mul_num}\t{h1_name}\t{hx_sisters}\t{tree_str}", 'i', prefix='')
 
+def log2_combinations(n_amb: int, n_amb_multi: int, c_max: int = 2,
+                      use_exact: bool = False) -> float:
+    """
+    log2 of the number of allele assignments a gene tree contributes for one MUL-tree.
+ 
+    n_amb        ambiguous (free) units; fixed/pinned units have one state, contributing 0
+    n_amb_multi  of those, how many have more than one leaf (these gain the mixed state)
+    c_max        copies of the most-duplicated species in this MUL-tree
+    use_exact    whether multi-leaf units carry the extra mixed state
+ 
+    For heterogeneous multi-MTs, c_max upper-bounds each unit's own c, so this
+    over-estimates log2 P and filters a SUPERSET - conservative, never under-filtering.
+    At c_max = 2 with use_exact = False it returns exactly n_amb, i.e. GRAMPA's rule, so
+    the default pathway and GRAMPA parity are unchanged.
+    """
+    if n_amb <= 0:
+        return 0.0
+    if not use_exact:
+        return n_amb * log2(c_max)
+    return (n_amb - n_amb_multi) * log2(c_max) + n_amb_multi * log2(2 * c_max - 1)
+
+def check_workload(work: float) -> None:
+    # Tractability, on the enumeration that will ACTUALLY run. Raising rather than
+    # filtering keeps the dataset fixed: a run either analyses every gene tree that
+    # passed the cap, or it stops and says why.
+    if work > MAX_LG_COMB:
+        raise RuntimeError(
+            f"2^{work:.1f} allele assignments for this gene tree are above 'MAX_LG_COMB' \
+            ({MAX_LG_COMB}). Lower --cap, or clear --optim bit 3 for this dataset.")
 
 def _collapse_task(state: Dict[str, Any], payload: Tuple[int, MulTree]
-                   ) -> Tuple[int, Dict[int, GroupData], List[int],
-                              Optional[Dict[int, Tuple[int, int]]]]:
+                   ) -> Tuple[int, List[int], Optional[Dict[int, Tuple[int, int, float]]]]:
     """
     Compute the groups of every gene tree against one MUL-tree.
  
-    Returns (m_idx, groups, fails, counts).
+    Returns (m_idx, fails, counts).
  
     `state` is moved once per worker by WorkPool - inherited under fork, read from a
     single spill file under spawn - so the per-task payload is just (index, MUL-tree).
@@ -1564,6 +1595,10 @@ def _collapse_task(state: Dict[str, Any], payload: Tuple[int, MulTree]
     cap: int = state['group_cap']
     want_counts: bool = state['want_counts']
     rep_of: Dict[int, int] = state['rep_of'] or {}
+    rule: int = state['rule']
+    cap_by_work: bool = state['cap_by_work']
+    use_exact: bool = state['use_exact']
+    pickle_dir, run_prefix = Path(state['pickle_dir']), state['run_prefix']
  
     m_idx, m_data = payload
     h1_sis, hx_sis_list = m_data.get_sister_clades()
@@ -1573,15 +1608,22 @@ def _collapse_task(state: Dict[str, Any], payload: Tuple[int, MulTree]
     # is pure loss. This is what made de-duplication a net cost at a low duplicate rate.
     has_members = set(rep_of.values())
  
-    groups_out: Dict[int, GroupData] = {}
+    groups_out: Dict[int, GroupData] = {}          # what gets pickled and reconciled
+    cap_cache: Dict[int, int] = {}                 # rep -> GRAMPA-rule ambiguous count
     fails: List[int] = []
     positions: Dict[int, Any] = {}
-    counts: Optional[Dict[int, Tuple[int, int]]] = {} if want_counts else None
+    counts: Optional[Dict[int, Tuple[int, int, float]]] = {} if want_counts else None
+
+    #from collections import Counter
+    #c_max = max(Counter(l.pure for l in m_data.mt.ete_tree.iter_leaves()).values())
+    # for now multi-MT with c_max > 2 shouldn't filter excessively [and we'll hope it
+    # won't lock up the enumeration]. Much more important to limit the power instead...
+    c_max = 2
  
     for g_idx, gt_obj in gene_trees.items():
         rep = rep_of.get(g_idx)
         if rep is None:
-            gd = compute_groups(gt_obj, m_data, registry, h1_sis, hx_sis_list)
+            gd = compute_groups(gt_obj, m_data, registry, h1_sis, hx_sis_list, rule)
             if g_idx in has_members:
                 positions[g_idx] = gt_obj.groups_to_positions(gd)
         else:
@@ -1591,29 +1633,158 @@ def _collapse_task(state: Dict[str, Any], payload: Tuple[int, MulTree]
                 # gene-tree dict is ever re-ordered. Cheaper than an assertion that
                 # fails deep inside a worker.
                 rep_gd = compute_groups(gene_trees[rep], m_data, registry,
-                                        h1_sis, hx_sis_list)
+                                        h1_sis, hx_sis_list, rule)
                 pos = positions[rep] = gene_trees[rep].groups_to_positions(rep_gd)
             gd = gt_obj.groups_from_positions(pos)
  
         groups_out[g_idx] = gd
         n_amb = len(gd.ambiguous_groups)
-        if n_amb > cap:
-            fails.append(g_idx)
-        if want_counts:
-            counts[g_idx] = (n_amb, len(gd.fixed_groups))
- 
-    return m_idx, groups_out, fails, counts
+        n_multi = sum(1 for u in gd.ambiguous_groups if len(u) > 1)
+        work = log2_combinations(n_amb, n_multi, c_max, use_exact)
 
+        # ---- the FILTER metric: what decides the dataset ---------------------
+        if cap_by_work:
+            metric = work
+        elif rule == ENGINE_RULE:
+            metric = n_amb                       # already GRAMPA's quantity
+        else:
+            # The filter must not move when the algorithm does, so recover GRAMPA's
+            # count explicitly. Paid ONLY under a non-default rule, and only once per
+            # de-duplication class (members reuse their representative's groups).
+            key = rep if rep is not None else g_idx
+            metric = cap_cache.get(key)
+            if metric is None:
+                src = gt_obj if rep is None else gene_trees[rep]
+                eng_gd = compute_groups(src, m_data, registry, h1_sis, hx_sis_list,
+                                        ENGINE_RULE)
+                metric = cap_cache[key] = len(eng_gd.ambiguous_groups)
+
+        if want_counts:
+            counts[g_idx] = (n_amb, len(gd.fixed_groups), work)
+        if metric > cap:
+            fails.append(g_idx)
+            continue
+
+        # Work guard on gts that did not fail
+        check_workload(work)
+
+    p_path = pickle_dir / f"{run_prefix}_{m_idx}_groups.pickle"
+    tmp = p_path.with_suffix('.pickle.tmp')
+    try:
+        # Write-then-rename: a crash mid-write must not leave a truncated pickle that a
+        # resumed run would happily read.
+        with open(tmp, 'wb') as f:
+            pickle.dump(groups_out, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, p_path)
+    except OSError as e:
+        raise RuntimeError(f"MUL-tree {m_idx}: cannot write group data '{p_path}': {e}") from e
+
+    return m_idx, fails, counts
+
+def _sweep_filter_task(state: Dict[str, Any], h_item: Tuple[str, int]) -> List[bytes]:
+    """
+    Decide the cap for ONE donor clade, over every DISTINCT gene tree.
+ 
+    Returns a list of over-cap signatures.
+    Keyed by signature rather than gene-tree index because both decisions are structural:
+    isomorphic gene trees give identical unit counts, so one decision serves the whole
+    de-duplication class and the payload back stays tiny.
+    """
+    from .core import sweep_engine
+ 
+    st_flat: FlatTree = state['st_flat']
+    flats: Dict[bytes, FlatTree] = state['flats_by_sig']     # one per signature
+    clade_ids: Dict[str, Set[int]] = state['clade_ids']
+    valid_t: Dict[str, List[int]] = state['valid_t']
+    cap: int = state['group_cap']
+    rule: int = state['rule']
+    cap_by_work: bool = state['cap_by_work']
+    use_exact: bool = state['use_exact']
+
+    # Real weights are needed because sweep_engine is a
+    # single-slot per-worker cache keyed partly on cost, so using the run's weights lets
+    # the scoring phase reuse this engine - and its scalar/leaf caches - instead of
+    # rebuilding at the phase transition.
+    pin_states_ = sweep_engine(st_flat, *state['weights']).pin_states
+ 
+    h1_name, h = h_item
+    sp_ids, targets = clade_ids[h1_name], valid_t[h1_name]
+
+    def _sweep_cap_decision(gt_flat: FlatTree) -> bool:
+        """
+        filtered? for one (gene tree, donor clade).
+
+        The FILTER is measured under GRAMPA's rule unless --cap-by-work is set, so the
+        set of analysed gene trees does not move with --optim or --unit-rule and stays
+        comparable with the pairwise engine and with GRAMPA. The WORK is measured under
+        the rule actually in use, because that is what the sweep will enumerate. The
+        sweep models exactly two copies, so c_max is always 2 here.
+        """
+        filt_rule = rule if cap_by_work else ENGINE_RULE
+        filt_units = compute_units(gt_flat, sp_ids, rule=filt_rule)
+        if not filt_units:
+            return False
+
+        # SHORT-CIRCUIT. pin_states costs an O(units*depth + N*g) pass, but pinning can
+        # only ever REDUCE the free-unit count: free[t] <= len(units) for every target.
+        # So when the un-pinned bound already clears the cap, no target can exceed it and
+        # the pass is pure waste - which is the common case (97.5% of decisions measured
+        # at the default cap). The decision, and therefore every log line, is identical.
+        g = len(filt_units)
+        n_big = sum(1 for u in filt_units if len(u) > 1)
+        bound = (log2_combinations(g, n_big, 2, use_exact)
+                 if cap_by_work else g)
+        if bound <= cap:
+            over = False
+            st_map = free = None
+        else:
+            st_map, free = pin_states_(gt_flat, h, filt_units, st_flat, targets)
+            if cap_by_work:
+                big = [i for i, u in enumerate(filt_units) if len(u) > 1]
+                over = any(log2_combinations(free[t],
+                            sum(1 for i in big if st_map[t][i] is None), 2,
+                            use_exact) > cap for t in targets)
+            else:
+                over = any(free[t] > cap for t in targets)
+        if over:
+            return True
+ 
+        # Same argument for the work guard: pinning only shrinks the enumeration, so the
+        # un-pinned count is an upper bound. Skip the analysis when it already clears.
+        if filt_rule == rule:
+            run_units, run_bound = filt_units, log2_combinations(g, n_big, 2, use_exact)
+        else:
+            run_units = compute_units(gt_flat, sp_ids, rule=rule)
+            if not run_units:
+                return False
+            run_bound = log2_combinations(
+                len(run_units), sum(1 for u in run_units if len(u) > 1), 2,
+                use_exact)
+        if run_bound <= MAX_LG_COMB:
+            return False
+
+        if filt_rule == rule and st_map is not None:
+            rst, rfree = st_map, free           # reuse the pinning we already paid for
+        else:
+            rst, rfree = pin_states_(gt_flat, h, run_units, st_flat, targets)
+        big = [i for i, u in enumerate(run_units) if len(u) > 1]
+        worst = max((log2_combinations(rfree[t],
+                                       sum(1 for i in big if rst[t][i] is None),
+                                       2, use_exact)
+                     for t in targets), default=0.0)
+        check_workload(worst)                   # Only situation where you need to raise
+        
+        return False
+
+    return [sig for sig, gt_flat in flats.items() if _sweep_cap_decision(gt_flat)]
 
 class GeneTreeManager:
     def __init__(self, config: TaskConfig, logger: GranLogger, num_processes: int = 1,
-                 pickle_action: str = 'archive', optim: int = 0, pool: Optional[WorkPool] = None):
+                 pickle_action: str = 'archive', pool: Optional[WorkPool] = None):
         self.tcf = config
         self.logger = logger
         self.n_procs = num_processes
         self.pickle_action = pickle_action
-        # bit 0 of --optim: reuse groups across isomorphic gene trees (1 and 3)
-        self.dedup_gts, _, _, _ = decode_optim(optim)
 
         self.dedup_threshold = getattr(config, 'disable_dedup_below', 0.05)
         self.rep_of: Dict[int, int] = {}        # the decision, read back by main
@@ -1733,7 +1904,8 @@ class GeneTreeManager:
         Returns (fails_by_mt, counts_by_mt, reused_mt_ids); the counts feed
         filter_and_check directly so it never has to read the pickles back.
         """
-        pickle_dir = self.tcf.pickle_dir
+        tcf = self.tcf
+        pickle_dir = tcf.pickle_dir
         self.unpack_archive_(pickle_dir)
         pickle_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1749,8 +1921,8 @@ class GeneTreeManager:
             gt.make_flat(registry)
         # ONE decision for the whole task; reconcile reuses it rather than re-deciding.
         self.rep_of, self.dedup_latch_next = plan_dedup(
-            gene_trees, self.dedup_threshold, enabled=self.dedup_gts,
-            latched_off=getattr(self.tcf, 'dedup_latch', False),
+            gene_trees, self.dedup_threshold, enabled=tcf.dedup_gts,
+            latched_off=getattr(tcf, 'dedup_latch', False),
             logger=self.logger)
         if self.rep_of:
             # canon is computed from the flat tree, which __getstate__ does not ship;
@@ -1758,15 +1930,20 @@ class GeneTreeManager:
             for gt in gene_trees.values():
                 gt.canon                        # prime for the workers (see __getstate__)
 
-        registry_path = pickle_dir / f"{self.tcf.run_prefix}_registry.pickle"
+        registry_path = pickle_dir / f"{tcf.run_prefix}_registry.pickle"
         force_regenerate = self._check_registry_safety(registry_path, registry)
+        if tcf.unit_rule != ENGINE_RULE and not tcf.cap_by_work:
+            # A reused pickle holds groups under whatever rule wrote it, so GRAMPA's
+            # ambiguous-unit count - the filter metric - is not recoverable from it.
+            # Regenerate rather than let a resumed run filter differently from a fresh one.
+            force_regenerate = True
 
         tasks, reused = [], []
         for m_idx, m_data in mul_trees.items():
             if m_idx == 0:
                 continue
-            pickle_path = pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
-            if pickle_path.exists() and not self.tcf.overwrite and not force_regenerate:
+            pickle_path = pickle_dir / f"{tcf.run_prefix}_{m_idx}_groups.pickle"
+            if pickle_path.exists() and not tcf.overwrite and not force_regenerate:
                 reused.append(m_idx)             # counts for these must come from disk
                 continue
             tasks.append((m_idx, m_data))
@@ -1774,23 +1951,12 @@ class GeneTreeManager:
         want_counts = self._want_checknums_file()
         cap = self.tcf.group_cap
         fails_by_mt: Dict[int, List[int]] = {}
-        counts_by_mt: Dict[int, Dict[int, Tuple[int, int]]] = {}
-
-        def save_result(res):
-            m_idx, groups, fails, counts = res
-            pickle_path = pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
-            try:
-                with open(pickle_path, 'wb') as f:
-                    pickle.dump(groups, f, protocol=pickle.HIGHEST_PROTOCOL)
-            except Exception as e:
-                self.logger.log(f"saving pickle {pickle_path}: {e}", 'e')
-            if fails:
-                fails_by_mt[m_idx] = fails
-            if want_counts:
-                counts_by_mt[m_idx] = counts
+        counts_by_mt: Dict[int, Dict[int, Tuple[int, int, float]]] = {}
 
         state = {'trees': gene_trees, 'registry': registry, 'group_cap': cap,
-            'want_counts': want_counts, 'rep_of': self.rep_of}
+            'want_counts': want_counts, 'rep_of': self.rep_of, 'rule': tcf.unit_rule,
+            'cap_by_work': tcf.cap_by_work, 'use_exact': tcf.use_exact,
+            'pickle_dir': str(pickle_dir), 'run_prefix': tcf.run_prefix}
 
         # A pool costs interpreter start-up (~0.3 s for 8 workers under spawn) plus a full
         # serialisation of every gene tree. Below this threshold it never repays itself.
@@ -1798,7 +1964,11 @@ class GeneTreeManager:
                                            desc="# Collapsing", unit="mt",
                                            disable=self.logger.disable_tqdm,
                                            min_parallel=2 * self.n_procs):
-            save_result(res)
+            m_idx, fails, counts = res
+            if fails:
+                fails_by_mt[m_idx] = fails
+            if want_counts:
+                counts_by_mt[m_idx] = counts
 
         try:
             with open(registry_path, 'wb') as f:
@@ -1809,7 +1979,7 @@ class GeneTreeManager:
         self.logger.report_step(step, "Success", full_update=True)
         return fails_by_mt, counts_by_mt, reused
 
-    def _counts_and_fails_from_pickle(self, m_idx: int, cap: int, want_counts: bool) -> Tuple[List[int], Optional[Dict[int, Tuple[int, int]]]]:
+    def _counts_and_fails_from_pickle(self, m_idx: int, cap: int, want_counts: bool) -> Tuple[List[int], Optional[Dict[int, Tuple[int, int, float]]]]:
         """Only for MUL-trees whose group pickle was REUSED from a previous run."""
         p = self.tcf.pickle_dir / f"{self.tcf.run_prefix}_{m_idx}_groups.pickle"
         fails, counts = [], ({} if want_counts else None)
@@ -1820,14 +1990,20 @@ class GeneTreeManager:
             raise RuntimeError(f"MUL-tree {m_idx}: cannot read reused group data '{p}': {e}")
         for g_idx, gd in groups.items():
             n_amb = len(gd.ambiguous_groups)
-            if n_amb > cap:
+            n_multi = sum(1 for u in gd.ambiguous_groups if len(u) > 1)
+            work = log2_combinations(n_amb, n_multi, 2, self.tcf.use_exact)
+            # force_regenerate guarantees rule == ENGINE_RULE here, so n_amb IS GRAMPA's
+            # quantity; applying a different test than _collapse_task would make a
+            # resumed run filter differently from a fresh one.
+            metric = work if self.tcf.cap_by_work else n_amb
+            if metric > cap:
                 fails.append(g_idx)
             if want_counts:
-                counts[g_idx] = (n_amb, len(gd.fixed_groups))
+                counts[g_idx] = (n_amb, len(gd.fixed_groups), work)
         return fails, counts
 
     def filter_by_sweep_cap(self, gene_trees: Dict[int, SmrtTree], st_flat: FlatTree,
-                            sw: TargetSweep, clade_ids: Dict[str, Set[int]], h_id: Dict[str, int],
+                            clade_ids: Dict[str, Set[int]], h_id: Dict[str, int],
                             valid_t: Dict[str, Set[int]], registry: NameRegistry) -> Dict[int, int]:
         """
         The sweep's equivalent of filter_and_check: the standard path caps on units
@@ -1844,32 +2020,36 @@ class GeneTreeManager:
         original_count = max(gene_trees.keys()) + 1 if gene_trees else 0
         for gt in gene_trees.values():
             gt.make_flat(registry)          # Traversed only: no Euler tour / or RMQ
-
-        cap = self.tcf.group_cap
-        gt_failures: Dict[int, int] = {}
-        cache: Dict[Tuple[bytes, str], bool] = {}
+ 
+        # One representative per signature: the decision is structural, so isomorphic
+        # gene trees share it. This is also what keeps the worker payload small.
+        flats_by_sig: Dict[bytes, FlatTree] = {}
+        members: Dict[bytes, List[int]] = {}
         for g_idx, gt in gene_trees.items():
-            sig = gt.canon_sig          # structural: identical trees give identical counts
-            for h1_name, sp_ids in clade_ids.items():
-                key = (sig, h1_name)
-                over = cache.get(key)
-                if over is None:
-                    units = compute_units(gt.flat_tree, sp_ids, rule=True)
-                    if not units:
-                        cache[key] = over = False
-                    else:
-                        _st, free = sw.pin_states(gt.flat_tree, h_id[h1_name], units,
-                                                  st_flat, valid_t[h1_name])
-                        cache[key] = over = any(free[t] > cap for t in valid_t[h1_name])
-                if over:
+            sig = gt.canon_sig
+            flats_by_sig.setdefault(sig, gt.flat_tree)
+            members.setdefault(sig, []).append(g_idx)
+
+        tcf = self.tcf
+        state = {'st_flat': st_flat, 'flats_by_sig': flats_by_sig, 'clade_ids': clade_ids, 'valid_t': valid_t,
+                 'group_cap': tcf.group_cap, 'rule': tcf.unit_rule, 'cap_by_work': tcf.cap_by_work,
+                 'use_exact': tcf.use_exact, 'weights': tcf.weights}
+        donors = [(name, h_id[name]) for name in clade_ids if name in h_id]
+ 
+        gt_failures: Dict[int, int] = {}
+        for over in self.pool.map_unordered(
+                _sweep_filter_task, donors, state=state, desc="# Filtering ", unit="h1",
+                disable=self.logger.disable_tqdm):
+            for sig in over:
+                for g_idx in members[sig]:
                     gt_failures[g_idx] = gt_failures.get(g_idx, 0) + 1
 
         for g_idx in sorted(gt_failures):
             self.logger.log(f"Gene tree on line {g_idx+1} is over the group cap for "
                             f"{gt_failures[g_idx]} donor clades and will be filtered.", 'w')
             del gene_trees[g_idx]
-        self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap")#, full_update=True)
-
+        self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap", full_update=True)
+ 
         self.write_filtered_trees(gene_trees, gt_failures, original_count)
         return gt_failures
 
@@ -1899,8 +2079,9 @@ class GeneTreeManager:
             for g_idx in fails:
                 gt_failures[g_idx] = gt_failures.get(g_idx, 0) + 1
 
+        # Must happen before the deletion loop below
         if want_counts:
-            self._write_checknums(mul_trees, gene_trees, counts_by_mt, cap)
+            self._write_checknums(mul_trees, gene_trees, counts_by_mt, fails_by_mt)
 
         self.logger.report_step(step, f"Success: {len(gt_failures)} gts over cap")#, full_update=True)
 
@@ -1931,7 +2112,19 @@ class GeneTreeManager:
                 
         self.logger.report_step(step, f"Success: {count} gene trees written")
 
-    def _write_checknums(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree], counts_by_mt: Dict[int, Dict[int, Tuple[int, int]]], cap: int) -> None:
+    def _write_checknums(self, mul_trees: Dict[int, MulTree], gene_trees: Dict[int, SmrtTree],
+                         counts_by_mt: Dict[int, Dict[int, Tuple[int, int, float]]],
+                         fails_by_mt: Dict[int, List[int]]) -> None:
+        """
+        The per-(MUL-tree, gene tree) diagnostic.
+
+        The 'combinations' column is the REAL enumeration size, 2**work - not 2**groups,
+        because a multi-MT gives a unit c states and exact grouping gives a multi-leaf
+        unit 2c-1. The 'over.cap.filtered' column is read from the authoritative `fails`
+        list rather than recomputed: under a non-default --unit-rule the filter metric is
+        GRAMPA's ambiguous-unit count recovered separately, which is NOT the n_amb stored
+        here, so any recomputation would silently disagree with what was actually filtered.
+        """
         check_path = Path(self.tcf.output_dir) / f"{self.tcf.run_prefix}-checknums.txt"
         sorted_gene_ids = sorted(gene_trees.keys())
         with open(check_path, 'w') as f:
@@ -1945,12 +2138,14 @@ class GeneTreeManager:
                 hx_str = ("\t".join(f'H{i+2} Node:{hx.name}' for i, hx in enumerate(hx_sisters))
                           if hx_sisters else "Hx Nodes:NA")
                 f.write(f"# MT-{m_idx}:{m_data.to_marked_str()}\tH1 Node:{h1_name}\t{hx_str}\n")
+
                 counts = counts_by_mt[m_idx]
+                filtered = set(fails_by_mt.get(m_idx, ()))
                 for g_idx in sorted_gene_ids:
                     c = counts.get(g_idx)
                     if c is None:
                         continue
-                    n_amb, n_fix = c
+                    n_amb, n_fix, work = c
                     f.write(f"{m_idx}\t{g_idx+1}\t{n_amb + n_fix}\t{n_fix}\t"
-                            f"{1 << n_amb}\t{'Y' if n_amb > cap else 'N'}\n")
+                            f"{2 ** work:.0f}\t{'Y' if g_idx in filtered else 'N'}\n")
                 f.write("# ----------------------------------\n")

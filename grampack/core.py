@@ -116,7 +116,7 @@ import numpy as np
 from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
                     Sequence, Set, Tuple, Union)
 
-from .models import SmrtTree, MulTree, GroupData, Map, NameRegistry, FlatTree, splitSpec
+from .models import SmrtTree, MulTree, GroupData, Map, NameRegistry, FlatTree, splitSpec, RULES, STRICT_RULE, ENGINE_RULE, MAXIMAL_RULE
 
 _INF = float('inf')
 
@@ -270,28 +270,45 @@ def unit_states(gt_flat: FlatTree, unit_leaves: Sequence[int],
 # at that node only - a species may therefore repeat inside one group). If you change
 # one, change the other, and re-run the agreement test.
 
-def compute_units(gt_flat: FlatTree, clade_species: Set[int], rule: bool = True) -> List[List[int]]:
+def _enforce_rule(rule: RULES):
+    if rule not in (STRICT_RULE, ENGINE_RULE, MAXIMAL_RULE):
+        raise ValueError(f"invalid unit rule {rule}: must be 0, 1 or 2")
+
+def compute_units(gt_flat: FlatTree, clade_species: Set[int], rule: RULES = ENGINE_RULE) -> List[List[int]]:
     """
     The ambiguous units: clades of G whose leaves are all donor-clade gene copies.
+    The three rules differ ONLY in how coarsely they collapse; all three partition the
+    same set of movable leaves into disjoint clades, which is the only property the
+    unit-locality decomposition needs (see unit_states).
 
-    rule=True (default) reproduces models.compute_groups EXACTLY (based on GRAMPA's non-
-    exact grouping), including its duplicate test: a clade is collapsed when the species
-    sets of its TWO CHILDREN are disjoint - a check made only at that node, not over the
-    whole clade. A species may therefore appear several times inside one engine group
-    (e.g. ((x,x),y) merges with a sibling carrying neither x nor y). Use this whenever
-    the sweep must be comparable with the standard pathway.
+    'strict'  requires the whole clade to be transitively duplicate-free, which is what
+        the GRAMPA paper describes, but fails to implement. Finer than 'engine'; retained
+        as a research knob for comparing the stated rule against the implemented one.
+        Matches neither engine exactly.
 
-    rule=False requires the whole clade to be duplicate-free, which is what the
-    GRAMPA paper describes ("only if there is not more than one copy of a species among
-    the clades can they be grouped"). It yields strictly finer units, hence a larger
-    assignment space and a score that is <= the engine's, and closer to the true MP.
-    No pinning is applied either way: pinning is target-dependent and is handled by
-    TargetSweep.pin_states.
+    'engine'  (default) reproduces core.compute_groups EXACTLY, i.e. GRAMPA's
+        non-exact grouping, including its duplicate test: a clade is collapsed when the
+        species sets of its TWO CHILDREN are disjoint - a check made at that node only,
+        not over the whole clade, so a species may appear several times inside one group
+        (e.g. ((x,x),y) merges with a sibling carrying neither x nor y). REQUIRED
+        whenever scores must be comparable with the predecessor.
+
+    'maximal' the coarsest valid decomposition: maximal clades ALL of whose leaves are
+        movable, duplicates included. Never produces more units than 'engine' (it drops
+        a restriction), and with exact grouping fewer, larger units are strictly cheaper
+        - merging k units trades a factor >= 2^k in the outer product for O(|U|) in the
+        local DP. Only sound WITH exact states: without them, collapsing a unit that is
+        not duplicate-free is precisely GRAMPA's second grouping defect.
+
+    No pinning is applied here: pinning is target-dependent (TargetSweep.pin_states,
+    and check_pin on the ETE side).
     """
     cs, cf, post = gt_flat.children_start, gt_flat.children_flat, gt_flat.postorder
     names = gt_flat.node_to_name_id
 
-    if rule:
+    _enforce_rule(rule)
+
+    if rule == ENGINE_RULE:
         groups: Dict[int, List[int]] = {}
         singles: Dict[int, bool] = {}
         info: Dict[int, tuple] = {}
@@ -322,33 +339,38 @@ def compute_units(gt_flat: FlatTree, clade_species: Set[int], rule: bool = True)
             info[u] = (u_s, u_l, u_a)
         return [list(v) for v in groups.values()] + [[k] for k in singles]
 
-    # --- strict (transitively duplicate-free) variant --------------------------
+    # --- 'maximal' and 'strict' share one bottom-up pass ----------------------
     leaves_below: Dict[int, List[int]] = {}
     species_below: Dict[int, set] = {}
     all_in: Dict[int, bool] = {}
     dup_free: Dict[int, bool] = {}
     unit_root: Dict[int, Optional[int]] = {}
+    strict = (rule == STRICT_RULE)
 
     for u in post:
         s, e = cs[u], cs[u + 1]
         if s == e:
             sp = names[u]
             leaves_below[u] = [u]
-            species_below[u] = {sp}
             all_in[u] = sp in clade_species
-            dup_free[u] = True
+            if strict:
+                species_below[u] = {sp}
+                dup_free[u] = True
             unit_root[u] = u if all_in[u] else None
         else:
             c1, c2 = cf[s], cf[s + 1]
             leaves_below[u] = leaves_below[c1] + leaves_below[c2]
-            species_below[u] = species_below[c1] | species_below[c2]
             all_in[u] = all_in[c1] and all_in[c2]
-            dup_free[u] = (dup_free[c1] and dup_free[c2]
-                           and not (species_below[c1] & species_below[c2]))
-            unit_root[u] = u if (all_in[u] and dup_free[u]) else None
+            if strict:
+                species_below[u] = species_below[c1] | species_below[c2]
+                dup_free[u] = (dup_free[c1] and dup_free[c2]
+                               and not (species_below[c1] & species_below[c2]))
+                unit_root[u] = u if (all_in[u] and dup_free[u]) else None
+            else:
+                unit_root[u] = u if all_in[u] else None
 
     units, taken = [], set()
-    for u in reversed(post):
+    for u in reversed(post):                       # parents before their descendants
         if unit_root[u] is None:
             continue
         blk = leaves_below[u]
@@ -358,12 +380,24 @@ def compute_units(gt_flat: FlatTree, clade_species: Set[int], rule: bool = True)
         taken.update(blk)
     return units
 
-def compute_groups(gt: SmrtTree, mul_data: MulTree, registry: NameRegistry, 
-                    h1_sisters: Set[str] = None, hx_sisters_list: List[Set[str]] = None) -> GroupData:
+def compute_groups(gt: SmrtTree, mul_data: MulTree, registry: NameRegistry, h1_sisters: Set[str] = None,
+                    hx_sisters_list: List[Set[str]] = None, rule: RULES = ENGINE_RULE) -> GroupData:
     """
-    Registry-Optimized O(N) implementation.
+    Registry-optimized O(N) grouping over the ETE tree.
     Uses integer IDs for Set operations (Union/IsSubset) to achieve significant speedup.
+
+    `rule` MUST match the one compute_units is given on the flat side: the two are the
+    same rule on two representations, and the sweep and the pairwise engine only agree
+    because they partition identically. See compute_units for what each rule means;
+    'maximal' is sound only with exact unit states.
     """
+    _enforce_rule(rule)
+    if rule == STRICT_RULE:
+        raise NotImplementedError("compute_groups implements 'engine' and 'maximal'; "
+                                  "'strict' exists on the flat side for rule comparison "
+                                  "only and must not be used by the pairwise engine.")
+    maximal = (rule == MAXIMAL_RULE)
+
     h1_target_ids = {registry.get_id(name) for name in mul_data.h_clade}
     # Cache: node -> (species_id_set, leaf_names_list, active_roots)
     # species_id_set: Set[int] - much faster than Set[str]
@@ -400,7 +434,12 @@ def compute_groups(gt: SmrtTree, mul_data: MulTree, registry: NameRegistry,
                 if not c_s_set.issubset(h1_target_ids):
                     all_h1_descendants = False
             
-            if all_h1_descendants and (len(u_s_set) == total_species_count) and len(node.children) > 1:
+            # 'maximal' drops the sibling-disjointness test: a clade is collapsed as soon
+            # as every leaf under it is movable. Never yields more units than 'engine'.
+            collapsible = all_h1_descendants and len(node.children) > 1 and (
+                maximal or len(u_s_set) == total_species_count)
+            if collapsible:
+
                 # Valid Group
                 for r in u_a_roots:
                     groups.pop(r, None)
@@ -437,7 +476,7 @@ def compute_groups(gt: SmrtTree, mul_data: MulTree, registry: NameRegistry,
     if mul_data.h1_node and (h1_sisters is None):
         h1_sisters, hx_sisters_list = mul_data.get_sister_clades()
 
-    def check_fix(unit_nodes, anc_leaves):
+    def check_pin(unit_nodes, anc_leaves):
         # Convert to Set for fast subset math
         group_sis_specs = {splitSpec(n) for n in anc_leaves}
         if group_sis_specs:
@@ -452,8 +491,8 @@ def compute_groups(gt: SmrtTree, mul_data: MulTree, registry: NameRegistry,
                     return
         final_ambiguous.append(registry.get_ids(unit_nodes))
 
-    for g_leaves, anc_leaves in groups.values(): check_fix(g_leaves, anc_leaves)
-    for s_name, anc_leaves in singles.items(): check_fix([s_name], anc_leaves)
+    for g_leaves, anc_leaves in groups.values(): check_pin(g_leaves, anc_leaves)
+    for s_name, anc_leaves in singles.items(): check_pin([s_name], anc_leaves)
 
     return GroupData(final_ambiguous, final_fixed)
 
@@ -527,11 +566,12 @@ def _group_ancestors(gt_flat: FlatTree, group_leaves: List[List[int]]
 class SpeciesIndex:
     """Precomputed, target-independent structure of the species tree."""
 
-    __slots__ = ('n', 'parent', 'depth', 'preorder', 'postorder', 'children',
+    __slots__ = ('st_flat', 'n', 'parent', 'depth', 'preorder', 'postorder', 'children',
                  'tin', 'tout', 'root', 'sp_of_leaf', 'node_of_species',
                  'tin_np', 'tout_np', 'depth_np')
 
     def __init__(self, st_flat: FlatTree) -> None:
+        self.st_flat = st_flat
         n = self.n = st_flat.num_nodes
         cs, cf = st_flat.children_start, st_flat.children_flat
         self.parent = list(st_flat.parents)
@@ -624,7 +664,14 @@ class TargetSweep:
         # Built ONCE: the closure depends only on the species tree, and the hot paths
         # (_cost_vector, _init_state, _flip, _mixed_correction) would otherwise allocate
         # a function object plus four cell bindings on every call.
-        self._lca: Callable[[int, int], int] = self._lca_factory()
+        try:
+            self._lca: Callable[[int, int], int] = sidx.st_flat.get_lca
+        except AttributeError:
+            raise ValueError("SpeciesIndex must be built with a FlatTree that has an LCA table.")
+        #st = getattr(sidx, 'st_flat', None)
+        #(
+        #    st.get_lca if (st is not None and getattr(st, 'rmq_table', None))
+        #    else self._lca_factory())
         self._scalar_cache: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
     # ----------------------------------------------------------------------
@@ -635,7 +682,7 @@ class TargetSweep:
                       units: Sequence[Sequence[int]]) -> List[Set[int]]:
         """
         For every unit, the species of its SISTER clade in the gene tree - exactly the
-        `anc_leaves` that compute_groups/check_fix look at (the leaves of the unit root's
+        `anc_leaves` that compute_groups/check_pin look at (the leaves of the unit root's
         parent, minus the unit's own leaves; empty when the unit root is the gene-tree
         root). Returned as a set of species name-ids.
         """
@@ -689,7 +736,7 @@ class TargetSweep:
         """
         The pinned copy of every unit, as a function of the target.
 
-        Mirrors MulTree.get_sister_clades + GroupData.check_fix:
+        Mirrors MulTree.get_sister_clades + GroupData.check_pin:
           * the BACKBONE copy's sister set is blanked when the graft lands inside h's
             sister subtree (or above h itself), because then that sister clade contains
             copies of the donor species;
@@ -698,7 +745,7 @@ class TargetSweep:
             contained in the (unblanked) backbone sister set - a t-INDEPENDENT test -
             and otherwise to the graft if they are contained in clade(t), i.e. iff
             t is an ancestor-or-self of lca_S(sisters(U)). Backbone takes precedence,
-            exactly as check_fix tests h1_sisters before hx_sisters.
+            exactly as check_pin tests h1_sisters before hx_sisters.
 
         Returns (states, free_counts) where states[t] is a tuple over units with entries
         0 (backbone), 1 (graft) or None (free), and free_counts[t] is the number of free
@@ -761,8 +808,8 @@ class TargetSweep:
     def score_all_targets(self, gt_flat: FlatTree, st_flat: FlatTree, h: int,
                           units: Optional[List[List[int]]] = None,
                           valid_targets: Optional[Sequence[int]] = None,
-                          pin: bool = True, exact: bool = True, mixed_on_pinned: bool = True,
-                          rule: bool = True, gray: bool = True,
+                          rule: RULES = ENGINE_RULE, pin: bool = True,
+                          exact: bool = True, gray: bool = True,
                           batch: int = 64) -> np.ndarray:
         """
         costs[t] = MP(G, T(h, t)) for every node t of S, as a NumPy array; entries for
@@ -778,8 +825,8 @@ class TargetSweep:
               on the duplications inside the unit and at its parent. The standard engine
               assumes the same for its fixed groups.
           exact=False           reproduces GRAMPA's collapsing: constant states only.
-              rule=True (default) is GRAMPA's sibling-disjoint collapse rule;
-              rule=False the transitive one (research knob; matches neither engine).
+              rule=ENGINE       see compute_units for the three options. The default
+                                rule reproduces the predecessor's grouping exactly.
           units                 overrides the decomposition; only with exact=False.
  
         SPEED DIALS - never change the answer:
@@ -788,7 +835,7 @@ class TargetSweep:
                  sweep when the decomposition would cost more.
           mixed_on_pinned
                  True: pinned units are never mixed - slower and less similar to the
-                 standard engine's approach.
+                 standard engine's approach. [DEPRECATED: True is the only valid option]
           gray   True: incremental Gray-code enumeration (one unit changes per step, and
                  the walk up its ancestors stops at the first dominating node that keeps
                  its class and image). False: rebuild from scratch per combination -
@@ -816,8 +863,8 @@ class TargetSweep:
                          for v in self._clade_leaves(st_flat, h)}
 
         if exact:
-            if units is not None or not rule:
-                raise ValueError("exact=True cannot be used with `units` or `rule=False`.")
+            if units is not None or rule == STRICT_RULE:
+                raise ValueError("exact=True cannot be used with `units` or `rule=STRICT`.")
         if units is None:
             # If units are still not, then the path is not_exact, and no exogenous units were given,
             # so we need to compute the default units based on the engine rule or not.
@@ -1310,36 +1357,61 @@ class TargetSweep:
             if nk == old_k and ni == old_i and i >= chain_start:
                 break                     # nothing above this node can change
 
-    def _snapshot(self, st: Dict[str, Any], n_leaves: int,
-                  corr: Optional[np.ndarray] = None) -> Tuple:
+    def _ensure_buffers(self, batch, want_corr):
+        # One spare row: the Gray-code path writes the initial assignment before the
+        # loop, so a full batch can be reached one write before the flush test runs.
+        batch = batch + 1
         n = self.S.n
-        return (st['om'].copy(), st['xw'].copy(), st['dsub'][:n + 1].copy(),
-                st['pt'].copy(),
-                st['const'] - 2 * (n_leaves - 1), st['m'], st['dpure'] + st['allc'],
-                None if corr is None else corr.copy())
+        buf = getattr(self, '_buf', None)
+        if buf is None or buf['rows'] < batch or buf['n'] != n or (want_corr and buf['corr'] is None):
+            self._buf = buf = {
+                'rows': batch, 'n': n,
+                'om': np.empty((batch, n)), 'xw': np.empty((batch, n)),
+                'ds': np.empty((batch, n + 1)), 'pt': np.empty((batch, n)),
+                'base': np.empty(batch), 'mm': np.empty(batch), 'dp': np.empty(batch),
+                'corr': np.empty((batch, n)) if want_corr else None,
+            }
+        elif want_corr and buf['corr'] is None:
+            buf['corr'] = np.empty((batch, n))
+        return buf
 
-    def _resolve_batch(self, rows: Sequence[Tuple]) -> np.ndarray:
-        """Resolve B stacked mark-sets at once; returns a (B, N) cost matrix."""
+    def _snapshot_into(self, st, n_leaves, corr, k):
+        """Write one assignment's marks into row k of the preallocated batch buffers.
+        Copying into a standing array avoids the four fresh allocations per assignment
+        that _snapshot used to make, and lets _resolve_batch skip np.stack entirely."""
+        n = self.S.n
+        buf = self._buf
+        buf['om'][k] = st['om']
+        buf['xw'][k] = st['xw']
+        buf['ds'][k] = st['dsub'][:n + 1]
+        buf['pt'][k] = st['pt']
+        buf['base'][k] = st['const'] - 2 * (n_leaves - 1)
+        buf['mm'][k] = st['m']
+        buf['dp'][k] = st['dpure'] + st['allc']
+        if corr is not None:
+            buf['corr'][k] = corr
+
+    def _resolve_batch(self, count: int, want_corr: bool):
+        """Resolve `count` stacked mark-sets at once from the preallocated buffers;
+        returns a (count, N) cost matrix."""
         S = self.S
         n = S.n
         tin, tout, depth = S.tin_np, S.tout_np, S.depth_np
-        B = len(rows)
-        om = np.stack([r[0] for r in rows])
-        xw = np.stack([r[1] for r in rows])
-        ds = np.stack([r[2] for r in rows])
-        pt = np.stack([r[3] for r in rows])
-        base = np.asarray([r[4] for r in rows], dtype=np.float64)[:, None]
-        mm = np.asarray([r[5] for r in rows], dtype=np.float64)[:, None]
-        dp = np.asarray([r[6] for r in rows], dtype=np.float64)[:, None]
+        buf = self._buf
+        om = buf['om'][:count]; xw = buf['xw'][:count]
+        ds = buf['ds'][:count]; pt = buf['pt'][:count]
+        base = buf['base'][:count, None]
+        mm = buf['mm'][:count, None]
+        dp = buf['dp'][:count, None]
 
-        zc = np.zeros((B, 1))
+        zc = np.zeros((count, 1))
         om_c = np.concatenate((zc, np.cumsum(om, axis=1)), axis=1)
         Omega = om_c[:, tout + 1] - om_c[:, tin]
 
         xw_c = np.concatenate((zc, np.cumsum(xw, axis=1)), axis=1)
-        c_arr = xw_c[:, tout + 1] - xw_c[:, tin]                 # (B, N) per node
+        c_arr = xw_c[:, tout + 1] - xw_c[:, tin]
         c_root = c_arr[:, S.root][:, None]
-        diff = np.zeros((B, n + 1))
+        diff = np.zeros((count, n + 1))
         np.add.at(diff, (slice(None), tin), c_arr)
         np.add.at(diff, (slice(None), tout + 1), -c_arr)
         F = np.cumsum(diff, axis=1)[:, :n][:, tin]
@@ -1350,8 +1422,8 @@ class TargetSweep:
         w_dup = self.dup_cost + 2 * self.loss_cost
         out = (w_dup * (dp + Dsub + Dpt)
                + self.loss_cost * (base + mm * (depth + 1) + Omega - (F - c_root)))
-        if rows[0][7] is not None:
-            out = out + np.stack([r[7] for r in rows])     # mixed-state corrections
+        if want_corr:
+            out = out + buf['corr'][:count]
         return out
 
     def _min_over_states(self, gt_flat: FlatTree, h: int, b_of_leaf: Dict[int, int],
@@ -1375,7 +1447,20 @@ class TargetSweep:
         corrs = [unit_states[i][0][1] for i in range(len(unit_states))]
 
         init = set().union(*subs) if subs else set()
-        st = self._init_state(gt_flat, h, b_of_leaf, init)
+        # Reuse the incremental state across pinning regions: _init_state is an O(n_G)
+        # classification pass, and with many regions it was being re-paid per region.
+        # Flipping every unit to this region's state-0 costs O(ancestors) per unit, and
+        # the state is exact either way (the flip machinery is the same one the Gray
+        # code uses).
+        st = getattr(self, '_carry_state', None)
+        if st is not None and st.get('_gt') is gt_flat and st.get('_h') == h:
+            for i, u in enumerate(units):
+                anc, chain = anc_cache[i]
+                self._flip(st, gt_flat, h, b_of_leaf, u, anc, chain, subs[i])
+        else:
+            st = self._init_state(gt_flat, h, b_of_leaf, init)
+            st['_gt'], st['_h'] = gt_flat, h
+            self._carry_state = st
 
         any_corr = any(c is not None for sl in unit_states for _, c in sl)
         run = np.zeros(self.S.n) if any_corr else None
@@ -1384,16 +1469,19 @@ class TargetSweep:
                 if c is not None:
                     run += c
 
+        want_corr = run is not None
+        self._ensure_buffers(batch, want_corr)
         best = None
-        rows = [self._snapshot(st, n_leaves, run)]
+        k = 0
+        self._snapshot_into(st, n_leaves, run, k); k += 1
 
         def flush():
-            nonlocal best, rows
-            if not rows:
+            nonlocal best, k
+            if not k:
                 return
-            mn = self._resolve_batch(rows).min(axis=0)
+            mn = self._resolve_batch(k, want_corr).min(axis=0)
             best = mn if best is None else np.minimum(best, mn)
-            rows = []
+            k = 0
 
         radices = [len(sl) for sl in unit_states]
         for gi, choice in _mixed_radix_gray(radices):
@@ -1406,8 +1494,8 @@ class TargetSweep:
                 if new_corr is not None:
                     run += new_corr
             subs[gi], corrs[gi], cur[gi] = new_sub, new_corr, choice
-            rows.append(self._snapshot(st, n_leaves, run))
-            if len(rows) >= batch:
+            self._snapshot_into(st, n_leaves, run, k); k += 1
+            if k >= batch:
                 flush()
         flush()
         return best
@@ -1419,27 +1507,30 @@ class TargetSweep:
         """Reference enumeration: rebuild the state from scratch for every combination.
         Same numbers as the incremental path; kept as an oracle and for --optim without
         the Gray-code bit."""
-        best = None
-        rows = []
-        def flush():
-            nonlocal best, rows
-            if not rows:
-                return
-            mn = self._resolve_batch(rows).min(axis=0)
-            best = mn if best is None else np.minimum(best, mn)
-            rows = []
         any_corr = any(c is not None for sl in unit_states for _, c in sl)
+        self._ensure_buffers(batch, any_corr)
+        best = None
+        k = 0
+
+        def flush():
+            nonlocal best, k
+            if not k:
+                return
+            mn = self._resolve_batch(k, any_corr).min(axis=0)
+            best = mn if best is None else np.minimum(best, mn)
+            k = 0
+
         for combo in itertools.product(*[range(len(sl)) for sl in unit_states]):
             to_graft = set()
             run = np.zeros(self.S.n) if any_corr else None
-            for i, k in enumerate(combo):
-                sub, corr = unit_states[i][k]
+            for i, choice in enumerate(combo):     # `k` is the batch row counter
+                sub, corr = unit_states[i][choice]
                 to_graft |= sub
                 if corr is not None:
                     run += corr
             st = self._init_state(gt_flat, h, b_of_leaf, to_graft)
-            rows.append(self._snapshot(st, n_leaves, run))
-            if len(rows) >= batch:
+            self._snapshot_into(st, n_leaves, run, k); k += 1
+            if k >= batch:
                 flush()
         flush()
         return best
@@ -1542,6 +1633,20 @@ class TargetSweep:
             else:
                 stack.extend(cf[s:e])
         return out
+
+# One SpeciesIndex/TargetSweep per worker process: both are derived from st_flat alone,
+# so rebuilding them locally is cheaper than shipping them with every task (and keeps
+# TargetSweep's per-donor scalar cache process-local).
+_SWEEP_ENGINE = {}   # single-slot cache: one species tree per worker per run
+
+def sweep_engine(st_flat: FlatTree, dup_cost: int, loss_cost: int) -> TargetSweep:
+    eng = _SWEEP_ENGINE.get('eng')
+    if (eng is None or _SWEEP_ENGINE['nodes'] != st_flat.num_nodes
+            or eng.dup_cost != dup_cost or eng.loss_cost != loss_cost):
+        from .core import SpeciesIndex, TargetSweep
+        eng = TargetSweep(SpeciesIndex(st_flat), dup_cost, loss_cost)
+        _SWEEP_ENGINE.update(eng=eng, nodes=st_flat.num_nodes)
+    return eng
 
 # --------------------------------------------------------------------------
 # Traditioal pairwise reconciliation

@@ -32,7 +32,7 @@ class GranMetadata:
     github: str = "https://github.com/Roshex/Grandma"
     http: str = "TBD"
     release: str = "TBD 2026"
-    version: str = "2.5.0"
+    version: str = "2.5.1"
 
     # GRAMPA Source Metadata
     source_authors: str = "Gregg Thomas, S. Hussain Ather, Matthew Hahn"
@@ -52,7 +52,6 @@ class GlobalContext:
     # System Resources
     num_processes: int = 1
     seed: int = 42
-    optim: int = 0
     
     # Output & Logging Controls
     verbosity: int = 3
@@ -156,7 +155,10 @@ class TaskConfig:
     h1_nodes: Optional[Union[str, List[str]]] = None
     h2_nodes: Optional[Union[str, List[str]]] = None
     ploidies: Optional[Union[Path, str, Dict[str, int]]] = None
+    optim: int = 0
+    unit_rule: int = 1 # 0=Strict, 1=Engine, 2=Maximal
     group_cap: int = 15
+    cap_by_work: bool = False
     quota_gts: str = "equal"
     weights: Tuple[int, int] = (1, 1) # (w_dup, w_loss)
     n_best: int = 1 # max mts to select for processing per Run (non-overlapping H clades & scoring above ST)
@@ -178,6 +180,33 @@ class TaskConfig:
     search_state_id: str = "S0"
     prev_score: Optional[float] = None
 
+    def __post_init__(self):
+        """Validate the optim bitmask right after dataclass initialization."""
+        if not isinstance(self.optim, int) or not (0 <= self.optim <= 15):
+            raise ValueError(f"Invalid optimization level: {self.optim}. Must be 0-15.")
+
+    # --- Optimization Switches (Decoded dynamically on access) ---
+
+    @property
+    def dedup_gts(self) -> bool:
+        """Bit 0 (+1): One representative per class of isomorphic gene trees."""
+        return bool(self.optim & 1)
+
+    @property
+    def use_gray(self) -> bool:
+        """Bit 1 (+2): Gray-code enumeration of ambiguous groups / units."""
+        return bool(self.optim & 2)
+
+    @property
+    def use_sweep(self) -> bool:
+        """Bit 2 (+4): Target sweep for single-target candidates."""
+        return bool(self.optim & 4)
+
+    @property
+    def use_exact(self) -> bool:
+        """Bit 3 (+8): Exact unit states. Without it, reproduces GRAMPA's collapsing exactly."""
+        return bool(self.optim & 8)
+
     @property
     def pickle_dir(self) -> Path:
         """Dynamic property derived from the step's output dir."""
@@ -194,7 +223,8 @@ class TaskConfig:
         Validates that keys exist to prevent silent errors.
         """
         # Certain fields should not be allowed to be changed
-        forbidden_keys = {'group_cap', "quota_gts", 'weights', 'max_select', 'run_prefix', 'search_state_id'}
+        forbidden_keys = {'optim', 'unit_rule', 'group_cap', 'cap_by_work', "quota_gts", 'weights',
+                          'max_select', 'run_prefix', 'search_state_id'}
         # Safety check to ensure we aren't inventing new fields
         valid_fields = {f.name for f in fields(self)}
         for key in changes:
@@ -206,6 +236,18 @@ class TaskConfig:
         return replace(self, **changes)
 
 # --- Utility Functions ---
+
+def decode_optim(optim: int) -> Tuple[bool, bool, bool, bool]:
+    """
+      bit 0 (+1)  dedup_gts    one representative per class of isomorphic gene trees
+      bit 1 (+2)  use_gray     Gray-code enumeration of ambiguous groups / units
+      bit 2 (+4)  use_sweep    target sweep for single-target candidates
+      bit 3 (+8)  use_exact    exact unit states (see core.unit_states); without it
+                               both engines reproduce GRAMPA's collapsing exactly.
+    """
+    if not isinstance(optim, int) or not (0 <= optim <= 15):
+        raise ValueError(f"Invalid optimization level: {optim}. Must be 0-15.")
+    return bool(optim & 1), bool(optim & 2), bool(optim & 4), bool(optim & 8)
 
 def load_history_ng(history_file: Path) -> Dict[Tuple[Any, int], Any]:
     """Loads and deserializes the iteration history."""
@@ -560,20 +602,20 @@ class InitParser:
         g_algo.add_argument("-c", "--cap", type=int, default=15,
             help="The maximum number of groups with polyploid species a gene tree is allowed to have given a MUL-tree. "
                  "A GT with more than --cap groups for at least one MT, will be skipped entirely. Default = 15.")
-        g_algo.add_argument("-q", "--quota_gts", type=str, choices=['equal', 'e', 'harmonic', 'h', 'per-clade', 'p'], default='equal',
+        g_algo.add_argument("-q", "--quota-gts", dest="quota_gts", type=str, choices=['equal', 'e', 'harmonic', 'h', 'per-clade', 'p'], default='equal',
             help="Method for balancing the influence of gene trees during reconciliation. "
                  "(e)qual: No balancing; all GTs contribute equally to the parsimony score [default]. "
                  "(h)armonic: Balance by the harmonic mean Q of topology and support. GTs with Q will have less influence. "
                  "(p)er-clade: Balance directly during reconciliation. Clades with low support will have less influence [Not implemented].")
         g_algo.add_argument("-w", "--weights", type=int, nargs=2, default=[1, 1],
             help="Space-separated integer weights for the parsimony score calculation: 'w_dup w_loss'. Default = '1 1'.")
-        g_algo.add_argument("-n", "--n_best", type=int, default=1,
+        g_algo.add_argument("-n", "--n-best", dest="n_best", type=int, default=1,
             help="Maximum top-ranked MUL-trees to select per run for postprocessing and detailed outputs. Default: 1, i.e., only the best "
                  "scoring MT is considered per iteration (Default: 1, All_until_input_st_inclusive: 0, ALL: any negative int).")
-        g_algo.add_argument("--min_st_lvs", type=int, default=1,
+        g_algo.add_argument("--min-st-lvs", dest="min_st_lvs", type=int, default=1,
             help="Minimum species tree leaves for a species tree to be considered valid. Specifically relevant for the "
                  "split mode. Default: 1.")
-        g_algo.add_argument("--min_gt_lvs", type=int, default=2,
+        g_algo.add_argument("--min-gt-lvs", dest="min_gt_lvs", type=int, default=2,
             help="Minimum gene trees leaves per tree for a gene tree to be considered valid. Specifically relevant for "
                  "the split mode. Default: 2.")
         g_algo.add_argument('--nesting', type=str, choices=['ignore', 'i', 'rectify', 'r', 'model', 'm', 'strict_rectify', 's'], default='model',
@@ -582,10 +624,10 @@ class InitParser:
                  "(r)ectify: Autocorrect nested events between iterations, including via sister relationships [default]. "
                  "(s)trict_rectify: Rectify, but only consider internally nested events when tracing missing subgenomes. "
                  "(m)odel: Model nested copies during MT creation. Computationally heaviest, but most exact.")
-        g_algo.add_argument('--strict_constraint', dest='strict_constraint', action='store_true',
+        g_algo.add_argument('--strict-constraint', dest='strict_constraint', action='store_true',
             help="If set, ploidy constraints will apply strictly to number of copies of a species, rather than to "
                  "number of their monophyletic clades.")
-        g_algo.add_argument('--allow_redunant_mts', dest='allow_redundant_mts', action='store_true',
+        g_algo.add_argument('--allow-redundant-mts', dest='allow_redundant_mts', action='store_true',
             help="If set, the program will not filter out redundant MUL-trees where taxa are grafted below themselves (i.e., having "
                  "identical groupings and scores with those grafted above themselves). This may be useful for debugging and for exact "
                  "reproduction of legacy-GRAMPA output, but is not recommended for general use due to increased runtime and algorithmic " 
@@ -593,13 +635,21 @@ class InitParser:
         
         g_algo.add_argument('--optim', dest='optim', type=int, default=0,
             help="Developer option for optimization level. 0 = default, 1 = deduplication only, 2 = backbone only, 3 = combined optimizations.")
-        g_algo.add_argument('--disable-dedup-below', dest='disable_dedup_below',
-            type=float, default=0.05, metavar='FRAC',
+        g_algo.add_argument('--disable-dedup-below', dest='disable_dedup_below', type=float, default=0.05, metavar='FRAC',
             help="Duplicate fraction below which gene-tree de-duplication is disabled for "
                 "SUBSEQUENT iterations of a serial chain. The map is always used in the task "
                 "that computed it (the signature pass is already paid). 1.0 disables it "
                 "entirely, including the signature pass; to switch it off completely, clear "
                 "bit 0 of --optim.")
+        g_algo.add_argument('-u', '--unit-rule', dest='unit_rule', default='auto', choices=['auto', 0, 'strict', 1, 'engine', 2, 'maximal'],
+        help="How gene-copy clades are collapsed into mapping units. 'auto' (default) uses 'maximal' when exact grouping "
+              "is enabled (--optim bit 3) and 'engine' otherwise, which is what preserves GRAMPA score parity. "
+              "'maximal' without exact grouping is NOT sound. 'strict' (0) is duplicate-freeness (transitive), "
+              "'engine' (2) is sibling-disjointedness, and 'maximal' (3) is maximally-movable.")
+        g_algo.add_argument('--cap-by-work', dest='cap_by_work', action='store_true',
+        help="Apply --cap to log2 of the number of allele assignments under the grouping actually in use, instead "
+              "of to GRAMPA's unit count ('engine' rule). With coarse units (--unit-rule maximal) this retains "
+              "more gene trees, but scores are then NOT comparable with runs that use the default metric.")
         
         # --- Flow Control Options ---
         g_flow = self.parser.add_argument_group("Flow Control Options")
@@ -621,7 +671,7 @@ class InitParser:
                  "Keeps only the paths which originated from the origin that produced the best path (at depth `d`), capping the maximum "
                  "active paths back to n^l. Only relevant for iterative modes with n>1. Default: 0 (disabled), Unbounded (=disabled): any "
                  "non-positive int.")
-        g_flow.add_argument("-b", "--breadth-max", type=int, default=0,
+        g_flow.add_argument("-b", "--breadth-max", dest="breadth_max", type=int, default=0,
             help="Controls the maximum number of active paths allowed to proceed at any given depth, keeping only the top `b` paths. "
                  "Only relevant for iterative modes with n>1. Default: 0 (disabled), Unbounded (=disabled): any non-positive int.")
         g_flow.add_argument('-i', '--iter', type=int, default=0,
@@ -702,6 +752,31 @@ class InitParser:
         g_legacy.add_argument("--st-only", dest="st_only", action="store_true",
             help="If set, only the standard reconciliation (reconciling to the singly-labeled species tree) "
                  "will be performed. Equivalent to -m st-only.")
+
+    @staticmethod
+    def resolve_unit_rule(unit_rule: str, use_exact: bool, use_sweep: bool) -> str:
+        """
+        'maximal' is the coarsest valid decomposition and is strictly cheaper under exact
+        grouping - merging k units trades a factor >= 2^k in the outer product for O(|U|) in
+        the local DP. It is NOT sound without exact states: collapsing a clade that is not
+        duplicate-free is exactly GRAMPA's second grouping defect.
+        """
+        unit_rule_2_num = {'maximal': 2, 'engine': 1, 'strict': 0}
+        if unit_rule == 'auto':
+            return 2 if use_exact else 1
+        if unit_rule in (2, 'maximal') and not use_exact:
+            raise ValueError("--unit-rule maximal requires exact grouping (--optim bit 3): "
+                            "without the mixed unit states it under-counts the score.")
+        if unit_rule in (0, 'strict') and not (not use_exact and use_sweep):
+            raise ValueError("--unit-rule strict is incompatible with pairwise recon, and with "
+                            "exact grouping (--optim bit 3) + sweep (--optim bit 2): the strict "
+                            "rule produces many, fragmented unit states for sweep to not lock up.")
+        if unit_rule in (0, 1, 2, '0', '1', '2'):
+            return int(unit_rule)
+        try:
+            return unit_rule_2_num[unit_rule]
+        except KeyError:
+            raise ValueError(f"Invalid unit rule: {unit_rule}")
 
     def parse_cutoff(self, vals: List[str]) -> Tuple[str, str, Union[float, int]]:
         """Parses stopping condition list into a typed tuple (Reference, DiffFunc, Offset)."""
@@ -1223,6 +1298,8 @@ class InitParser:
                 except NotImplementedError:
                     n_procs = 1
 
+        _, _, use_sweep, use_exact = decode_optim(args.optim)
+
         # --- Build Global Context ---
         ctx = GlobalContext(
             num_processes = n_procs,
@@ -1236,7 +1313,6 @@ class InitParser:
             debug         = args.debug,
             seed          = args.seed,
             sample        = args.sample,
-            optim         = args.optim,
             orth_opt      = args.orthologies,
             lookahead     = args.lookahead,
             breadth_max   = args.breadth_max,
@@ -1269,7 +1345,10 @@ class InitParser:
             h1_nodes      = args.h1,
             h2_nodes      = args.h2,
             ploidies      = args.ploidy,
+            optim         = args.optim,
+            unit_rule     = self.resolve_unit_rule(args.unit_rule, use_exact=use_exact, use_sweep=use_sweep),
             group_cap     = args.cap,
+            cap_by_work   = args.cap_by_work,
             quota_gts     = quota_gts,
             weights       = tuple(args.weights),
             n_best        = args.n_best,

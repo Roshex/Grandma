@@ -21,7 +21,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union, Set
 from .config import InitParser, GlobalContext, TaskConfig
 from .flow import FlowManager
 from .logger import GranLogger, LogInheritance
-from .models import SmrtTree, MulTree, NameRegistry, TaskResult, HistoryType, ConcurrTask, TreeCache, decode_optim
+from .models import SmrtTree, MulTree, NameRegistry, TaskResult, HistoryType, ConcurrTask, TreeCache
 from .ops import TreeLoader, GeneTreeManager, MulTreeManager
 from .orthology import OrthologyLabeler
 from .reconcile import Reconciler
@@ -116,8 +116,7 @@ class Task:
     def reconciler_uses_sweep(self, tcf: TaskConfig) -> bool:
         """The sweep only models a single graft into a singly labelled species tree, so it
         is available at depth 0 only. Iterative modes fall back to the standard path."""
-        _, _, use_sweep, _ = decode_optim(self.ctx.optim)
-        return use_sweep and tcf.mode not in ("st-only", "check-nums", "repair") \
+        return tcf.use_sweep and tcf.mode not in ("st-only", "check-nums", "repair") \
             and not getattr(tcf, 'predefined_rets', None) \
             and getattr(tcf, 'depth', 0) == 0
     
@@ -178,9 +177,9 @@ class Task:
  
         # Re-init component with current task
         self.reconciler = Reconciler(
-            tcf, self.logger, self.ctx.num_processes, self.ctx.pickles, self.ctx.maps, self.ctx.optim, pool=self.pool)
+            tcf, self.logger, self.ctx.num_processes, self.ctx.pickles, self.ctx.maps, pool=self.pool)
         self.gene_mgr = GeneTreeManager(
-            tcf, self.logger, self.ctx.num_processes, self.ctx.pickles, self.ctx.optim, pool=self.pool)
+            tcf, self.logger, self.ctx.num_processes, self.ctx.pickles, pool=self.pool)
 
         try:
             if mt_space is not None:

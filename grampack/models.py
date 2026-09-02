@@ -6,7 +6,7 @@ from pathlib import Path
 from functools import partial
 from ete3 import Tree, TreeNode
 from collections import defaultdict
-from typing import List, Dict, Optional, Tuple, Any, Set, Union
+from typing import List, Dict, Optional, Tuple, Any, Set, Union, Literal
 from dataclasses import dataclass, field
 
 from Reticulate_Tree.reticulate_tree import ReticulateTree
@@ -15,31 +15,11 @@ from Reticulate_Tree.reticulate_tree import ReticulateTree
 # Grandma will eventually do:   raw.split("_", 1)[-1]   // split by first underscore, to preserve species names with underscores
 splitSpec = lambda raw: raw.rsplit("_", 1)[-1] if "_" in raw else raw
 
-'''def decode_optim(optim: int) -> Tuple[bool, bool, bool]:
-    """
-    Decode --optim into independent switches.
-      bit 0 (1,3,5,7) -> dedup_gts : one representative per class of gene trees that are
-                                     isomorphic as species-labelled trees.
-      bit 1 (2,3,6,7) -> use_gray  : Gray-code enumeration of the ambiguous groups.
-      bit 2 (4,5,6,7) -> use_sweep : score single-target candidates with the target
-                                     sweep instead of building and reconciling each MT.
-    Kept here so ops (grouping), reconcile (scoring) and main (wiring) cannot drift.
-    """
-    if not isinstance(optim, int) or not (0 <= optim <= 7):
-        raise ValueError(f"Invalid optimization level: {optim}. Must be 0-7.")
-    return bool(optim & 1), bool(optim & 2), bool(optim & 4)'''
-
-def decode_optim(optim: int) -> Tuple[bool, bool, bool, bool]:
-    """
-      bit 0 (+1)  dedup_gts    one representative per class of isomorphic gene trees
-      bit 1 (+2)  use_gray     Gray-code enumeration
-      bit 2 (+4)  use_sweep    target sweep for single-target candidates
-      bit 3 (+8)  exact_groups exact unit states (see grouping.unit_states); without it
-                               both engines reproduce GRAMPA's collapsing exactly.
-    """
-    if not isinstance(optim, int) or not (0 <= optim <= 15):
-        raise ValueError(f"Invalid optimization level: {optim}. Must be 0-15.")
-    return bool(optim & 1), bool(optim & 2), bool(optim & 4), bool(optim & 8)
+# Rule Classes
+RULES = Literal[0, 1, 2]
+STRICT_RULE: RULES = 0
+ENGINE_RULE: RULES = 1
+MAXIMAL_RULE: RULES = 2
 
 class NameRegistry:
     """
